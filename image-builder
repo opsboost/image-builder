@@ -1157,7 +1157,7 @@ build_gentoo_stage4() {
                         --build-arg TARGET_ARCH="$target_arch" \
                         --build-arg TARGET_FLAVOUR="$target_flavour" \
                         -v "${PWD}"/output:/output \
-                        -t gentoo-stage4-"$flavour-$target_arch" \
+                        -t gentoo-stage4-"$target_flavour-$target_arch" \
                         -f Containerfile
 }
 
