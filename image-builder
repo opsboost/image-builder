@@ -1019,7 +1019,8 @@ linux_build_kernel() {
         fi
 
         if [ "1" = "${PODMAN_USE_EXTERNAL_REPO:-1}" ]; then
-            podman_add_repo
+            #podman_add_repo
+            printf "Skipping repo installation\n"
         fi
 
         podman_install
@@ -1134,7 +1135,8 @@ build_gentoo_stage4() {
     info "$(printf "Gentoo: Installing build dependenies for Gentoo build")"
 
     if [ "1" = "${PODMAN_USE_EXTERNAL_REPO:-1}" ]; then
-        podman_add_repo
+        #podman_add_repo
+        printf "Skipping repo installation\n"
     fi
 
     podman_install
