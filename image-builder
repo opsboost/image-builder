@@ -1916,16 +1916,19 @@ main() {
             target_flavour="containeros"
 
             build_gentoo_stage4 "$target_flavour" "$target_arch"
+            return
             ;;
         gentoo-sway)
             local target_flavour
             target_flavour="containeros"
 
             build_gentoo_stage4 "$target_flavour" "$target_arch"
+            return
             ;;
         gentoo-stage3)
             build_gentoo_stage3
             gentoo_fetch_stage3
+            return
             ;;
         linux-kernel)
             target_arch="$4"
