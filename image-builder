@@ -1923,7 +1923,7 @@ main() {
             ;;
         gentoo-sway)
             local target_flavour
-            target_flavour="containeros"
+            target_flavour="sway"
 
             build_gentoo_stage4 "$target_flavour" "$target_arch"
             return
