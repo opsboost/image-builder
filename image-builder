@@ -2080,7 +2080,7 @@ main() {
                           "${kernel_csum_url}" \
                           "${kernel_csum_file}"
 
-            gentoo_fetch_stage4 "containeros" "$target_arch"
+            gentoo_fetch_stage4 "$target_flavour" "$target_arch"
 
             # Install EFI bootloader
             install_bootloader_efi "${esp_dev}" \
