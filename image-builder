@@ -928,6 +928,9 @@ build_freebsd_world() {
     local version
     version="$(freebsd-version)"
 
+    mkdir -p /usr/obj
+    mount -t tmpfs tmpfs /usr/obj
+
     make -j4 buildworld
     mkdir -p /tmp/build
     DESTDIR=/tmp/build make installworld
