@@ -159,9 +159,7 @@ compare_checksums() {
         csum_2=$(sha384sum "${2}")
         csum_2=${csum_2:0:64}
         ;;
-    Darwin)
-        ;&
-    FreeBSD)
+    Darwin|FreeBSD)
         csum_2=$(sha384 "${2}")
         ;;
     esac
@@ -285,17 +283,13 @@ create_user() {
     local path
     path="${2}"
     local os
-    os=sys_os
+    os="${sys_os}"
 
     case "$os" in
     freebsd)
         cmd="pw user add ${user}"
         ;;
-    debian)
-        ;&
-    ubuntu)
-        ;&
-    fedora)
+    debian|ubuntu|fedora)
         cmd="adduser -U ${user} ${user}"
         ;;
     esac
@@ -827,11 +821,7 @@ sys_arch() {
     freebsd)
         arch=$(uname -p)
         ;;
-    fedora)
-        ;&
-    debian)
-        ;&
-    ubuntu)
+    fedora|debian|ubuntu)
         arch=$(uname -m)
         ;;
     esac
@@ -865,9 +855,7 @@ podman_install() {
     os=$(sys_os)
 
     case "$os" in
-    debian)
-        ;&
-    ubuntu)
+    debian|ubuntu)
         sudo apt update -y
         sudo apt install -y podman
         ;;
@@ -974,9 +962,7 @@ linux_install_kernel_build_dependencies() {
     os=$(sys_os)
 
     case "$os" in
-    debian)
-        ;&
-    ubuntu)
+    debian|ubuntu)
         # Install build dependencies
         apt update -y
         apt install -y linux-firmware \
@@ -1423,7 +1409,7 @@ filesystem() {
         # Some grace time is needed for the detection not to fail
         sleep 1
         fs="$(lsblk -f -n -ofstype "${dev}")"
-        if [ -v "${fs}" ]; then
+        if [ -z "${fs}" ]; then
             error "$(printf "Failed to determine filesystem of %s\n" "${dev}")"
             loop_unmount ""
             exit 1
@@ -1510,6 +1496,7 @@ alpine_fetch_image() {
         fi
     fi
 }
+
 gentoo_create_disk() {
     local path
     path="${1}"
@@ -1534,9 +1521,7 @@ gentoo_create_disk() {
     create_disk "${disk_file}"
 
     case "$os" in
-    ubuntu)
-        ;&
-    fedora)
+    ubuntu|fedora)
         loop_mount_linux "${disk_file}"
         ;;
     freebsd)
@@ -1546,9 +1531,7 @@ gentoo_create_disk() {
 
     # Create filesystems
     case "$os" in
-    ubuntu)
-        ;&
-    fedora)
+    ubuntu|fedora)
         info "Creating file systems"
         if ! mkfs.vfat "${esp_dev}"; then
             error "$(printf "Error: Failed to create filesystem\n")"
@@ -1826,11 +1809,11 @@ main() {
         source ENVIRONMENT
     fi
 
-    if [ -v "${DEBUG}" ]; then
+    if [ -z "${DEBUG+x}" ]; then
         DEBUG=0
     fi
 
-    if [ -v "${SEND_NOTIFICATION}" ]; then
+    if [ -z "${SEND_NOTIFICATION+x}" ]; then
         SEND_NOTIFICATION=0
     fi
 
@@ -1875,6 +1858,12 @@ main() {
     if [ "help" == "${1}" ]; then
         show_usage
         exit 0
+    fi
+
+    # No arguments: show usage
+    if [ $# -eq 0 ]; then
+        show_usage
+        exit 1
     fi
 
     # Build
@@ -1989,7 +1978,7 @@ main() {
         local img_file
         img_file="$build_target".raw
 
-        if [ -v "${OLDPWD}" ]; then
+        if [ -n "${OLDPWD}" ]; then
             img_path="${OLDPWD}"
         else
             img_path="${PWD}"
@@ -2032,9 +2021,7 @@ main() {
             info "$(printf " # image-builder write %s [DEVICE]" "${build_target}")"
             exit 0
             ;;
-        alpine-sway)
-            ;&
-        alpine-containeros)
+        alpine-sway|alpine-containeros)
             # We need root privileges
             reexec_privileged "$@"
 
@@ -2070,9 +2057,7 @@ main() {
             #                "${ansible_roles}"
             exit 0
             ;;
-        gentoo-containeros)
-            ;&
-        gentoo-sway)
+        gentoo-containeros|gentoo-sway)
             gentoo_create_disk  "${img_path}" \
                                 "${img_file}" \
                                 "${mnt_path}"
@@ -2309,7 +2294,7 @@ main() {
         fi
     fi
 
-    if [ -v "${1}" ]; then
+    if [ -z "${1}" ]; then
         error "$(printf "Please provide a valid verb\n")"
         show_usage
         exit 1
