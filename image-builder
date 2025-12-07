@@ -555,6 +555,14 @@ create_boot_entry() {
     local title
     title="${3}"
 
+    # Ensure parent directory exists and file is present
+    local entry_dir
+    entry_dir="$(dirname -- "${entry_file}")"
+    mkdir -p "${entry_dir}"
+    if [ ! -e "${entry_file}" ]; then
+        : > "${entry_file}"
+    fi
+
 cat << EOF > "${entry_file}"
 title         ${title}
 linux         /bzImage
