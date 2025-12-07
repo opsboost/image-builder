@@ -813,6 +813,10 @@ install_kernel() {
     mnt_path="${3}"
     local part_fs
     part_fs="vfat"
+    
+    info "Installing kernel"
+    reexec_privileged
+    mkdir -p "${mnt_path}"
 
     info "Installing kernel\n"
     printf "Mounting disk image: %s with %s at %s\n" "${dev}" "${part_fs}" "${mnt_path}"
@@ -1609,9 +1613,8 @@ gentoo_create_disk() {
         ;;
     esac
 
-
-    # Remove disk
-    loop_unmount ""
+    # Keep loop device mounted for subsequent install steps
+    # Caller is responsible for loop teardown after installs
 }
 
 write_image_to_disk() {
@@ -2155,6 +2158,9 @@ main() {
                       "${ansible_user}" \
                       "${ansible_roles_path}" \
                       "${ansible_roles}"
+
+            # Tear down loop devices after installation steps
+            loop_unmount ""
 
             exit 0
             ;;
