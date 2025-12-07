@@ -571,7 +571,7 @@ create_disk() {
 
 
     case "$os" in
-    fedora)
+    ubuntu|fedora)
         # Create partition layout
         parted "${file_disk}" mklabel gpt
         parted "${file_disk}" mkpart fat32 1 2
@@ -580,12 +580,17 @@ create_disk() {
         parted "${file_disk}" set 2 boot on
         parted "${file_disk}" print
         ;;
-    freebsd)
+    freebsd|macos)
         loop_mount_freebsd "${file_disk}"
         gpart create -s gpt /dev/md99
         gpart add -t efi -s 512m -l efi0 /dev/md99
         gpart add -t linux-data -l rootfs0 /dev/md99
         loop_unmount_freebsd 99
+        ;;
+    *)
+        error "$(printf "Unsupported OS for create_disk: %s\n" "${os}")"
+        error "Aborting.."
+        exit 1
         ;;
     esac
 }
@@ -626,6 +631,13 @@ rootfs() {
 }
 
 # Set up loop mount
+loop_mount_macos() {
+    local loop_device
+    loop_device="${1}"
+
+    printf "Loop mounting: %s\n" "${loop_device}"
+}
+
 loop_mount_freebsd() {
     local disk_file
     disk_file="${1}"
@@ -645,6 +657,8 @@ loop_mount_freebsd() {
 loop_mount_linux() {
     local disk_file
     disk_file="${1}"
+
+    printf "Loop mounting %s" "${disk_file}"
 
     if [ 2 == "$(loop_exists)" ]; then
         local loop_dev
@@ -669,6 +683,7 @@ loop_mount_linux() {
     fi
 
     modprobe loop
+
     if ! sudo losetup -P -f "${disk_file}"; then
         error "$(printf "Failed to loop mount %s\n" "${disk_file}")"
         dmesg
@@ -723,13 +738,18 @@ install_bootloader_u_boot() {
     fi
 }
 
+install_bootctl() {
+    sudo apt-get update
+    sudo apt-get install systemd-boot
+}
+
 install_bootloader_efi() {
     local esp_dev
     esp_dev="${1}"
     local rootfs_dev
     rootfs_dev="${2}"
-    local path
-    path="${3}"
+    local mnt_path
+    mnt_path="${3}"
     local boot_entry_file
     boot_entry_file="${4}"
     local version
@@ -738,17 +758,27 @@ install_bootloader_efi() {
     info "Installing bootloader to ESP"
     reexec_privileged
 
-    mkdir -p "$path"
+    # Ensure bootctl is available; install it on Ubuntu if missing (e.g. if run from github action
+    if ! command -v bootctl >/dev/null 2>&1; then
+        local os
+        os="$(sys_os)"
+        if [ "ubuntu" = "${os}" ]; then
+            info "bootctl not found; installing on Ubuntu"
+            install_bootctl
+        fi
+    fi
 
-    if ! mount "${esp_dev}" "${path}"; then
-        error "$(printf "Failed to install bootloader to efi system partition (esp)\n")"
+    mkdir -p "${mnt_path}"
+
+    if ! mount "${esp_dev}" "${mnt_path}"; then
+        error "$(printf "Failed to install bootloader to efi system partition (esp): %s at path: %s\n" "${esp_dev}" "${mnt_path}")"
         exit 1
     fi
 
     # Populate esp partition
     printf "\n"
-    printf "Creating esp content at path %s..\n" "${path}"
-    bootctl --esp-path="${path}" install
+    printf "Creating esp content at path %s..\n" "${mnt_path}"
+    bootctl --esp-path="${mnt_path}" install
 
     # Create boot entry
     local boot_entry_title
@@ -756,7 +786,7 @@ install_bootloader_efi() {
     create_boot_entry "/dev/sda3" "${boot_entry_file}" "${boot_entry_title}"
 
     printf "\n"
-    ls -al "${path}"
+    ls -al "${mnt_path}"
     printf "\n"
     info "$(printf "Boot entry:\n")"
     cat "${boot_entry_file}"
@@ -1519,7 +1549,7 @@ gentoo_create_disk() {
     local esp_dev
     esp_dev=$(esp)
     local boot_entry_file
-    boot_entry_file="${mnt_path}/loader/entries/linux-${kernel_version}.conf"
+    boot_entry_file="${4}"
 
     local os
     os="$(sys_os)"
@@ -1543,11 +1573,11 @@ gentoo_create_disk() {
     case "$os" in
     ubuntu|fedora)
         info "Creating file systems"
-        if ! mkfs.vfat "${esp_dev}"; then
+        if ! sudo mkfs.vfat "${esp_dev}"; then
             error "$(printf "Error: Failed to create filesystem\n")"
             exit 1
         fi
-        if ! mkfs.xfs "${rootfs_dev}"; then
+        if ! sudo mkfs.xfs "${rootfs_dev}"; then
             error "$(printf "Error: Failed to create filesystem\n")"
             exit 1
         fi
@@ -1812,7 +1842,7 @@ main() {
     local service_user
     service_user=iss
     local mnt_path
-    mnt_path=/mnt/tmp
+    mnt_path="/mnt/disk-image"
 
     # Source vars
     if [ -f ENVIRONMENT ]; then
@@ -2068,6 +2098,8 @@ main() {
             exit 0
             ;;
         gentoo-containeros|gentoo-sway)
+            local boot_entry_file
+            boot_entry_file="${mnt_path}/loader/entries/linux-${kernel_version}.conf"
             gentoo_create_disk  "${img_path}" \
                                 "${img_file}" \
                                 "${mnt_path}"
@@ -2081,6 +2113,8 @@ main() {
             gentoo_fetch_stage4 "$target_flavour" "$target_arch"
 
             # Install EFI bootloader
+            local esp_dev
+            esp_dev=$(esp)
             install_bootloader_efi "${esp_dev}" \
                                    "${rootfs_dev}" \
                                    "${mnt_path}" \
