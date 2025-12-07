@@ -778,8 +778,23 @@ install_bootloader_efi() {
 
     mkdir -p "${mnt_path}"
 
-    if ! mount "${esp_dev}" "${mnt_path}"; then
+    # Sanity checks: device must exist
+    if [ -z "${esp_dev}" ]; then
+        error "install_bootloader_efi: Missing ESP device (arg #1)"
+        exit 1
+    fi
+    if [ ! -b "${esp_dev}" ] && [ ! -c "${esp_dev}" ]; then
+        error "install_bootloader_efi: ESP device does not exist: ${esp_dev}"
+        lsblk -f || true
+        exit 1
+    fi
+
+    # Avoid double-mount: mount only if not already mounted
+    if findmnt -rno TARGET "${mnt_path}" >/dev/null 2>&1; then
+        info "ESP already mounted at ${mnt_path}"
+    elif ! mount "${esp_dev}" "${mnt_path}"; then
         error "$(printf "Failed to install bootloader to efi system partition (esp): %s at path: %s\n" "${esp_dev}" "${mnt_path}")"
+        dmesg | tail -n 50 || true
         exit 1
     fi
 
@@ -800,8 +815,11 @@ install_bootloader_efi() {
     cat "${boot_entry_file}"
     printf "\n"
 
-    umount "${esp_dev}"
-    sleep 1
+    # Unmount only if mounted
+    if findmnt -rno TARGET "${mnt_path}" >/dev/null 2>&1; then
+        umount "${esp_dev}"
+        sleep 1
+    fi
 }
 
 install_kernel() {
@@ -821,13 +839,33 @@ install_kernel() {
     info "Installing kernel\n"
     printf "Mounting disk image: %s with %s at %s\n" "${dev}" "${part_fs}" "${mnt_path}"
 
-    if mount -t "${part_fs}" "${dev}" "${mnt_path}"; then
+    # Sanity checks
+    if [ -z "${dev}" ]; then
+        error "install_kernel: Missing device for ESP (arg #2)"
+        exit 1
+    fi
+    if [ ! -b "${dev}" ] && [ ! -c "${dev}" ]; then
+        error "install_kernel: Device does not exist: ${dev}"
+        lsblk -f || true
+        exit 1
+    fi
+
+    info "Mounting disk image: ${dev} with ${part_fs} at ${mnt_path}"
+    # Avoid double-mount: mount only if not already mounted
+    if findmnt -rno TARGET "${mnt_path}" >/dev/null 2>&1; then
+        info "ESP already mounted at ${mnt_path}"
+    elif mount -t "${part_fs}" "${dev}" "${mnt_path}"; then
         cp "${kernel}" "${mnt_path}/bzimage"
     else
         error "$(printf "Failed to mount %s at %s\n" "${dev}" "${mnt_path}")"
+        dmesg | tail -n 50 || true
+        exit 1
     fi
 
-    umount "${dev}"
+    # Unmount only if mounted
+    if findmnt -rno TARGET "${mnt_path}" >/dev/null 2>&1; then
+        umount "${dev}"
+    fi
 }
 
 sys_os() {
