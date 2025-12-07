@@ -666,7 +666,7 @@ loop_mount_linux() {
     local disk_file
     disk_file="${1}"
 
-    printf "Loop mounting %s" "${disk_file}"
+    printf "Loop mounting %s\n" "${disk_file}"
 
     if [ 2 == "$(loop_exists)" ]; then
         local loop_dev
@@ -801,6 +801,7 @@ install_bootloader_efi() {
     printf "\n"
 
     umount "${esp_dev}"
+    sleep 1
 }
 
 install_kernel() {
@@ -812,6 +813,9 @@ install_kernel() {
     mnt_path="${3}"
     local part_fs
     part_fs="vfat"
+
+    info "Installing kernel\n"
+    printf "Mounting disk image: %s with %s at %s\n" "${dev}" "${part_fs}" "${mnt_path}"
 
     if mount -t "${part_fs}" "${dev}" "${mnt_path}"; then
         cp "${kernel}" "${mnt_path}/bzimage"
