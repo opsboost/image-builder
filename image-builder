@@ -205,6 +205,8 @@ mount_disk_image_part_by_no() {
 
     fs_type="$(trim "${fs_type}")"
 
+    info "Mounting disk: ${dev} with ${fs_type} at ${mnt_path}"
+
     # Mount
     if mount -t "${fs_type}" "${dev}" "${mnt_path}"; then
         info "$(printf "Mounted %s at %s\n" "${disk_file}" "${mnt_path}")"
@@ -281,8 +283,7 @@ download() {
 
     # --output-dir needs a new enough cURL
     cd "${path}" || exit 1
-    if ! curl -s -S --fail -LO "${url}"; then
-        error "$(printf "Failed to fetch %s. Aborting..\n" "${url}")"
+
     while [ "${attempt}" -le "${retries}" ]; do
         if curl -s -S --fail -LO "${url}"; then
             success=1
@@ -300,6 +301,8 @@ download() {
         error "$(printf "Failed to fetch file after %s attempt(s). Aborting..\n" "${retries}")"
         exit 1
     fi
+}
+
 create_user() {
     local user
     user="${1}"
@@ -1495,14 +1498,14 @@ provision() {
 
     local fs_type
     fs_type="$(filesystem "${disk_file}" "${part_no}")"
-    debug "$(printf "Detected filesystem: %s\n" "${fs_type}")"
+    info "$(printf "Detected filesystem: %s\n" "${fs_type}")"
 
     mount_disk_image_part_by_no "${disk_file}" \
                                 "${mnt_path}" \
                                 "${part_no}" \
                                 "${fs_type}"
 
-    debug "$(printf "Applying changes to partition %s\n" "${part_no}")"
+    info "$(printf "Applying changes to partition %s\n" "${part_no}")"
 
     if [ -n "${ansible_user}" ]; then
         info "Creating user"
