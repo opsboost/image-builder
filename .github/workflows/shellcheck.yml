@@ -1,0 +1,26 @@
+---
+name: ShellCheck
+on:
+  pull_request:
+    paths-ignore:
+      - "*.md"
+      - "assets/**"
+  push:
+    paths-ignore:
+      - "*.md"
+      - "assets/**"
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    name: Reusable ShellCheck
+    uses: bbusse/github-workflows/.github/workflows/shellcheck.yml@dev
+    with:
+      shellcheck_opts: "-a"
+      checkout: true
+      fetch_depth: 1
