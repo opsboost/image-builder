@@ -1503,7 +1503,7 @@ provision() {
     mount_disk_image_part_by_no "${disk_file}" \
                                 "${mnt_path}" \
                                 "${part_no}" \
-                                "${fs_type}"
+                                "xfs"
 
     info "$(printf "Applying changes to partition %s\n" "${part_no}")"
 
@@ -1561,6 +1561,7 @@ provision() {
     fi
 
     info "$(printf "Unmounting %s\n" "${mnt_path}")"
+    cd
     umount "${mnt_path}"
 }
 
