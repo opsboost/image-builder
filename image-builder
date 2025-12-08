@@ -128,7 +128,7 @@ check_root_fail() {
 
 reexec_privileged() {
     if [ "$(id -u)" != "0" ]; then
-        sudo "$SCRIPT_PATH"/"$SCRIPT_NAME" $args
+        sudo "$SCRIPT_PATH"/"$SCRIPT_NAME" "${args[@]}"
         exit 0
     fi
 }
@@ -188,8 +188,8 @@ mount_disk_image_part_by_no() {
     mnt_path="${2}"
     local part_no
     part_no="${3}"
-    local part_fs
-    part_fs="${4}"
+    local fs_type
+    fs_type="${4}"
     local loop_no
     loop_no="0"
     local dev
@@ -200,15 +200,15 @@ mount_disk_image_part_by_no() {
 
     mkdir -p "${mnt_path}"
 
-    part_fs="$(trim "${part_fs}")"
+    fs_type="$(trim "${fs_type}")"
 
     # Mount
-    if mount -t "${part_fs}" "${dev}" "${mnt_path}"; then
+    if mount -t "${fs_type}" "${dev}" "${mnt_path}"; then
         info "$(printf "Mounted %s at %s\n" "${disk_file}" "${mnt_path}")"
     else
         error "$(printf "Failed to mount %s (%s) at %s \
                          Aborting..\n" "${dev}" \
-                                       "${part_fs}" \
+                                       "${fs_type}" \
                                        "${mnt_path}")"
         # Remove disk
         loop_unmount ""
@@ -771,7 +771,7 @@ install_bootloader_efi() {
         local os
         os="$(sys_os)"
         if [ "ubuntu" = "${os}" ]; then
-            info "bootctl not found; installing on Ubuntu"
+            info "bootctl not found: Installing on Ubuntu"
             install_bootctl
         fi
     fi
@@ -825,47 +825,45 @@ install_bootloader_efi() {
 install_kernel() {
     local kernel
     kernel="${1}"
-    local dev
+    local esp_dev
     dev="${2}"
     local mnt_path
     mnt_path="${3}"
-    local part_fs
-    part_fs="vfat"
-    
+    local fs_type
+    fs_type="vfat"
+
     info "Installing kernel"
     reexec_privileged
     mkdir -p "${mnt_path}"
 
     info "Installing kernel\n"
-    printf "Mounting disk image: %s with %s at %s\n" "${dev}" "${part_fs}" "${mnt_path}"
+    printf "Mounting disk image: %s with %s at %s\n" "${esp_dev}" "${fs_type}" "${mnt_path}"
 
-    # Sanity checks
-    if [ -z "${dev}" ]; then
+    if [ -z "${esp_dev}" ]; then
         error "install_kernel: Missing device for ESP (arg #2)"
         exit 1
     fi
-    if [ ! -b "${dev}" ] && [ ! -c "${dev}" ]; then
-        error "install_kernel: Device does not exist: ${dev}"
+    if [ ! -b "${esp_dev}" ] && [ ! -c "${dev}" ]; then
+        error "install_kernel: Device does not exist: ${esp_dev}"
         lsblk -f || true
         exit 1
     fi
 
-    info "Mounting disk image: ${dev} with ${part_fs} at ${mnt_path}"
-    # Avoid double-mount: mount only if not already mounted
+    info "Mounting disk image: ${esp_dev} with ${fs_type} at ${mnt_path}"
+
+    # Avoid double-mount
     if findmnt -rno TARGET "${mnt_path}" >/dev/null 2>&1; then
         info "ESP already mounted at ${mnt_path}"
-    elif mount -t "${part_fs}" "${dev}" "${mnt_path}"; then
+    elif mount -t "${fs_type}" "${esp_dev}" "${mnt_path}"; then
         cp "${kernel}" "${mnt_path}/bzimage"
     else
-        error "$(printf "Failed to mount %s at %s\n" "${dev}" "${mnt_path}")"
+        error "$(printf "Failed to mount %s at %s with \n" "${esp_dev}" "${mnt_path}" "${fs_type}")"
         dmesg | tail -n 50 || true
         exit 1
     fi
 
-    # Unmount only if mounted
-    if findmnt -rno TARGET "${mnt_path}" >/dev/null 2>&1; then
-        umount "${dev}"
-    fi
+    umount "${esp_dev}"
+    sleep 1
 }
 
 sys_os() {
@@ -1412,14 +1410,14 @@ provision() {
     disk_part_types=$(part_types "${disk_file}")
     info "$(printf "Found %s partition(s)\n" "${#disk_part_types[@]}")"
 
-    local part_fs
-    part_fs="$(filesystem "${disk_file}" "${part_no}")"
-    debug "$(printf "Detected filesystem: %s\n" "${part_fs}")"
+    local fs_type
+    fs_type="$(filesystem "${disk_file}" "${part_no}")"
+    debug "$(printf "Detected filesystem: %s\n" "${fs_type}")"
 
     mount_disk_image_part_by_no "${disk_file}" \
                                 "${mnt_path}" \
                                 "${part_no}" \
-                                "${part_fs}"
+                                "${fs_type}"
 
     debug "$(printf "Applying changes to partition %s\n" "${part_no}")"
 
@@ -2240,14 +2238,14 @@ main() {
             exit 1
         fi
 
-        local part_fs
-        part_fs="$(filesystem "${img}" "${part_no}")"
-        part_fs="$(echo -n "$part_fs")"
+        local fs_type
+        fs_type="$(filesystem "${img}" "${part_no}")"
+        fs_type="$(echo -n "$fs_type")"
 
         mount_disk_image_part_by_no "${img}" \
                                     "${mnt_path}" \
                                     "${part_no}" \
-                                    "${part_fs}"
+                                    "${fs_type}"
 
         if [ "chroot" == "${1}" ]; then
             chroot "${mnt_path}" "/bin/sh"
@@ -2405,5 +2403,5 @@ main() {
     exit 1
 }
 
-args="$@"
+args=("$@")
 main "$@"
