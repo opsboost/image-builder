@@ -128,7 +128,7 @@ check_root_fail() {
 
 reexec_privileged() {
     if [ "$(id -u)" != "0" ]; then
-        sudo "$SCRIPT_PATH"/"$SCRIPT_NAME" $args
+        sudo "$SCRIPT_PATH"/"$SCRIPT_NAME" "${args[@]}"
         exit 0
     fi
 }
@@ -188,8 +188,8 @@ mount_disk_image_part_by_no() {
     mnt_path="${2}"
     local part_no
     part_no="${3}"
-    local part_fs
-    part_fs="${4}"
+    local fs_type
+    fs_type="${4}"
     local loop_no
     loop_no="0"
     local dev
@@ -200,15 +200,15 @@ mount_disk_image_part_by_no() {
 
     mkdir -p "${mnt_path}"
 
-    part_fs="$(trim "${part_fs}")"
+    fs_type="$(trim "${fs_type}")"
 
     # Mount
-    if mount -t "${part_fs}" "${dev}" "${mnt_path}"; then
+    if mount -t "${fs_type}" "${dev}" "${mnt_path}"; then
         info "$(printf "Mounted %s at %s\n" "${disk_file}" "${mnt_path}")"
     else
         error "$(printf "Failed to mount %s (%s) at %s \
                          Aborting..\n" "${dev}" \
-                                       "${part_fs}" \
+                                       "${fs_type}" \
                                        "${mnt_path}")"
         # Remove disk
         loop_unmount ""
@@ -283,7 +283,7 @@ create_user() {
     local path
     path="${2}"
     local os
-    os="${sys_os}"
+    os="$(sys_os)"
 
     case "$os" in
     freebsd)
@@ -666,7 +666,7 @@ loop_mount_linux() {
     local disk_file
     disk_file="${1}"
 
-    printf "Loop mounting %s" "${disk_file}"
+    printf "Loop mounting %s\n" "${disk_file}"
 
     if [ 2 == "$(loop_exists)" ]; then
         local loop_dev
@@ -771,22 +771,52 @@ install_bootloader_efi() {
         local os
         os="$(sys_os)"
         if [ "ubuntu" = "${os}" ]; then
-            info "bootctl not found; installing on Ubuntu"
+            info "bootctl not found: Installing on Ubuntu"
             install_bootctl
         fi
     fi
 
     mkdir -p "${mnt_path}"
+    chmod 700 "${mnt_path}" || true
 
-    if ! mount "${esp_dev}" "${mnt_path}"; then
-        error "$(printf "Failed to install bootloader to efi system partition (esp): %s at path: %s\n" "${esp_dev}" "${mnt_path}")"
+    # Sanity checks: device must exist
+    if [ -z "${esp_dev}" ]; then
+        error "install_bootloader_efi: Missing ESP device (arg #1)"
         exit 1
+    fi
+    if [ ! -b "${esp_dev}" ] && [ ! -c "${esp_dev}" ]; then
+        error "install_bootloader_efi: ESP device does not exist: ${esp_dev}"
+        lsblk -f || true
+        exit 1
+    fi
+
+    # Avoid double-mount: mount only if not already mounted
+    if findmnt -rno TARGET "${mnt_path}" >/dev/null 2>&1; then
+        info "ESP already mounted at ${mnt_path}"
+    else
+        # Prefer explicit vfat mount with safe options
+        if ! mount -t vfat -o codepage=437,iocharset=utf8,shortname=mixed,umask=077 "${esp_dev}" "${mnt_path}"; then
+            info "Mount failed, attempting vfat fsck"
+            command -v fsck.vfat >/dev/null 2>&1 && fsck.vfat -a "${esp_dev}" || true
+            sleep 1
+            if ! mount -t vfat -o codepage=437,iocharset=utf8,shortname=mixed,umask=077 "${esp_dev}" "${mnt_path}"; then
+                error "$(printf "Failed to install bootloader to efi system partition (esp): %s at path: %s\n" "${esp_dev}" "${mnt_path}")"
+                dmesg | tail -n 50 || true
+                exit 1
+            fi
+        fi
     fi
 
     # Populate esp partition
     printf "\n"
     printf "Creating esp content at path %s..\n" "${mnt_path}"
     bootctl --esp-path="${mnt_path}" install
+    # Fix random-seed permissions warnings from bootctl
+    chmod 700 "${mnt_path}" || true
+    if [ -d "${mnt_path}/loader" ]; then
+        find "${mnt_path}/loader" -maxdepth 1 -type f -name "random-seed" -exec chmod 600 {} \; 2>/dev/null || true
+        find "${mnt_path}/loader" -maxdepth 1 -type f -name ".#bootctlrandom-seed*" -exec chmod 600 {} \; 2>/dev/null || true
+    fi
 
     # Create boot entry
     local boot_entry_title
@@ -801,25 +831,68 @@ install_bootloader_efi() {
     printf "\n"
 
     umount "${esp_dev}"
+    sleep 3
 }
 
 install_kernel() {
     local kernel
     kernel="${1}"
-    local dev
-    dev="${2}"
+    local esp_dev
+    esp_dev="${2}"
     local mnt_path
     mnt_path="${3}"
-    local part_fs
-    part_fs="vfat"
+    local fs_type
+    fs_type="vfat"
 
-    if mount -t "${part_fs}" "${dev}" "${mnt_path}"; then
-        cp "${kernel}" "${mnt_path}/bzimage"
-    else
-        error "$(printf "Failed to mount %s at %s\n" "${dev}" "${mnt_path}")"
+    info "Installing kernel"
+    reexec_privileged
+    modprobe vfat || true
+    mkdir -p "${mnt_path}"
+    chmod 700 "${mnt_path}" || true
+
+    info "Installing kernel\n"
+
+    if [ -z "${esp_dev}" ]; then
+        error "install_kernel: Missing device for ESP (arg #2)"
+        exit 1
+    fi
+    if [ ! -b "${esp_dev}" ] && [ ! -c "${esp_dev}" ]; then
+        error "install_kernel: Device does not exist: ${esp_dev}"
+        lsblk -f || true
+        exit 1
     fi
 
-    umount "${dev}"
+    info "Mounting disk image: ${esp_dev} with ${fs_type} at ${mnt_path}"
+
+    # Verify filesystem type before mounting
+    if command -v blkid >/dev/null 2>&1; then
+        fs_probe=$(blkid -o value -s TYPE "${esp_dev}" || true)
+        if [ -n "${fs_probe}" ] && [ "vfat" != "${fs_probe}" ] && [ "fat" != "${fs_probe}" ] && [ "msdos" != "${fs_probe}" ]; then
+            error "install_kernel: ESP is not FAT/vfat (detected: ${fs_probe})"
+        fi
+    fi
+
+    # Avoid double-mount
+    if findmnt -rno TARGET "${mnt_path}" >/dev/null 2>&1; then
+        info "ESP already mounted at ${mnt_path}"
+    else
+        if ! mount -t "${fs_type}" -o codepage=437,iocharset=utf8,shortname=mixed,umask=077 "${esp_dev}" "${mnt_path}"; then
+            info "Mount failed, running fsck.vfat then retry"
+            command -v fsck.vfat >/dev/null 2>&1 && fsck.vfat -a "${esp_dev}" || true
+            sleep 1
+            if ! mount -t "${fs_type}" -o codepage=437,iocharset=utf8,shortname=mixed,umask=077 "${esp_dev}" "${mnt_path}"; then
+                error "$(printf "Failed to mount %s at %s with %s\n" "${esp_dev}" "${mnt_path}" "${fs_type}")"
+                dmesg | tail -n 50 || true
+                exit 1
+            fi
+        fi
+        # Copy kernel once mounted
+        info "Copying kernel to ESP"
+        cp "${kernel}" "${mnt_path}/bzImage"
+    fi
+
+    umount "${esp_dev}"
+    sleep 1
 }
 
 sys_os() {
@@ -981,7 +1054,7 @@ build_freebsd_release() {
     cp /etc/src.conf "$target_path/etc"
 
     cd "${src_path}"
-    sh -c "TARGETS="amd64" release/release.sh -c $target_path/etc/release.conf mini-memstick"
+    sh -c "TARGETS=\"amd64\" release/release.sh -c $target_path/etc/release.conf mini-memstick"
 
     info "$(printf "Creating compressed archive: %s\n" "${release_archive}")"
     tar cJf "${release_archive}" "${target_path}"
@@ -1237,12 +1310,22 @@ install_builder() {
 
 # Populate rootfs
 install_rootfs() {
-    mount "${1}" "${2}"
-    printf "extracting stage3 to root in %s\n" "${2}"
-    tar xpf stage3-*.tar.xz --xattrs-include='*.*' --numeric-owner --directory "${2}"
+    local rootfs_dev
+    rootfs_dev="${1}"
+    local mnt_path
+    mnt_path="${2}"
+    local fs_type
+    fs_type="${3}"
+
+    info "Installing sys to root fs"
+    info "Mounting: ${rootfs_dev} with ${fs_type} at ${mnt_path}"
+
+    mount -t "${fs_type}" "${rootfs_dev}" "${mnt_path}"
+    printf "Extracting stage3 to root in %s\n" "${mnt_path}"
+    tar xpf stage3-*.tar.xz --xattrs-include='*.*' --numeric-owner --directory "${mnt_path}"
     printf "\n"
-    ls "${2}"
-    umount "${1}"
+    ls "${mnt_path}"
+    umount "${rootfs_dev}"
 }
 
 install_fonts() {
@@ -1366,14 +1449,14 @@ provision() {
     disk_part_types=$(part_types "${disk_file}")
     info "$(printf "Found %s partition(s)\n" "${#disk_part_types[@]}")"
 
-    local part_fs
-    part_fs="$(filesystem "${disk_file}" "${part_no}")"
-    debug "$(printf "Detected filesystem: %s\n" "${part_fs}")"
+    local fs_type
+    fs_type="$(filesystem "${disk_file}" "${part_no}")"
+    debug "$(printf "Detected filesystem: %s\n" "${fs_type}")"
 
     mount_disk_image_part_by_no "${disk_file}" \
                                 "${mnt_path}" \
                                 "${part_no}" \
-                                "${part_fs}"
+                                "${fs_type}"
 
     debug "$(printf "Applying changes to partition %s\n" "${part_no}")"
 
@@ -1605,9 +1688,8 @@ gentoo_create_disk() {
         ;;
     esac
 
-
-    # Remove disk
-    loop_unmount ""
+    # Keep loop device mounted for subsequent install steps
+    # Caller is responsible for loop teardown after installs
 }
 
 write_image_to_disk() {
@@ -2106,6 +2188,8 @@ main() {
             exit 0
             ;;
         gentoo-containeros|gentoo-sway)
+            local rootfs_dev
+            rootfs_dev=$(rootfs)
             local boot_entry_file
             boot_entry_file="${mnt_path}/loader/entries/linux-${kernel_version}.conf"
             gentoo_create_disk  "${img_path}" \
@@ -2135,7 +2219,7 @@ main() {
                            "${mnt_path}" \
                            "${kernel_version}"
 
-            install_rootfs "${rootfs_dev}" "${mnt_path}"
+            install_rootfs "${rootfs_dev}" "${mnt_path}" "xfs"
 
             info "$(printf "Gentoo: Provisioning image\n")"
 
@@ -2151,6 +2235,9 @@ main() {
                       "${ansible_user}" \
                       "${ansible_roles_path}" \
                       "${ansible_roles}"
+
+            # Tear down loop devices after installation steps
+            loop_unmount ""
 
             exit 0
             ;;
@@ -2192,14 +2279,14 @@ main() {
             exit 1
         fi
 
-        local part_fs
-        part_fs="$(filesystem "${img}" "${part_no}")"
-        part_fs="$(echo -n "$part_fs")"
+        local fs_type
+        fs_type="$(filesystem "${img}" "${part_no}")"
+        fs_type="$(echo -n "$fs_type")"
 
         mount_disk_image_part_by_no "${img}" \
                                     "${mnt_path}" \
                                     "${part_no}" \
-                                    "${part_fs}"
+                                    "${fs_type}"
 
         if [ "chroot" == "${1}" ]; then
             chroot "${mnt_path}" "/bin/sh"
@@ -2357,5 +2444,5 @@ main() {
     exit 1
 }
 
-args="$@"
+args=("$@")
 main "$@"
