@@ -45,7 +45,7 @@ SCRIPT_NAME=$(basename "$0")
 SCRIPT_PATH="$(dirname -- "${BASH_SOURCE[0]}")"
 SCRIPT_PATH="$(cd -- "${SCRIPT_PATH}" && pwd)"
 
-target_arch="aarch64"
+target_arch="amd64"
 platform="pine64"
 
 # Kernel
@@ -76,12 +76,12 @@ alpine_csum_file="${alpine_compressed_img_file}".sha384
 alpine_csum_url="${alpine_repo_url}/${alpine_version}/${alpine_csum_file}"
 
 # Gentoo
-gentoo_stage3_version="latest"
+gentoo_stage3_version="20251207T170056Z"
 gentoo_stage3_file="stage3-${target_arch}-systemd-${gentoo_stage3_version}.tar.xz"
-gentoo_stage3_repo_url="https://bouncer.gentoo.org/fetch/root/all/releases/amd64/autobuilds"
-gentoo_stage3_url="${gentoo_stage3_repo_url}/${gentoo_stage3_version}/${gentoo_stage3_file}"
+gentoo_stage3_repo_url="https://bouncer.gentoo.org/fetch/root/all/releases/amd64/autobuilds/current-stage3-amd64-systemd/"
+gentoo_stage3_url="${gentoo_stage3_repo_url}/${gentoo_stage3_file}"
 gentoo_stage3_csum_file="${gentoo_stage3_file}.sha256"
-gentoo_stage3_csum_url="${gentoo_stage3_repo_url}/${gentoo_stage3_version}/${gentoo_stage3_csum_file}"
+gentoo_stage3_csum_url="${gentoo_stage3_repo_url}/${gentoo_stage3_csum_file}"
 gentoo_stage4_repo_url="https://github.com/bbusse/gentoo-build/releases/tag"
 gentoo_config_url="https://github.com/bbusse/gentoo-config"
 gentoo_build_container_url="https://github.com/bbusse/gentoo-build"
@@ -1220,10 +1220,11 @@ build_gentoo_stage3() {
 gentoo_fetch_stage3() {
     info "Fetching stage3"
 
-    download_miss "${path}" \
-                  "${gentoo_stage3_url}" \
-                  "${gentoo_stage3_csum_url}" \
-                  "${gentoo_stage3_csum_file}"
+    download "${gentoo_stage3_url}" "${path}"
+    #download_miss "${path}" \
+    #              "${gentoo_stage3_url}" \
+    #              "${gentoo_stage3_csum_url}" \
+    #              "${gentoo_stage3_csum_file}"
 }
 
 # We also use this in a github-action
@@ -1321,6 +1322,7 @@ install_rootfs() {
     info "Mounting: ${rootfs_dev} with ${fs_type} at ${mnt_path}"
 
     mount -t "${fs_type}" "${rootfs_dev}" "${mnt_path}"
+
     printf "Extracting stage3 to root in %s\n" "${mnt_path}"
     tar xpf stage3-*.tar.xz --xattrs-include='*.*' --numeric-owner --directory "${mnt_path}"
     printf "\n"
@@ -2202,6 +2204,7 @@ main() {
                           "${kernel_csum_url}" \
                           "${kernel_csum_file}"
 
+            gentoo_fetch_stage3
             gentoo_fetch_stage4 "$target_flavour" "$target_arch"
 
             # Install EFI bootloader
