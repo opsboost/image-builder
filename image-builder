@@ -101,6 +101,9 @@ podman_repo_url="https://download.opensuse.org/repositories/devel:/kubic:/libcon
 
 log_level=info
 
+# Default retries for network downloads; override with DOWNLOAD_RETRIES env
+DOWNLOAD_RETRIES="${DOWNLOAD_RETRIES:-3}"
+
 # Check if we got root privileges
 # Return 0 if privileged, 1 otherwise
 check_root() {
@@ -243,7 +246,7 @@ download_miss() {
     cd "${download_path}" || exit 1
 
     debug "$(printf "Fetching file checksum\n")"
-    download "${csum_url}" "${download_path}"
+    download "${csum_url}" "${download_path}" "${DOWNLOAD_RETRIES}"
 
     if [ -f "${download_path}/${file}" ]; then
         ret=$(compare_checksums "${download_path}/${csum_file}" \
@@ -258,7 +261,7 @@ download_miss() {
     fi
 
     if [ 1 == "$download_image" ]; then
-        download "${file}" "${download_path}"
+        download "${file}" "${download_path}" "${DOWNLOAD_RETRIES}"
     fi
 }
 
@@ -267,16 +270,36 @@ download() {
     url="${1}"
     local path
     path="${2}"
+    local retries
+    retries="${3:-1}"
+    local attempt
+    attempt=1
+    local success
+    success=0
 
     info "$(printf "Fetching: %s\n" "${url}")"
+
     # --output-dir needs a new enough cURL
     cd "${path}" || exit 1
     if ! curl -s -S --fail -LO "${url}"; then
-        error "$(printf "Failed to fetch file. Aborting..\n")"
+        error "$(printf "Failed to fetch %s. Aborting..\n" "${url}")"
+    while [ "${attempt}" -le "${retries}" ]; do
+        if curl -s -S --fail -LO "${url}"; then
+            success=1
+            break
+        else
+            if [ "${attempt}" -lt "${retries}" ]; then
+                info "$(printf "Download attempt %s/%s failed; retrying..\n" "${attempt}" "${retries}")"
+                sleep 2
+            fi
+        fi
+        attempt=$((attempt+1))
+    done
+
+    if [ "${success}" -ne 1 ]; then
+        error "$(printf "Failed to fetch file after %s attempt(s). Aborting..\n" "${retries}")"
         exit 1
     fi
-}
-
 create_user() {
     local user
     user="${1}"
@@ -639,6 +662,25 @@ rootfs() {
 }
 
 # Set up loop mount
+loop_mount() {
+    local disk_file
+    disk_file="${1}"
+    local os
+    os=$(sys_os)
+
+    case "$os" in
+    fedora|ubuntu)
+        loop_mount_linux "${disk_file}"
+        ;;
+    macos)
+        loop_mount_macos "${disk_file}"
+        ;;
+    freebsd)
+        loop_mount_freebsd "${disk_file}"
+        ;;
+    esac
+}
+
 loop_mount_macos() {
     local loop_device
     loop_device="${1}"
@@ -1220,7 +1262,7 @@ build_gentoo_stage3() {
 gentoo_fetch_stage3() {
     info "Fetching stage3"
 
-    download "${gentoo_stage3_url}" "${path}"
+    download "${gentoo_stage3_url}" "${path}" "3"
     #download_miss "${path}" \
     #              "${gentoo_stage3_url}" \
     #              "${gentoo_stage3_csum_url}" \
