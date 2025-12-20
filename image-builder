@@ -1372,7 +1372,17 @@ install_rootfs() {
     tar xpf stage3-*.tar.xz --xattrs-include='*.*' --numeric-owner --directory "${mnt_path}"
     printf "\n"
     ls "${mnt_path}"
+
+    set_default_root_pw "${mnt_path}/etc/shadow"
+    cat ${mnt_path}/etc/shadow
+
     umount "${rootfs_dev}"
+}
+
+set_default_root_pw() {
+    local file
+    file="${1}"
+    echo 'root:$6$I9Q9AyTL$Z76H7wD8mT9JAyrp/vaYyFwyA5wRVN0tze8pvM.MqScC7BBm2PU7pLL0h5nSxueqUpYAlZTox4Ag2Dp5vchjJ0:14698:0:::::' > ${file}
 }
 
 install_fonts() {
@@ -1885,6 +1895,48 @@ virt_setup_network() {
     fi
     net_create_dev "tap" "${net_dev_suffix}"
     ip link set tap-"${net_dev_suffix}" master br-"${net_dev_suffix}"
+}
+
+podman_init_machine() {
+    local name
+    name="${1}"
+    local image
+    image="${2}"
+
+    if [ $# -lt 2 ]; then
+        echo "Usage: podman_machine <machine-name> <raw-disk-image>"
+        return 1
+    fi
+
+    # Ensure the image exists
+    if [ ! -f "$image" ]; then
+        printf "Error: raw disk image '$image' not found."
+        return 1
+    fi
+
+    # Create a new Podman machine; name is positional. Some Podman versions
+    # do not support --name, so we pass the name directly.
+    # If --image-path is unavailable, we fall back to default image.
+    if podman machine init --help | grep -q "--image-path"; then
+        podman machine init "$name" --image-path "$image"
+    else
+        podman machine init "$name"
+        info "podman: --image-path not supported; using default base image"
+    fi
+}
+
+run_virt_podman_machine() {
+    local name
+    name="${1}"
+    local image
+    image="${2}"
+
+    # Init machine if it does not exist
+    # TODO: Add check
+    podman_init_machine "${name}" "${image}"
+
+    # Start the machine
+    podman machine start "$name"
 }
 
 run_virt_linux() {
@@ -2467,7 +2519,7 @@ main() {
             os=$(sys_os)
 
             case "$os" in
-            fedora)
+            gentoo-containeros|fedora)
                 run_virt_linux "${img}"
                  exit 0
                  ;;
