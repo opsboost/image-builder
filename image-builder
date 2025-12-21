@@ -76,9 +76,9 @@ alpine_csum_file="${alpine_compressed_img_file}".sha384
 alpine_csum_url="${alpine_repo_url}/${alpine_version}/${alpine_csum_file}"
 
 # Gentoo
-gentoo_stage3_version="20251207T170056Z"
+gentoo_stage3_version="20250803T163732Z"
 gentoo_stage3_file="stage3-${target_arch}-systemd-${gentoo_stage3_version}.tar.xz"
-gentoo_stage3_repo_url="https://bouncer.gentoo.org/fetch/root/all/releases/amd64/autobuilds/current-stage3-amd64-systemd/"
+gentoo_stage3_repo_url="https://bouncer.gentoo.org/fetch/root/all/releases/${target_arch}/autobuilds/current-stage3-amd64-systemd/"
 gentoo_stage3_url="${gentoo_stage3_repo_url}/${gentoo_stage3_file}"
 gentoo_stage3_csum_file="${gentoo_stage3_file}.sha256"
 gentoo_stage3_csum_url="${gentoo_stage3_repo_url}/${gentoo_stage3_csum_file}"
@@ -1265,7 +1265,7 @@ build_gentoo_stage3() {
 gentoo_fetch_stage3() {
     info "Fetching stage3"
 
-    download "${gentoo_stage3_url}" "${path}" "3"
+    download "${gentoo_stage3_url}" "${path}" "16"
     #download_miss "${path}" \
     #              "${gentoo_stage3_url}" \
     #              "${gentoo_stage3_csum_url}" \
