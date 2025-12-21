@@ -1158,21 +1158,10 @@ linux_build_kernel() {
     fi
 
     info "$(printf "Building kernel version %s for %s with arch %s\n" "${kernel_version}" "${kernel_flavour}" "${target_arch}")"
+
     if [ 1 = "${build_use_container}" ]; then
         local platform
         platform=$(container_platform "$target_arch")
-
-        # Validate chroot config visibility
-        info "Verifying chroot config at $target_path/etc"
-        if [ ! -f "$target_path/etc/src.conf" ] || [ ! -f "$target_path/etc/make.conf" ]; then
-            error "Chroot config missing: ensure src.conf and make.conf are copied"
-            ls -al "$target_path/etc" || true
-            exit 1
-        fi
-
-        info "Effective src.conf:"
-        cat "$target_path/etc/src.conf" || true
-        cd "${src_path}"
 
         if [ -z "$platform" ]; then
             error "$(printf "kernel-build: Unsupported target arch: %s\n" "${target_arch}")"
