@@ -1157,6 +1157,7 @@ linux_build_kernel() {
     if [ 1 = "${build_use_container}" ]; then
         local platform
         platform=$(container_platform "$target_arch")
+
         # Validate chroot config visibility
         info "Verifying chroot config at $target_path/etc"
         if [ ! -f "$target_path/etc/src.conf" ] || [ ! -f "$target_path/etc/make.conf" ]; then
@@ -1164,10 +1165,11 @@ linux_build_kernel() {
             ls -al "$target_path/etc" || true
             exit 1
         fi
+
         info "Effective src.conf:"
         cat "$target_path/etc/src.conf" || true
-    
         cd "${src_path}"
+
         if [ -z "$platform" ]; then
             error "$(printf "kernel-build: Unsupported target arch: %s\n" "${target_arch}")"
             error "kernel-build: target_arch must be amd64 or arm64\n"
@@ -1307,6 +1309,8 @@ build_gentoo_stage4() {
     cd "$path_containerfile"
     gentoo_fetch_config "${gentoo_config_url}"
     mkdir output
+
+    info "podman: Building ${target_flavour} for ${platform}"
 
     podman buildx build --cap-add=SYS_PTRACE \
                         --platform="${platform}" \
