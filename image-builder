@@ -1253,6 +1253,8 @@ gentoo_fetch_stage4() {
     info "gentoo: Fetching stage4"
     gentoo_stage4_file="gentoo-stage4-${target_flavour}-${target_arch}-${target_version}.tar.xz"
     gentoo_stage4_url="${gentoo_stage4_repo_url}/${target_version}/${gentoo_stage4_file}"
+
+    download "${gentoo_stage4_url}" "/" "3"
 }
 
 # Build a Gentoo stage3 with catalyst
@@ -2293,6 +2295,10 @@ main() {
             rootfs_dev=$(rootfs)
             local boot_entry_file
             boot_entry_file="${mnt_path}/loader/entries/linux-${kernel_version}.conf"
+
+            local target_flavour
+            target_flavour=${build_target#*gentoo-}
+
             gentoo_create_disk  "${img_path}" \
                                 "${img_file}" \
                                 "${mnt_path}"
@@ -2304,7 +2310,7 @@ main() {
                           "${kernel_csum_file}"
 
             gentoo_fetch_stage3
-            gentoo_fetch_stage4 "$target_flavour" "$target_arch"
+            gentoo_fetch_stage4 "$target_flavour" "$target_arch" "latest"
 
             # Install EFI bootloader
             local esp_dev
