@@ -1320,6 +1320,15 @@ build_gentoo_stage4() {
                         -f Containerfile
 }
 
+build_u_root() {
+    info "podman: Building u-root for ${platform}"
+    podman_install
+    podman buildx build --platform="${platform}" \
+                        -v "${PWD}"/output:/output \
+                        -t "u-root" \
+                        -f Containerfile
+}
+
 openwrt_build() {
     local flavour
     flavour="$1"
@@ -2197,6 +2206,10 @@ main() {
             fi
 
             openwrt_build "${flavour}"
+            exit 0
+            ;;
+        u-root)
+            build_u_root
             exit 0
             ;;
         esac
