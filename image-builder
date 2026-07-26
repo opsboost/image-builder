@@ -1125,7 +1125,14 @@ build_nanobsd_world() {
     local version
     version="$(freebsd-version)"
 
-    sh tools/tools/nanobsd/nanobsd.sh
+    # nanobsd.sh hardcodes NANO_SRC=/usr/src in defaults.sh and only
+    # a -c config file sourced during arg parsing can override it, so
+    # point it at our actual checkout instead of the /usr/src default
+    local nano_conf
+    nano_conf="$(mktemp)"
+    echo "NANO_SRC=$(pwd)" > "${nano_conf}"
+
+    sh tools/tools/nanobsd/nanobsd.sh -c "${nano_conf}"
 }
 
 linux_install_kernel_build_dependencies() {
