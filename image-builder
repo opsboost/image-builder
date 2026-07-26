@@ -1048,6 +1048,14 @@ container_platform() {
 freebsd_install_build_dependencies() {
     # Install build dependencies
     pkg install -y curl python
+
+    # If the freebsd-src checkout's owner uid doesn't match the uid
+    # running this script, git's dubious-ownership check would abort
+    # build steps (e.g. nanobsd.sh) that shell out to git. This can
+    # happen e.g. when running in a GitHub Action (or any VM with
+    # sshfs), where the source is synced in and built as a different
+    # user, like the action does
+    git config --global --add safe.directory '*'
 }
 
 # src.conf / make.conf / release.conf
