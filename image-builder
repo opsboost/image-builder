@@ -1132,7 +1132,22 @@ build_nanobsd_world() {
     nano_conf="$(mktemp)"
     echo "NANO_SRC=$(pwd)" > "${nano_conf}"
 
-    sh tools/tools/nanobsd/nanobsd.sh -c "${nano_conf}"
+    # nanobsd.sh redirects buildworld/buildkernel output into log
+    # files under NANO_OBJ instead of stdout, and aborts silently on
+    # failure (set -e, no error message), so surface the tail of
+    # those logs here since NANO_OBJ lives outside the synced
+    # workspace and would otherwise be lost with the VM
+    if ! sh tools/tools/nanobsd/nanobsd.sh -c "${nano_conf}"; then
+        error "nanobsd build failed, dumping build logs:"
+        local log
+        for log in /usr/obj/nanobsd.*/_.bw /usr/obj/nanobsd.*/_.bk; do
+            if [ -f "${log}" ]; then
+                error "=== tail -n 200 ${log} ==="
+                tail -n 200 "${log}" >&2
+            fi
+        done
+        exit 1
+    fi
 }
 
 linux_install_kernel_build_dependencies() {
