@@ -76,13 +76,12 @@ alpine_csum_file="${alpine_compressed_img_file}".sha384
 alpine_csum_url="${alpine_repo_url}/${alpine_version}/${alpine_csum_file}"
 
 # Gentoo
-gentoo_stage3_version="20250803T163732Z"
-gentoo_stage3_file="stage3-${target_arch}-systemd-${gentoo_stage3_version}.tar.xz"
+# gentoo_stage3_file/url are resolved at fetch time from the "latest-stage3"
+# manifest (see gentoo_fetch_stage3) - Gentoo mirrors prune older snapshots,
+# so a hardcoded version 404s within a few months.
 gentoo_stage3_repo_url="https://bouncer.gentoo.org/fetch/root/all/releases/${target_arch}/autobuilds/current-stage3-amd64-systemd/"
-gentoo_stage3_url="${gentoo_stage3_repo_url}/${gentoo_stage3_file}"
-gentoo_stage3_csum_file="${gentoo_stage3_file}.sha256"
-gentoo_stage3_csum_url="${gentoo_stage3_repo_url}/${gentoo_stage3_csum_file}"
-gentoo_stage4_repo_url="https://github.com/bbusse/gentoo-build/releases/tag"
+gentoo_stage3_manifest_file="latest-stage3-${target_arch}-systemd.txt"
+gentoo_stage4_repo_url="https://github.com/bbusse/gentoo-build/releases/download"
 gentoo_config_url="https://github.com/bbusse/gentoo-config"
 gentoo_build_container_url="https://github.com/bbusse/gentoo-build"
 
@@ -1281,7 +1280,7 @@ gentoo_fetch_stage4() {
     target_version="$3"
 
     info "gentoo: Fetching stage4"
-    gentoo_stage4_file="gentoo-stage4-${target_flavour}-${target_arch}-${target_version}.tar.xz"
+    gentoo_stage4_file="gentoo-stage4-${target_flavour}-${target_arch}.tar.xz"
     gentoo_stage4_url="${gentoo_stage4_repo_url}/${target_version}/${gentoo_stage4_file}"
 
     download "${gentoo_stage4_url}" "/" "3"
@@ -1295,6 +1294,14 @@ build_gentoo_stage3() {
 
 gentoo_fetch_stage3() {
     info "Fetching stage3"
+
+    download "${gentoo_stage3_repo_url}/${gentoo_stage3_manifest_file}" "${path}" "3"
+
+    local gentoo_stage3_file
+    gentoo_stage3_file=$(grep -o 'stage3-[^[:space:]]*\.tar\.xz' \
+                              "${path}/${gentoo_stage3_manifest_file}" | head -1)
+    local gentoo_stage3_url
+    gentoo_stage3_url="${gentoo_stage3_repo_url}/${gentoo_stage3_file}"
 
     download "${gentoo_stage3_url}" "${path}" "16"
     #download_miss "${path}" \
@@ -1329,14 +1336,9 @@ build_gentoo_stage4() {
     podman_install
 
     info "$(printf "Gentoo: Building stage4")"
-    mkdir -p "${PWD}"/output
 
     git clone --depth 1 "$gentoo_build_container_url"
-
-    local path_containerfile
-    path_containerfile="gentoo-build"
-    cd "$path_containerfile"
-    gentoo_fetch_config "${gentoo_config_url}"
+    cd gentoo-build
     mkdir output
 
     info "podman: Building ${target_flavour} for ${platform}"
