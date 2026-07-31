@@ -1283,7 +1283,9 @@ gentoo_fetch_stage4() {
     gentoo_stage4_file="gentoo-stage4-${target_flavour}-${target_arch}.tar.xz"
     gentoo_stage4_url="${gentoo_stage4_repo_url}/${target_version}/${gentoo_stage4_file}"
 
-    download "${gentoo_stage4_url}" "/" "3"
+    # "/" isn't writable by a non-root CI user; use the same destination
+    # stage3 fetches into
+    download "${gentoo_stage4_url}" "${path:-.}" "3"
 }
 
 # Build a Gentoo stage3 with catalyst
@@ -1299,7 +1301,7 @@ gentoo_fetch_stage3() {
 
     local gentoo_stage3_file
     gentoo_stage3_file=$(grep -o 'stage3-[^[:space:]]*\.tar\.xz' \
-                              "${path}/${gentoo_stage3_manifest_file}" | head -1)
+                              "${path:-.}/${gentoo_stage3_manifest_file}" | head -1)
     local gentoo_stage3_url
     gentoo_stage3_url="${gentoo_stage3_repo_url}/${gentoo_stage3_file}"
 
@@ -2343,6 +2345,15 @@ main() {
 
             local target_flavour
             target_flavour=${build_target#*gentoo-}
+
+            # download_miss/gentoo_fetch_stage3 (called below) expect a
+            # "path" in scope to fetch into - it was never actually set
+            # anywhere in this call chain, so it silently expanded to "",
+            # and cd "" happens to no-op on this runner instead of erroring,
+            # meaning downloads landed in whatever the cwd happened to be
+            # rather than alongside the image we're building
+            local path
+            path="${img_path}"
 
             gentoo_create_disk  "${img_path}" \
                                 "${img_file}" \
