@@ -1110,8 +1110,6 @@ build_freebsd_release() {
     info "$(printf "Building release for version %s\n" "${version}")"
     mkdir -p "$target_path/etc"
     cp freebsd-config/release.conf "$target_path/etc"
-    cp /etc/make.conf "$target_path/etc"
-    cp /etc/src.conf "$target_path/etc"
 
     cd "${src_path}"
     sh -c "TARGETS=\"amd64\" release/release.sh -c $target_path/etc/release.conf mini-memstick"
