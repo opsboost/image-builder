@@ -88,6 +88,9 @@ gentoo_build_container_url="https://github.com/bbusse/gentoo-build"
 # FreeBSD
 freebsd_source_url="https://github.com/freebsd/freebsd-src"
 freebsd_config_url="https://github.com/bbusse/freebsd-config"
+# Root password baked into built images so CI can boot-test them under
+# qemu; these images are throwaway CI artifacts, not production systems
+freebsd_ci_root_password="freebsd-ci"
 
 # OpenWrt
 openwrt_source_url="https://github.com/bbusse/openwrt"
@@ -591,7 +594,7 @@ create_boot_entry() {
 cat << EOF > "${entry_file}"
 title         ${title}
 linux         /bzImage
-options       root=${rootfs_dev} init=/lib/systemd/systemd enforcing=1
+options       root=${rootfs_dev} init=/lib/systemd/systemd enforcing=1 console=tty0 console=ttyS0,115200n8
 EOF
 }
 
@@ -1044,6 +1047,95 @@ container_platform() {
     fi
 }
 
+# FreeBSD's TARGET/TARGET_ARCH pair doesn't match arm64/aarch64
+# 1:1: TARGET is the machine family (arm64), TARGET_ARCH is the
+# specific machine arch (aarch64). For amd64 both are the same.
+freebsd_target() {
+    local target_arch
+    target_arch="${1}"
+
+    if [ "arm64" = "${target_arch}" ]; then
+        echo "arm64"
+    else
+        echo "amd64"
+    fi
+}
+
+freebsd_target_arch() {
+    local target_arch
+    target_arch="${1}"
+
+    if [ "arm64" = "${target_arch}" ]; then
+        echo "aarch64"
+    else
+        echo "amd64"
+    fi
+}
+
+# Recursively walk gpart's MBR -> BSD label layout (used by both
+# nanobsd and mini-memstick images) to find the freebsd-ufs partition,
+# without hardcoding slice/partition numbers
+find_ufs_partition() {
+    local geom
+    geom="${1}"
+
+    local part
+    part="$(gpart show -p "${geom}" 2>/dev/null | awk '$4 == "freebsd-ufs" {print $3; exit}')"
+    if [ -n "${part}" ]; then
+        echo "${part}"
+        return 0
+    fi
+
+    local slice
+    slice="$(gpart show -p "${geom}" 2>/dev/null | awk '$4 == "freebsd" {print $3; exit}')"
+    if [ -n "${slice}" ]; then
+        find_ufs_partition "${slice}"
+        return $?
+    fi
+
+    return 1
+}
+
+# Set a known root password and enable the serial console on a built
+# disk image, so CI can boot-test it headless under qemu (-nographic
+# -serial pipe:...). Images built here have no NANO_CUSTOMIZE/release.sh
+# hook late enough to do this pre-image, so it's done post-build by
+# mounting the image directly
+freebsd_customize_image() {
+    local image
+    image="${1}"
+    local password
+    password="${2}"
+
+    local md
+    md="$(mdconfig -a -t vnode -f "${image}")"
+
+    local part
+    part="$(find_ufs_partition "${md}")"
+    if [ -z "${part}" ]; then
+        mdconfig -d -u "${md}"
+        error "$(printf "freebsd_customize_image: could not find a freebsd-ufs partition in %s\n" "${image}")"
+        return 1
+    fi
+
+    local mnt
+    mnt="$(mktemp -d)"
+    mount "/dev/${part}" "${mnt}"
+
+    echo "${password}" | pw -R "${mnt}" usermod root -h 0
+    sed -i "" -e '/^tty[du]0/s/off/onifconsole/' "${mnt}/etc/ttys"
+    echo 'console="comconsole"' >> "${mnt}/boot/loader.conf"
+    # mini-memstick images unconditionally auto-launch bsdinstall via
+    # /etc/rc.local; drop it so the image boots to a plain login
+    # prompt instead, since here we're smoke-testing the built
+    # kernel/world, not the installer
+    rm -f "${mnt}/etc/rc.local"
+
+    umount "${mnt}"
+    rmdir "${mnt}"
+    mdconfig -d -u "${md}"
+}
+
 freebsd_install_build_dependencies() {
     # Install build dependencies
     pkg install -y curl python
@@ -1059,9 +1151,14 @@ freebsd_install_build_dependencies() {
 
 # src.conf / make.conf / release.conf
 freebsd_fetch_build_config() {
+    local target_arch
+    target_arch="${1}"
+
     git clone --depth 1 "${freebsd_config_url}"
     sudo cp freebsd-config/src.conf /etc/
-    sudo cp freebsd-config/make.conf /etc/
+    # MODULES_OVERRIDE lists arch-specific kernel modules (e.g. aesni
+    # is amd64/i386-only), so make.conf is split per arch
+    sudo cp "freebsd-config/make.conf.${target_arch}" /etc/make.conf
 }
 
 freebsd_fetch_src() {
@@ -1072,30 +1169,42 @@ freebsd_fetch_src() {
 }
 
 build_freebsd_kernel() {
+    local target_arch
+    target_arch="${1}"
+    local arch_flags
+    arch_flags="TARGET=$(freebsd_target "${target_arch}") TARGET_ARCH=$(freebsd_target_arch "${target_arch}")"
+
     cd freebsd-src
     local version
     version="$(freebsd-version)"
 
     info "$(printf "Building version: %s\n" "${version}")"
-    make buildkernel
+    sh -c "make ${arch_flags} buildkernel"
 
     mkdir -p /tmp/build
-    DESTDIR=/tmp/build make installkernel
+    sh -c "DESTDIR=/tmp/build make ${arch_flags} installkernel"
 }
 
 build_freebsd_world() {
+    local target_arch
+    target_arch="${1}"
+    local arch_flags
+    arch_flags="TARGET=$(freebsd_target "${target_arch}") TARGET_ARCH=$(freebsd_target_arch "${target_arch}")"
+
     local version
     version="$(freebsd-version)"
 
     mkdir -p /usr/obj
     mount -t tmpfs tmpfs /usr/obj
 
-    make -j4 buildworld
+    sh -c "make ${arch_flags} -j4 buildworld"
     mkdir -p /tmp/build
-    DESTDIR=/tmp/build make installworld
+    sh -c "DESTDIR=/tmp/build make ${arch_flags} installworld"
 }
 
 build_freebsd_release() {
+    local target_arch
+    target_arch="${1}"
     local version
     version="$(freebsd-version)"
     local src_path
@@ -1105,29 +1214,55 @@ build_freebsd_release() {
     local target_path
     target_path="/release"
     local release_archive
-    release_archive="freebsd-${version}.tar.xz"
+    release_archive="freebsd-${version}-${target_arch}.tar.xz"
 
-    info "$(printf "Building release for version %s\n" "${version}")"
+    info "$(printf "Building release for version %s (%s)\n" "${version}" "${target_arch}")"
     mkdir -p "$target_path/etc"
     cp freebsd-config/release.conf "$target_path/etc"
 
+    # release.conf ships amd64 defaults; override for the requested arch
+    cat >> "$target_path/etc/release.conf" <<EOF
+TARGET="$(freebsd_target "${target_arch}")"
+TARGET_ARCH="$(freebsd_target_arch "${target_arch}")"
+EOF
+
     cd "${src_path}"
-    sh -c "TARGETS=\"amd64\" release/release.sh -c $target_path/etc/release.conf mini-memstick"
+    sh -c "release/release.sh -c $target_path/etc/release.conf mini-memstick"
+
+    local memstick_image
+    memstick_image="$(find "$target_path/R" -maxdepth 1 -name '*mini-memstick.img' | head -1)"
+    if [ -n "${memstick_image}" ]; then
+        freebsd_customize_image "${memstick_image}" "${freebsd_ci_root_password}"
+        cp "${memstick_image}" "mini-memstick-${target_arch}.img"
+    else
+        error "$(printf "build_freebsd_release: no mini-memstick.img found under %s/R\n" "${target_path}")"
+    fi
 
     info "$(printf "Creating compressed archive: %s\n" "${release_archive}")"
     tar cJf "${release_archive}" "${target_path}"
 }
 
 build_nanobsd_world() {
+    local target_arch
+    target_arch="${1}"
     local version
     version="$(freebsd-version)"
 
     # nanobsd.sh hardcodes NANO_SRC=/usr/src in defaults.sh and only
     # a -c config file sourced during arg parsing can override it, so
-    # point it at our actual checkout instead of the /usr/src default
+    # point it at our actual checkout instead of the /usr/src default.
+    # NANO_ARCH feeds TARGET_ARCH via nano_global_make_env, but nanobsd
+    # has no equivalent for TARGET, so extend CONF_WORLD (shared by
+    # both the build and install make.conf) to carry it too
     local nano_conf
     nano_conf="$(mktemp)"
-    echo "NANO_SRC=$(pwd)" > "${nano_conf}"
+    cat > "${nano_conf}" <<EOF
+NANO_SRC=$(pwd)
+NANO_ARCH=$(freebsd_target_arch "${target_arch}")
+CONF_WORLD="\${CONF_WORLD}
+TARGET=$(freebsd_target "${target_arch}")
+"
+EOF
 
     # nanobsd.sh redirects buildworld/buildkernel output into log
     # files under NANO_OBJ instead of stdout, and aborts silently on
@@ -1145,6 +1280,8 @@ build_nanobsd_world() {
         done
         exit 1
     fi
+
+    freebsd_customize_image "/usr/obj/nanobsd.full/_.disk.full" "${freebsd_ci_root_password}"
 }
 
 linux_install_kernel_build_dependencies() {
@@ -2163,18 +2300,18 @@ main() {
             ;;
         freebsd)
             freebsd_install_build_dependencies
-            freebsd_fetch_build_config
+            freebsd_fetch_build_config "${target_arch}"
             freebsd_fetch_src "${freebsd_source_url}"
-            build_freebsd_release
-            #build_freebsd_kernel
-            build_freebsd_world
+            build_freebsd_release "${target_arch}"
+            #build_freebsd_kernel "${target_arch}"
+            build_freebsd_world "${target_arch}"
             exit 0
             ;;
         nanobsd)
             freebsd_install_build_dependencies
             freebsd_fetch_src "${freebsd_source_url}"
-            build_freebsd_kernel
-            build_nanobsd_world
+            build_freebsd_kernel "${target_arch}"
+            build_nanobsd_world "${target_arch}"
             exit 0
             ;;
         gentoo-containeros)
