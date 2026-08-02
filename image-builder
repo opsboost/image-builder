@@ -1164,8 +1164,14 @@ freebsd_fetch_build_config() {
 freebsd_fetch_src() {
     local freebsd_source_url
     freebsd_source_url="${1}"
+    local branch
+    branch="${2}"
 
-    git clone --depth 1 "${freebsd_source_url}"
+    if [ -n "${branch}" ]; then
+        git clone --depth 1 -b "${branch}" "${freebsd_source_url}"
+    else
+        git clone --depth 1 "${freebsd_source_url}"
+    fi
 }
 
 build_freebsd_kernel() {
@@ -2299,9 +2305,21 @@ main() {
             exit 0
             ;;
         freebsd)
+            local release
+            release="${4}"
+            local freebsd_branch
+            if [ -n "${release}" ]; then
+                # Pin to the matching release branch. Without this,
+                # the default branch (main/CURRENT) gets built instead,
+                # which the base image's installed compiler doesn't
+                # match closely enough to be trusted, forcing a full
+                # clang/lld bootstrap rebuild from scratch
+                freebsd_branch="releng/${release}"
+            fi
+
             freebsd_install_build_dependencies
             freebsd_fetch_build_config "${target_arch}"
-            freebsd_fetch_src "${freebsd_source_url}"
+            freebsd_fetch_src "${freebsd_source_url}" "${freebsd_branch}"
             build_freebsd_release "${target_arch}"
             #build_freebsd_kernel "${target_arch}"
             build_freebsd_world "${target_arch}"
