@@ -74,6 +74,9 @@ alpine_config_url="https://github.com/bbusse/alpine-config"
 alpine_img_url="${alpine_repo_url}/${alpine_version}/${alpine_compressed_img_file}"
 alpine_csum_file="${alpine_compressed_img_file}".sha384
 alpine_csum_url="${alpine_repo_url}/${alpine_version}/${alpine_csum_file}"
+# raspi-alpine/builder ARCH: aarch64 (pi 3/4/5, 64bit), armv7 (pi2/pi3, 32bit)
+# or armhf (pi0/pi1 - will not boot on pi4+)
+alpine_arch="${ALPINE_ARCH:-aarch64}"
 
 # Gentoo
 # gentoo_stage3_file/url are resolved at fetch time from the "latest-stage3"
@@ -1393,7 +1396,7 @@ alpine_build() {
     docker run --rm \
                --mount type=bind,source="${PWD}"/alpine-config/"$target_flavour"/input/image.sh,target=/input/image.sh \
                --mount type=bind,source="${PWD}"/alpine-config/"$target_flavour"/input/modules,target=/input/modules \
-               -e ARCH=armhf \
+               -e ARCH="${alpine_arch}" \
                -e DEFAULT_KERNEL_MODULES="*" \
                -e SIZE_ROOT_FS=1024M \
                -e SIZE_ROOT_PART=1024M \
@@ -1837,6 +1840,8 @@ alpine_create_disk() {
     csum_file="${6}"
     local user
     user="${7}"
+    local target_flavour
+    target_flavour="${8}"
     local compressed_file
     compressed_file="${file}.xz"
 
@@ -1845,7 +1850,7 @@ alpine_create_disk() {
         alpine_fetch_image "$@"
         ;;
     build)
-        alpine_build "sway" ""
+        alpine_build "$target_flavour" ""
         ;;
     esac
 }
@@ -2208,7 +2213,7 @@ show_usage() {
     printf "    image-builder write      DEVICE\n"
     printf "\n"
     printf "\n"
-    printf "  TARGET            One of alpine|gentoo|freebsd\n"
+    printf "  TARGET            One of alpine-sway|alpine-containeros|gentoo|freebsd\n"
     printf "  DEVICE            A raw block device e.g. /dev/sdX, /dev/mmcblk0\n"
     printf "  PARTITION_NUMBER  A partition number to work on\n"
     printf "\n"
@@ -2300,8 +2305,11 @@ main() {
         fi
 
         case "$build_target" in
-        alpine-sway)
-            alpine_build "sway" ""
+        alpine-sway|alpine-containeros)
+            local target_flavour
+            target_flavour=${build_target#*alpine-}
+
+            alpine_build "$target_flavour" ""
             exit 0
             ;;
         freebsd)
@@ -2458,13 +2466,17 @@ main() {
             # We need root privileges
             reexec_privileged "$@"
 
+            local target_flavour
+            target_flavour=${build_target#*alpine-}
+
             alpine_create_disk "build" \
                                "${img_path}" \
                                "${img_file}" \
                                "${alpine_img_url}" \
                                "${alpine_csum_url}" \
                                "${alpine_csum_file}" \
-                               "${service_user}"
+                               "${service_user}" \
+                               "${target_flavour}"
 
             info "$(printf "Alpine: Provisioning image\n")"
 
@@ -2651,6 +2663,15 @@ main() {
             ;;
         alpine)
             img_file="alpine.img"
+
+            # alpine_build leaves the disk image xz-compressed
+            # (alpine.img.xz); decompress it here so 'write' can
+            # operate on the same output 'create'/'build' produced
+            if ! [ -f "${img_path}/${img_file}" ] && \
+               [ -f "${img_path}/${img_file}.xz" ]; then
+                info "$(printf "Alpine: Decompressing %s\n" "${img_file}.xz")"
+                xz -d -k "${img_path}/${img_file}.xz"
+            fi
             ;;
         *)
             error "Please specify the image to write: One of 'alma, iss'\n"
