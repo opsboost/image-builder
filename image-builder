@@ -1236,7 +1236,16 @@ TARGET_ARCH="$(freebsd_target_arch "${target_arch}")"
 EOF
 
     cd "${src_path}"
-    sh -c "release/release.sh -c $target_path/etc/release.conf mini-memstick"
+    local release_log
+    release_log="$(mktemp)"
+    sh -c "release/release.sh -c $target_path/etc/release.conf mini-memstick" 2>&1 | tee "${release_log}"
+
+    if grep -q "SYSTEM_COMPILER: .* will be built" "${release_log}"; then
+        error "clang/lld bootstrap was triggered"
+    else
+        info "No clang/lld bootstrap triggered"
+    fi
+    rm -f "${release_log}"
 
     local memstick_image
     memstick_image="$(find "$target_path/R" -maxdepth 1 -name '*mini-memstick.img' | head -1)"
