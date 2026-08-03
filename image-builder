@@ -1578,6 +1578,73 @@ install_rootfs() {
     umount "${rootfs_dev}"
 }
 
+# Merge the stage4 binpkgs onto the stage3 rootfs install_rootfs just
+# extracted. The "stage4" artifact from gentoo-build is just a
+# /var/cache/binpkgs cache (see its Containerfile), not a mergeable
+# filesystem snapshot, so a plain tar overlay would leave the binary
+# packages sitting unmerged - chroot in and emerge --usepkgonly them,
+# same as emerge.sh did to build them in the first place
+gentoo_install_stage4_binpkgs() {
+    local target_flavour
+    target_flavour="${1}"
+    local target_arch
+    target_arch="${2}"
+    local rootfs_dev
+    rootfs_dev="${3}"
+    local mnt_path
+    mnt_path="${4}"
+
+    local stage4_file
+    stage4_file="gentoo-stage4-${target_flavour}-${target_arch}.tar.xz"
+
+    mount -t xfs "${rootfs_dev}" "${mnt_path}"
+
+    info "$(printf "Gentoo: Extracting stage4 binpkgs\n")"
+    tar xpf "${stage4_file}" --xattrs-include='*.*' --numeric-owner --directory "${mnt_path}"
+
+    info "$(printf "Gentoo: Installing Portage config\n")"
+    git clone --depth 1 "${gentoo_config_url}"
+    mkdir -p "${mnt_path}/etc/portage/package.use" "${mnt_path}/etc/portage/package.unmask"
+    cp gentoo-config/make.conf "${mnt_path}/etc/portage/"
+    cp gentoo-config/package.use/* "${mnt_path}/etc/portage/package.use/"
+    cp gentoo-config/package.unmask/* "${mnt_path}/etc/portage/package.unmask/"
+    cp gentoo-config/package.accept_keywords "${mnt_path}/etc/portage/package.accept_keywords/"
+    cp -r gentoo-config/sets "${mnt_path}/etc/portage/sets"
+
+    # DNS resolution inside the chroot (emerge-webrsync needs network)
+    cp /etc/resolv.conf "${mnt_path}/etc/resolv.conf"
+
+    mount --types proc /proc "${mnt_path}/proc"
+    mount --rbind /sys "${mnt_path}/sys"
+    mount --make-rslave "${mnt_path}/sys"
+    mount --rbind /dev "${mnt_path}/dev"
+    mount --make-rslave "${mnt_path}/dev"
+
+    info "$(printf "Gentoo: Syncing Portage tree\n")"
+    chroot "${mnt_path}" emerge-webrsync
+
+    # Mirror gentoo-build/emerge.sh's set list per flavour - keep in
+    # sync with that script if the sets it installs ever change
+    local sets
+    case "${target_flavour}" in
+    containeros)
+        sets="@container-podman @essentials @net"
+        ;;
+    sway)
+        sets="@dev @dev-lang @sway @essentials @virt @net"
+        ;;
+    esac
+
+    info "$(printf "Gentoo: Merging stage4 binpkgs (%s)\n" "${target_flavour}")"
+    # shellcheck disable=SC2086 # $sets is an intentional word-split set list
+    chroot "${mnt_path}" emerge --usepkgonly --getbinpkg=n ${sets}
+
+    umount -R "${mnt_path}/dev"
+    umount -R "${mnt_path}/sys"
+    umount "${mnt_path}/proc"
+    umount "${rootfs_dev}"
+}
+
 set_default_root_pw() {
     local file
     file="${1}"
@@ -2558,6 +2625,11 @@ main() {
                            "${kernel_version}"
 
             install_rootfs "${rootfs_dev}" "${mnt_path}" "xfs"
+
+            gentoo_install_stage4_binpkgs "${target_flavour}" \
+                                          "${target_arch}" \
+                                          "${rootfs_dev}" \
+                                          "${mnt_path}"
 
             info "$(printf "Gentoo: Provisioning image\n")"
 
