@@ -1498,10 +1498,22 @@ build_gentoo_stage4() {
 
     info "podman: Building ${target_flavour} for ${platform}"
 
+    # GHA cache backend needs ACTIONS_CACHE_URL/ACTIONS_RUNTIME_TOKEN, which
+    # are only present in a GitHub Actions runner (exposed there via
+    # crazy-max/ghaction-github-runtime). Skip it entirely outside CI.
+    local cache_args=()
+    if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+        local cache_scope
+        cache_scope="gentoo-stage4-${target_flavour}-${target_arch}"
+        cache_args=(--cache-from "type=gha,scope=${cache_scope}"
+                    --cache-to "type=gha,mode=max,scope=${cache_scope}")
+    fi
+
     podman buildx build --cap-add=SYS_PTRACE \
                         --platform="${platform}" \
                         --build-arg TARGET_ARCH="$target_arch" \
                         --build-arg TARGET_FLAVOUR="$target_flavour" \
+                        "${cache_args[@]}" \
                         -v "${PWD}"/output:/output \
                         -t gentoo-stage4-"$target_flavour-$target_arch" \
                         -f Containerfile
@@ -1606,7 +1618,7 @@ gentoo_install_stage4_binpkgs() {
     git clone --depth 1 "${gentoo_config_url}"
     mkdir -p "${mnt_path}/etc/portage/package.use" "${mnt_path}/etc/portage/package.unmask"
     cp gentoo-config/make.conf "${mnt_path}/etc/portage/"
-    cp gentoo-config/package.use/* "${mnt_path}/etc/portage/package.use/"
+    cp gentoo-config/package.use "${mnt_path}/etc/portage/package.use/"
     cp gentoo-config/package.unmask/* "${mnt_path}/etc/portage/package.unmask/"
     cp gentoo-config/package.accept_keywords "${mnt_path}/etc/portage/package.accept_keywords/"
     cp -r gentoo-config/sets "${mnt_path}/etc/portage/sets"
