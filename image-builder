@@ -606,7 +606,12 @@ create_disk() {
     file_disk="${1}"
 
     info "$(printf "Creating disk file %s..\n" "${file_disk}")"
-    dd if=/dev/zero of="${file_disk}" bs=1M count=8192 status=progress
+    # 16GB: shared by gentoo_create_disk's callers (Gentoo, Alma), but
+    # this size only matters for Gentoo - its xfs partition now also
+    # holds a synced Portage tree (~1GB) plus stage4 binpkgs on top of
+    # stage3, which no longer fit in the previous 8GB total. Alma just
+    # inherits the larger disk incidentally
+    dd if=/dev/zero of="${file_disk}" bs=1M count=16384 status=progress
 
 
     case "$os" in
@@ -615,7 +620,7 @@ create_disk() {
         parted "${file_disk}" mklabel gpt
         parted "${file_disk}" mkpart fat32 1 2
         parted "${file_disk}" mkpart fat32 3 259
-        parted "${file_disk}" mkpart xfs 260 8GB
+        parted "${file_disk}" mkpart xfs 260 16GB
         parted "${file_disk}" set 2 boot on
         parted "${file_disk}" print
         ;;
