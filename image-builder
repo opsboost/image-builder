@@ -1599,7 +1599,7 @@ install_rootfs() {
 # extracted. The "stage4" artifact from gentoo-build is just a
 # /var/cache/binpkgs cache (see its Containerfile), not a mergeable
 # filesystem snapshot, so a plain tar overlay would leave the binary
-# packages sitting unmerged - chroot in and emerge --usepkgonly them,
+# packages sitting unmerged - chroot in and emerge --usepkg them,
 # same as emerge.sh did to build them in the first place
 gentoo_install_stage4_binpkgs() {
     local target_flavour
@@ -1653,8 +1653,14 @@ gentoo_install_stage4_binpkgs() {
     esac
 
     info "$(printf "Gentoo: Merging stage4 binpkgs (%s)\n" "${target_flavour}")"
+    # --usepkgonly would refuse to resolve virtual/* (deliberately left
+    # out of the binpkgs by emerge.sh's --buildpkg-exclude) at all; use
+    # --usepkg instead so those few packages can still build from
+    # source, while --newuse --update reconciles USE-flag differences
+    # against what stage3 already has installed (e.g. iptables)
+    # instead of erroring out on the resulting slot conflict
     # shellcheck disable=SC2086 # $sets is an intentional word-split set list
-    chroot "${mnt_path}" emerge --usepkgonly --getbinpkg=n ${sets}
+    chroot "${mnt_path}" emerge --usepkg --newuse --update --getbinpkg=n ${sets}
 
     umount -R "${mnt_path}/dev"
     umount -R "${mnt_path}/sys"
