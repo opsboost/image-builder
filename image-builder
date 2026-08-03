@@ -597,7 +597,7 @@ create_boot_entry() {
 cat << EOF > "${entry_file}"
 title         ${title}
 linux         /bzImage
-options       root=${rootfs_dev} init=/lib/systemd/systemd enforcing=1 console=tty0 console=ttyS0,115200n8
+options       root=${rootfs_dev} rw init=/lib/systemd/systemd enforcing=1 console=tty0 console=ttyS0,115200n8
 EOF
 }
 
