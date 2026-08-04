@@ -1092,6 +1092,9 @@ sys_arch() {
         aarch64)
         arch="arm64"
         ;;
+        x86_64)
+        arch="amd64"
+        ;;
         i686)
         arch="i386"
         ;;
