@@ -2612,6 +2612,14 @@ main() {
     if [ "create" == "${1}" ]; then
         local build_target
         build_target="${2}"
+        local target_arch
+        target_arch="${3}"
+
+        if [ -z "$target_arch" ]; then
+            local host_arch
+            host_arch=$(sys_arch)
+            target_arch="${TARGET_ARCH:-$host_arch}"
+        fi
 
         local img_path
         local img_file
