@@ -465,29 +465,71 @@ EOF
     ln -s -f "${path}/booted.service" "${path}/getty.target.wants/booted.service"
 }
 
-# Write systemd-unit for static network config
-# for initial provisioning
-# Needs iproute2
 write_net_config() {
     local mnt_path
     mnt_path="${1}"
+    local target_arch
+    target_arch="${2}"
+    local net_mode
+    net_mode="${3}"
     local net_device
-    net_device="${2}"
+    net_device="${4}"
     local net_address
-    net_address="${3}"
+    net_address="${5}"
     local net_gateway
-    net_gateway="${4}"
-    local path
-    path="${mnt_path}/etc/systemd/system"
+    net_gateway="${6}"
 
-# The interface gets renamed by systemd-udevd during boot
-# We need to wait for the actual name and use a path unit to this
+    case "${net_mode}" in
+    systemd-networkd-dhcp)
+        local path
+        path="${mnt_path}/etc/systemd/network"
+
+        mkdir -p "${path}"
+
+cat <<EOF > "${path}/20-dhcp.network"
+[Match]
+Name=enp*
+
+[Network]
+DHCP=yes
+EOF
+
+        mkdir -p "${mnt_path}/etc/systemd/system/multi-user.target.wants"
+        ln -s -f "${mnt_path}/etc/systemd/system/systemd-networkd.service" \
+            "${mnt_path}/etc/systemd/system/multi-user.target.wants/systemd-networkd.service"
+        ;;
+    systemd-networkd-static)
+        local path
+        path="${mnt_path}/etc/systemd/network"
+
+        mkdir -p "${path}"
+
+cat <<EOF > "${path}/20-static.network"
+[Match]
+Name=enp*
+
+[Network]
+Address=${net_address}
+Gateway=${net_gateway}
+EOF
+
+        mkdir -p "${mnt_path}/etc/systemd/system/multi-user.target.wants"
+        ln -s -f "${mnt_path}/etc/systemd/system/systemd-networkd.service" \
+            "${mnt_path}/etc/systemd/system/multi-user.target.wants/systemd-networkd.service"
+        ;;
+    gokrazy-dhcp)
+        add_dhcp_client "${mnt_path}" "${target_arch}"
+        ;;
+    iproute2-static)
+        local path
+        path="${mnt_path}/etc/systemd/system"
+
 cat <<EOF > "${path}/net-interface.path"
 [Unit]
 Description=Monitor network interface
 
 [Path]
-PathChanged=/sys/class/net/enp0s1
+PathChanged=/sys/class/net/${net_device}
 Unit=net-config.service
 
 [Install]
@@ -510,9 +552,62 @@ ExecStart=/bin/ip addr add ${net_address} dev ${net_device}
 ExecStart=/bin/ip route add default via ${net_gateway}
 EOF
 
-    # Enable service
-    ln -s -f "${path}/net-config.service" "${path}/getty.target.wants/net-config.service"
-    ln -s -f "${path}/net-interface.path" "${path}/getty.target.wants/net-config.path"
+        ln -s -f "${path}/net-config.service" "${path}/getty.target.wants/net-config.service"
+        ln -s -f "${path}/net-interface.path" "${path}/getty.target.wants/net-config.path"
+        ;;
+    *)
+        error "$(printf "write_net_config: unknown net_mode: %s\n" "${net_mode}")"
+        exit 1
+        ;;
+    esac
+}
+
+add_dhcp_client() {
+    local mnt_path
+    mnt_path="${1}"
+    local target_arch
+    target_arch="${2}"
+
+    if ! command -v go >/dev/null 2>&1; then
+        error "add_dhcp_client: go is required to build the gokrazy dhcp client"
+        exit 1
+    fi
+
+    local build_dir
+    build_dir="$(mktemp -d)"
+    git clone --depth 1 https://github.com/gokrazy/gokrazy "${build_dir}"
+
+    (cd "${build_dir}" && \
+        CGO_ENABLED=0 GOOS=linux GOARCH="${target_arch}" \
+        go build -o dhcp ./cmd/dhcp)
+
+    install -Dm755 "${build_dir}/dhcp" "${mnt_path}/usr/local/sbin/dhcp"
+    rm -rf "${build_dir}"
+
+    local path
+    path="${mnt_path}/etc/systemd/system"
+
+cat <<'EOF' > "${mnt_path}/usr/local/sbin/net-dhcp"
+#!/bin/sh
+iface="$(ls /sys/class/net | grep '^enp' | head -1)"
+exec /usr/local/sbin/dhcp -interface="${iface}"
+EOF
+    chmod 755 "${mnt_path}/usr/local/sbin/net-dhcp"
+
+cat <<EOF > "${path}/net-dhcp.service"
+[Unit]
+Description=gokrazy DHCP client
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/net-dhcp
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    mkdir -p "${path}/multi-user.target.wants"
+    ln -s -f "${path}/net-dhcp.service" "${path}/multi-user.target.wants/net-dhcp.service"
 }
 
 # Write config for wpa_supplicant
@@ -1504,22 +1599,10 @@ build_gentoo_stage4() {
 
     info "podman: Building ${target_flavour} for ${platform}"
 
-    # GHA cache backend needs ACTIONS_CACHE_URL/ACTIONS_RUNTIME_TOKEN, which
-    # are only present in a GitHub Actions runner (exposed there via
-    # crazy-max/ghaction-github-runtime). Skip it entirely outside CI.
-    local cache_args=()
-    if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
-        local cache_scope
-        cache_scope="gentoo-stage4-${target_flavour}-${target_arch}"
-        cache_args=(--cache-from "type=gha,scope=${cache_scope}"
-                    --cache-to "type=gha,mode=max,scope=${cache_scope}")
-    fi
-
     podman buildx build --cap-add=SYS_PTRACE \
                         --platform="${platform}" \
                         --build-arg TARGET_ARCH="$target_arch" \
                         --build-arg TARGET_FLAVOUR="$target_flavour" \
-                        "${cache_args[@]}" \
                         -v "${PWD}"/output:/output \
                         -t gentoo-stage4-"$target_flavour-$target_arch" \
                         -f Containerfile
@@ -1799,6 +1882,8 @@ provision() {
     ansible_roles_path="${9}"
     local ansible_roles
     ansible_roles="${10}"
+    local net_mode
+    net_mode="${11}"
 
     local disk_part_types
     disk_part_types=$(part_types "${disk_file}")
@@ -1831,10 +1916,8 @@ provision() {
     fi
 
     info "Writing network config"
-    write_net_config "${mnt_path}" \
-                     "${net_device}" \
-                     "${net_address}" \
-                     "${net_gateway}"
+    write_net_config "${mnt_path}" "${target_arch}" "${net_mode}" \
+                     "${net_device}" "${net_address}" "${net_gateway}"
 
     write_booted_script "${mnt_path}" "${net_host_readiness_port}"
     write_booted_service "${mnt_path}" "${net_host_address}"
@@ -2365,6 +2448,9 @@ main() {
     local net_gateway
     net_gateway="${NET_GATEWAY:-""}"
 
+    local net_mode
+    net_mode="${NET_MODE:-"gokrazy-dhcp"}"
+
     local ansible_user
     local ansible_roles
     local ansible_roles_path
@@ -2680,7 +2766,8 @@ main() {
                       "${net_gateway}" \
                       "${ansible_user}" \
                       "${ansible_roles_path}" \
-                      "${ansible_roles}"
+                      "${ansible_roles}" \
+                      "${net_mode}"
 
             # Tear down loop devices after installation steps
             loop_unmount ""
@@ -2861,7 +2948,8 @@ main() {
                   "${net_gateway}" \
                   "${ansible_user}" \
                   "${ansible_roles_path}" \
-                  "${ansible_roles}"
+                  "${ansible_roles}" \
+                  "${net_mode}"
 
         exit 0
     fi
