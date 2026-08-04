@@ -94,6 +94,7 @@ freebsd_config_url="https://github.com/bbusse/freebsd-config"
 # Root password baked into built images so CI can boot-test them under
 # qemu; these images are throwaway CI artifacts, not production systems
 freebsd_ci_root_password="freebsd-ci"
+freebsd_use_release_script="${FREEBSD_USE_RELEASE_SCRIPT:-true}"
 
 # OpenWrt
 openwrt_source_url="https://github.com/bbusse/openwrt"
@@ -2435,9 +2436,13 @@ main() {
             freebsd_install_build_dependencies
             freebsd_fetch_build_config "${target_arch}"
             freebsd_fetch_src "${freebsd_source_url}" "${freebsd_branch}"
-            build_freebsd_release "${target_arch}"
-            #build_freebsd_kernel "${target_arch}"
-            build_freebsd_world "${target_arch}"
+
+            if [ "${freebsd_use_release_script}" = "true" ]; then
+                build_freebsd_release "${target_arch}"
+            else
+                build_freebsd_kernel "${target_arch}"
+                build_freebsd_world "${target_arch}"
+            fi
             exit 0
             ;;
         nanobsd)
