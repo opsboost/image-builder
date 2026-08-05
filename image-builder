@@ -96,6 +96,10 @@ freebsd_config_url="https://github.com/bbusse/freebsd-config"
 freebsd_ci_root_password="freebsd-ci"
 freebsd_use_release_script="${FREEBSD_USE_RELEASE_SCRIPT:-true}"
 
+# gokrazy-dhcp
+gokrazy_dhcp_repo_url="https://github.com/bbusse/gokrazy-dhcp"
+gokrazy_dhcp_release_tag="ci_c150ed5_2"
+
 # OpenWrt
 openwrt_source_url="https://github.com/bbusse/openwrt"
 openwrt_config_url="https://github.com/bbusse/openwrt-config"
@@ -568,20 +572,19 @@ add_dhcp_client() {
     local target_arch
     target_arch="${2}"
 
-    if ! command -v go >/dev/null 2>&1; then
-        error "add_dhcp_client: go is required to build the gokrazy dhcp client"
+    local artifact
+    artifact="gokrazy-dhcp-linux-${target_arch}-${gokrazy_dhcp_release_tag}.tar.xz"
+    local build_dir
+    build_dir="$(mktemp -d)"
+
+    if ! curl -fsSL -o "${build_dir}/${artifact}" \
+        "${gokrazy_dhcp_repo_url}/releases/download/${gokrazy_dhcp_release_tag}/${artifact}"; then
+        error "$(printf "add_dhcp_client: failed to download %s\n" "${artifact}")"
         exit 1
     fi
 
-    local build_dir
-    build_dir="$(mktemp -d)"
-    git clone --depth 1 https://github.com/gokrazy/gokrazy "${build_dir}"
-
-    (cd "${build_dir}" && \
-        CGO_ENABLED=0 GOOS=linux GOARCH="${target_arch}" \
-        go build -o dhcp ./cmd/dhcp)
-
-    install -Dm755 "${build_dir}/dhcp" "${mnt_path}/usr/local/sbin/dhcp"
+    tar -C "${build_dir}" -xf "${build_dir}/${artifact}"
+    install -Dm755 "${build_dir}/gokrazy-dhcp" "${mnt_path}/usr/local/sbin/dhcp"
     rm -rf "${build_dir}"
 
     local path
@@ -1123,7 +1126,7 @@ podman_install() {
     debian|ubuntu)
         sudo apt update -y
         # Prepare for cross-builds with --platform if we are on amd64
-        if [ "x86_64" = "$(sys_arch)" ]; then
+        if [ "amd64" = "$(sys_arch)" ]; then
             sudo apt install -y podman qemu-user-static binfmt-support
             sudo docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
         fi
@@ -1131,7 +1134,7 @@ podman_install() {
     fedora)
         sudo dnf update -y
         # Prepare for cross-builds with --platform if we are on amd64
-        if [ "x86_64" = "$(sys_arch)" ]; then
+        if [ "amd64" = "$(sys_arch)" ]; then
             sudo dnf install -y podman qemu-user-static
             sudo systemctl restart systemd-binfmt
         fi
