@@ -860,7 +860,7 @@ loop_unmount() {
     os="$(sys_os)"
 
     case "$os" in
-    fedora)
+    debian|ubuntu|fedora)
         loop_unmount_linux
         ;;
     freebsd)
@@ -876,6 +876,7 @@ loop_unmount_freebsd() {
 
 # Linux: Tear down loop mount
 loop_unmount_linux() {
+    sync
     losetup -D
 }
 
