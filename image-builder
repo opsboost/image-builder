@@ -56,7 +56,7 @@ kernel="bzImage-${kernel_version}"
 kernel_url="${kernel_repo_url}/${kernel}"
 kernel_csum_file="${kernel}.sha384"
 kernel_csum_url="${kernel_repo_url}/${kernel_csum_file}"
-kernel_config_url="https://raw.githubusercontent.com/bbusse/config-kernel/main"
+kernel_config_url="https://raw.githubusercontent.com/bbusse/linux-kernel-config/main"
 
 # Alma
 alma_version="9.1"
