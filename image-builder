@@ -1158,6 +1158,18 @@ container_platform() {
     fi
 }
 
+# arm64 kernels are "Image", not "bzImage" - that's x86-only naming
+kernel_file_for_arch() {
+    local target_arch
+    target_arch="${1}"
+
+    if [ "arm64" = "${target_arch}" ]; then
+        echo "Image-${kernel_version}"
+    else
+        echo "bzImage-${kernel_version}"
+    fi
+}
+
 # FreeBSD's TARGET/TARGET_ARCH pair doesn't match arm64/aarch64
 # 1:1: TARGET is the machine family (arm64), TARGET_ARCH is the
 # specific machine arch (aarch64). For amd64 both are the same.
@@ -1411,22 +1423,31 @@ EOF
 }
 
 linux_install_kernel_build_dependencies() {
+    local target_arch
+    target_arch="${1}"
     local os
 
     os=$(sys_os)
 
     case "$os" in
     debian|ubuntu)
-        # Install build dependencies
         apt update -y
-        apt install -y linux-firmware \
-                       libelf-dev \
-                       intel-microcode
+        apt install -y linux-firmware libelf-dev
+
+        if [ "arm64" = "${target_arch}" ]; then
+            apt install -y crossbuild-essential-arm64
+        else
+            apt install -y intel-microcode
+        fi
         ;;
     fedora)
         dnf install -y intel-gpu-firmware \
                        iwl6000-firmware \
                        linux-firmware
+
+        if [ "arm64" = "${target_arch}" ]; then
+            dnf install -y gcc-aarch64-linux-gnu
+        fi
         ;;
     esac
 }
@@ -1484,15 +1505,35 @@ linux_build_kernel() {
         podman buildx build --cap-add=SYS_PTRACE \
                             --platform="${platform}" \
                             --build-arg KERNEL_VERSION="${kernel_version}" \
+                            --build-arg KERNEL_CONFIG="kernel-config-${kernel_flavour}" \
                             -v "${PWD}"/output:/output \
                             -t linux-kernel-build-"${kernel_flavour}" \
-                            -f Containerfile
+                            -f Containerfile .
     else
-        linux_install_kernel_build_dependencies
+        linux_install_kernel_build_dependencies "${target_arch}"
+
+        local kernel_arch_dir
+        local kernel_image_name
+        if [ "arm64" = "${target_arch}" ]; then
+            kernel_arch_dir="arm64"
+            kernel_image_name="Image"
+        else
+            kernel_arch_dir="x86_64"
+            kernel_image_name="bzImage"
+        fi
+
         mv "kernel-config-${kernel_flavour}" .config
-        make -j3
-        mv arch/x86_64/boot/bzImage "arch/x86_64/boot/bzImage-${kernel_version}"
-        sha384sum "arch/x86_64/boot/bzImage-${kernel_version}" > "arch/x86_64/boot/bzImage-${kernel_version}.sha384"
+
+        if [ "arm64" = "${target_arch}" ]; then
+            ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- make -j3
+        else
+            make -j3
+        fi
+
+        mv "arch/${kernel_arch_dir}/boot/${kernel_image_name}" \
+           "arch/${kernel_arch_dir}/boot/${kernel_image_name}-${kernel_version}"
+        sha384sum "arch/${kernel_arch_dir}/boot/${kernel_image_name}-${kernel_version}" \
+            > "arch/${kernel_arch_dir}/boot/${kernel_image_name}-${kernel_version}.sha384"
     fi
 }
 
@@ -2565,10 +2606,12 @@ main() {
             return
             ;;
         linux-kernel)
-            target_arch="$4"
+            target_arch="${4:-$TARGET_ARCH}"
 
             if [ -n "${3}" ]; then
                 kernel_flavour="${3}"
+            elif [ -n "${KERNEL_FLAVOUR}" ]; then
+                kernel_flavour="${KERNEL_FLAVOUR}"
             else
                 error "Please specify a kernel flavour\nAborting.."
                 exit 1
@@ -2580,6 +2623,9 @@ main() {
                     target_arch="arm64"
                     ;;
                     rockpro64)
+                    target_arch="arm64"
+                    ;;
+                    arm64-vm)
                     target_arch="arm64"
                     ;;
                     x230)
@@ -2737,11 +2783,16 @@ main() {
                                 "${img_file}" \
                                 "${mnt_path}"
 
+            local kernel_file
+            kernel_file="$(kernel_file_for_arch "${target_arch}")"
+            local kernel_file_csum_file
+            kernel_file_csum_file="${kernel_file}.sha384"
+
             info "Fetching kernel"
             download_miss "${path}" \
-                          "${kernel_url}" \
-                          "${kernel_csum_url}" \
-                          "${kernel_csum_file}"
+                          "${kernel_repo_url}/${kernel_file}" \
+                          "${kernel_repo_url}/${kernel_file_csum_file}" \
+                          "${kernel_file_csum_file}"
 
             gentoo_fetch_stage3
             gentoo_fetch_stage4 "$target_flavour" "$target_arch" "latest"
@@ -2756,7 +2807,7 @@ main() {
                                    "${kernel_version}"
 
             # Install files
-            install_kernel "${kernel}" \
+            install_kernel "${kernel_file}" \
                            "${esp_dev}" \
                            "${mnt_path}" \
                            "${kernel_version}"
