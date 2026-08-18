@@ -2797,8 +2797,11 @@ main() {
 
             local kernel_file
             kernel_file="$(kernel_file_for_arch "${target_arch}")"
-            local kernel_file_csum_file
-            kernel_file_csum_file="${kernel_file}.sha384"
+
+            local kernel_download_file
+            kernel_download_file="${kernel_file}-latest"
+            local kernel_download_csum_file
+            kernel_download_csum_file="${kernel_download_file}.sha384"
 
             # Named after the actual kernel file being installed, not the
             # unrelated global "kernel_version" (a stale placeholder left
@@ -2808,9 +2811,9 @@ main() {
 
             info "Fetching kernel"
             download_miss "${path}" \
-                          "${kernel_repo_url}/${kernel_file}" \
-                          "${kernel_repo_url}/${kernel_file_csum_file}" \
-                          "${kernel_file_csum_file}"
+                          "${kernel_repo_url}/${kernel_download_file}" \
+                          "${kernel_repo_url}/${kernel_download_csum_file}" \
+                          "${kernel_download_csum_file}"
 
             gentoo_fetch_stage3 "${target_arch}"
             gentoo_fetch_stage4 "$target_flavour" "$target_arch" "latest"
@@ -2824,8 +2827,7 @@ main() {
                                    "${boot_entry_file}" \
                                    "${kernel_file}"
 
-            # Install files
-            install_kernel "${kernel_file}" \
+            install_kernel "${kernel_download_file}" \
                            "${esp_dev}" \
                            "${mnt_path}" \
                            "${kernel_file}"
