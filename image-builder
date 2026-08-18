@@ -529,7 +529,7 @@ EOF
             "${mnt_path}/etc/systemd/system/multi-user.target.wants/systemd-networkd.service"
         ;;
     gokrazy-dhcp)
-        add_dhcp_client "${mnt_path}" "${target_arch}"
+        add_dhcp_client "${mnt_path}" "${target_arch}" "${net_device}"
         ;;
     iproute2-static)
         local path
@@ -578,6 +578,8 @@ add_dhcp_client() {
     mnt_path="${1}"
     local target_arch
     target_arch="${2}"
+    local net_device
+    net_device="${3}"
 
     local artifact
     artifact="gokrazy-dhcp-linux-${target_arch}-${gokrazy_dhcp_release_tag}.tar.xz"
@@ -610,6 +612,7 @@ Description=gokrazy DHCP client
 
 [Service]
 Type=simple
+ExecStartPre=/bin/ip link set dev ${net_device} up
 ExecStart=/usr/local/sbin/net-dhcp
 
 [Install]
