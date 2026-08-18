@@ -1176,7 +1176,7 @@ kernel_file_for_arch() {
     if [ "arm64" = "${target_arch}" ]; then
         echo "Image-arm64-vm"
     else
-        echo "bzImage-x230"
+        echo "bzImage-virt-amd64"
     fi
 }
 
