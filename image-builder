@@ -1507,7 +1507,7 @@ linux_build_kernel() {
                             --build-arg KERNEL_VERSION="${kernel_version}" \
                             --build-arg KERNEL_CONFIG="kernel-config-${kernel_flavour}" \
                             -v "${PWD}"/output:/output \
-                            -t linux-kernel-build-"${kernel_flavour}" \
+                            -t "ghcr.io/bbusse/linux-kernel-${kernel_flavour}:latest" \
                             -f Containerfile .
     else
         linux_install_kernel_build_dependencies "${target_arch}"
