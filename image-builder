@@ -51,11 +51,7 @@ platform="pine64"
 # Kernel
 kernel_src_url="https://github.com/torvalds/linux"
 kernel_version="6.1.0-rc8"
-kernel_repo_url="https://github.com/bbusse/linux-build/releases/download/latest"
-kernel="bzImage-${kernel_version}"
-kernel_url="${kernel_repo_url}/${kernel}"
-kernel_csum_file="${kernel}.sha384"
-kernel_csum_url="${kernel_repo_url}/${kernel_csum_file}"
+kernel_repo_url="https://github.com/bbusse/linux-kernel-build/releases/download/latest"
 kernel_config_url="https://raw.githubusercontent.com/bbusse/linux-kernel-config/main"
 
 # Alma
@@ -82,8 +78,6 @@ alpine_arch="${ALPINE_ARCH:-aarch64}"
 # gentoo_stage3_file/url are resolved at fetch time from the "latest-stage3"
 # manifest (see gentoo_fetch_stage3) - Gentoo mirrors prune older snapshots,
 # so a hardcoded version 404s within a few months.
-gentoo_stage3_repo_url="https://bouncer.gentoo.org/fetch/root/all/releases/${target_arch}/autobuilds/current-stage3-amd64-systemd/"
-gentoo_stage3_manifest_file="latest-stage3-${target_arch}-systemd.txt"
 gentoo_stage4_repo_url="https://github.com/bbusse/gentoo-build/releases/download"
 gentoo_config_url="https://github.com/bbusse/gentoo-config"
 gentoo_build_container_url="https://github.com/bbusse/gentoo-build"
@@ -257,12 +251,18 @@ download_miss() {
 
     cd "${download_path}" || exit 1
 
+    # "file" is a URL (as passed by every caller) - compare/skip logic
+    # needs the local file name it downloads to, not the URL itself
+    local file_name
+    file_name="$(basename "${file}")"
+
     debug "$(printf "Fetching file checksum\n")"
     download "${csum_url}" "${download_path}" "${DOWNLOAD_RETRIES}"
 
-    if [ -f "${download_path}/${file}" ]; then
+    local ret
+    if [ -f "${download_path}/${file_name}" ]; then
         ret=$(compare_checksums "${download_path}/${csum_file}" \
-                                "${download_path}/${file}")
+                                "${download_path}/${file_name}")
 
         if [ "$ret" != "0" ]; then
             info "$(printf "Remote and local images differ\n")"
@@ -274,6 +274,13 @@ download_miss() {
 
     if [ 1 == "$download_image" ]; then
         download "${file}" "${download_path}" "${DOWNLOAD_RETRIES}"
+
+        ret=$(compare_checksums "${download_path}/${csum_file}" \
+                                "${download_path}/${file_name}")
+        if [ "$ret" != "0" ]; then
+            error "$(printf "Checksum mismatch after download: %s\n" "${file_name}")"
+            exit 1
+        fi
     fi
 }
 
@@ -1164,9 +1171,9 @@ kernel_file_for_arch() {
     target_arch="${1}"
 
     if [ "arm64" = "${target_arch}" ]; then
-        echo "Image-${kernel_version}"
+        echo "Image-arm64-vm"
     else
-        echo "bzImage-${kernel_version}"
+        echo "bzImage-x230"
     fi
 }
 
@@ -1597,6 +1604,14 @@ build_gentoo_stage3() {
 }
 
 gentoo_fetch_stage3() {
+    local target_arch
+    target_arch="${1}"
+
+    local gentoo_stage3_repo_url
+    gentoo_stage3_repo_url="https://bouncer.gentoo.org/fetch/root/all/releases/${target_arch}/autobuilds/current-stage3-${target_arch}-systemd/"
+    local gentoo_stage3_manifest_file
+    gentoo_stage3_manifest_file="latest-stage3-${target_arch}-systemd.txt"
+
     info "Fetching stage3"
 
     download "${gentoo_stage3_repo_url}/${gentoo_stage3_manifest_file}" "${path}" "3"
@@ -1608,10 +1623,6 @@ gentoo_fetch_stage3() {
     gentoo_stage3_url="${gentoo_stage3_repo_url}/${gentoo_stage3_file}"
 
     download "${gentoo_stage3_url}" "${path}" "16"
-    #download_miss "${path}" \
-    #              "${gentoo_stage3_url}" \
-    #              "${gentoo_stage3_csum_url}" \
-    #              "${gentoo_stage3_csum_file}"
 }
 
 # We also use this in a github-action
@@ -2602,7 +2613,7 @@ main() {
             ;;
         gentoo-stage3)
             build_gentoo_stage3
-            gentoo_fetch_stage3
+            gentoo_fetch_stage3 "${target_arch}"
             return
             ;;
         linux-kernel)
@@ -2764,8 +2775,6 @@ main() {
         gentoo-containeros|gentoo-sway)
             local rootfs_dev
             rootfs_dev=$(rootfs)
-            local boot_entry_file
-            boot_entry_file="${mnt_path}/loader/entries/linux-${kernel_version}.conf"
 
             local target_flavour
             target_flavour=${build_target#*gentoo-}
@@ -2788,13 +2797,19 @@ main() {
             local kernel_file_csum_file
             kernel_file_csum_file="${kernel_file}.sha384"
 
+            # Named after the actual kernel file being installed, not the
+            # unrelated global "kernel_version" (a stale placeholder left
+            # over from an old single-flavour x86 naming scheme)
+            local boot_entry_file
+            boot_entry_file="${mnt_path}/loader/entries/linux-${kernel_file}.conf"
+
             info "Fetching kernel"
             download_miss "${path}" \
                           "${kernel_repo_url}/${kernel_file}" \
                           "${kernel_repo_url}/${kernel_file_csum_file}" \
                           "${kernel_file_csum_file}"
 
-            gentoo_fetch_stage3
+            gentoo_fetch_stage3 "${target_arch}"
             gentoo_fetch_stage4 "$target_flavour" "$target_arch" "latest"
 
             # Install EFI bootloader
@@ -2804,13 +2819,13 @@ main() {
                                    "${rootfs_dev}" \
                                    "${mnt_path}" \
                                    "${boot_entry_file}" \
-                                   "${kernel_version}"
+                                   "${kernel_file}"
 
             # Install files
             install_kernel "${kernel_file}" \
                            "${esp_dev}" \
                            "${mnt_path}" \
-                           "${kernel_version}"
+                           "${kernel_file}"
 
             install_rootfs "${rootfs_dev}" "${mnt_path}" "xfs"
 
