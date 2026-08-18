@@ -2645,6 +2645,9 @@ main() {
                     x230)
                     target_arch="amd64"
                     ;;
+                    virt-amd64)
+                    target_arch="amd64"
+                    ;;
                     *)
                     error "Please specify a target architecture\nAborting.."
                     exit 1
