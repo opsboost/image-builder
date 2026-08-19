@@ -223,9 +223,6 @@ mount_disk_image_part_by_no() {
         loop_unmount ""
         exit 1
     fi
-
-    # Remove disk
-    loop_unmount ""
 }
 
 # TODO: Use a list of files with source/target
