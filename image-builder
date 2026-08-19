@@ -135,7 +135,7 @@ check_root_fail() {
 
 reexec_privileged() {
     if [ "$(id -u)" != "0" ]; then
-        sudo "$SCRIPT_PATH"/"$SCRIPT_NAME" "${args[@]}"
+        sudo -E "$SCRIPT_PATH"/"$SCRIPT_NAME" "${args[@]}"
         exit 0
     fi
 }
@@ -746,14 +746,7 @@ create_disk() {
 }
 
 loop_exists() {
-    local loop_dev
-    loop_dev="$(losetup -f)"
-
-    if [ "/dev/loop0" == "${loop_dev}" ]; then
-        echo 0
-    else
-        echo 1
-    fi
+    [ "/dev/loop0" != "$(losetup -f)" ]
 }
 
 # Returns the last created loop device
@@ -829,7 +822,22 @@ loop_mount_linux() {
 
     printf "Loop mounting %s\n" "${disk_file}"
 
-    if [ 2 == "$(loop_exists)" ]; then
+    local existing
+    existing="$(losetup -j "${disk_file}" -O NAME --noheadings 2>/dev/null | head -1)"
+    existing="$(trim "${existing}")"
+
+    if [ -n "${existing}" ]; then
+        if [ "/dev/loop0" != "${existing}" ]; then
+            error "$(printf "loop_mount: %s is attached to %s, but this tool assumes /dev/loop0\n" \
+                            "${disk_file}" "${existing}")"
+            losetup -l
+            exit 1
+        fi
+        printf "Reusing loop device %s for %s\n" "${existing}" "${disk_file}"
+        return 0
+    fi
+
+    if loop_exists; then
         local loop_dev
         loop_dev="$(loop_device)"
         local mounts
@@ -1000,7 +1008,7 @@ install_bootloader_efi() {
     cat "${boot_entry_file}"
     printf "\n"
 
-    umount "${esp_dev}"
+    unmount_recursive "${mnt_path}"
     sleep 3
 }
 
@@ -1061,7 +1069,7 @@ install_kernel() {
         cp "${kernel}" "${mnt_path}/bzImage"
     fi
 
-    umount "${esp_dev}"
+    unmount_recursive "${mnt_path}"
     sleep 1
 }
 
@@ -1722,6 +1730,174 @@ install_builder() {
 }
 
 # Populate rootfs
+unmount_recursive() {
+    local mnt_path
+    mnt_path="${1}"
+
+    if ! command -v findmnt >/dev/null 2>&1; then
+        error "$(printf "unmount_recursive: findmnt is required but not installed\n")"
+        exit 1
+    fi
+
+    if ! findmnt -rno TARGET "${mnt_path}" >/dev/null 2>&1; then
+        info "$(printf "unmount_recursive: nothing mounted at %s\n" "${mnt_path}")"
+        return 0
+    fi
+
+    info "$(printf "unmount_recursive: unmounting %s\n" "${mnt_path}")"
+    findmnt -R "${mnt_path}" || true
+
+    sync
+
+    if ! umount -R "${mnt_path}"; then
+        error "$(printf "unmount_recursive: Failed to unmount %s\n" "${mnt_path}")"
+        findmnt -R "${mnt_path}" || true
+        fuser -vm "${mnt_path}" 2>&1 || true
+        exit 1
+    fi
+
+    if findmnt -rno TARGET "${mnt_path}" >/dev/null 2>&1; then
+        error "$(printf "unmount_recursive: %s still mounted after umount\n" "${mnt_path}")"
+        findmnt -R "${mnt_path}" || true
+        exit 1
+    fi
+
+    sync
+}
+
+chroot_mounts() {
+    local mnt_path
+    mnt_path="${1}"
+
+    mount --types proc /proc "${mnt_path}/proc"
+    mount --rbind /sys "${mnt_path}/sys"
+    mount --make-rslave "${mnt_path}/sys"
+    mount --rbind /dev "${mnt_path}/dev"
+    mount --make-rslave "${mnt_path}/dev"
+}
+
+verify_stage_fs() {
+    local rootfs_dev
+    rootfs_dev="${1}"
+    local mnt_path
+    mnt_path="${2}"
+    local context
+    context="${3}"
+    local remount_chroot
+    remount_chroot="${4:-0}"
+
+    if [ "1" != "${VERIFY_FS_STAGES:-0}" ]; then
+        return 0
+    fi
+
+    unmount_recursive "${mnt_path}"
+    verify_filesystem "${rootfs_dev}" "${context}"
+
+    if ! mount -t xfs "${rootfs_dev}" "${mnt_path}"; then
+        error "$(printf "verify_stage_fs: Failed to remount %s at %s\n" "${rootfs_dev}" "${mnt_path}")"
+        exit 1
+    fi
+
+    if [ "1" == "${remount_chroot}" ]; then
+        chroot_mounts "${mnt_path}"
+    fi
+}
+
+replay_log_xfs() {
+    local dev
+    dev="${1}"
+
+    local replay_dir
+    replay_dir="$(mktemp -d)"
+
+    info "$(printf "replay_log_xfs: mounting %s at %s to replay log\n" "${dev}" "${replay_dir}")"
+
+    if mount -t xfs "${dev}" "${replay_dir}"; then
+        findmnt -R "${replay_dir}" || true
+        if ! umount "${replay_dir}"; then
+            error "$(printf "replay_log_xfs: Failed to unmount %s after log replay\n" "${dev}")"
+            rmdir "${replay_dir}" 2>/dev/null || true
+            exit 1
+        fi
+    else
+        error "$(printf "replay_log_xfs: Failed to mount %s to replay its log\n" "${dev}")"
+        rmdir "${replay_dir}" 2>/dev/null || true
+        exit 1
+    fi
+
+    sync
+    blockdev --flushbufs "${dev}" 2>/dev/null || true
+    rmdir "${replay_dir}" 2>/dev/null || true
+    info "$(printf "replay_log_xfs: log replayed on %s\n" "${dev}")"
+}
+
+verify_filesystem() {
+    local dev
+    dev="${1}"
+    local context
+    context="${2}"
+
+    if [ "0" == "${VERIFY_FS:-1}" ]; then
+        return 0
+    fi
+
+    if [ ! -b "${dev}" ] && [ ! -c "${dev}" ]; then
+        error "$(printf "verify_filesystem: Device does not exist: %s\n" "${dev}")"
+        exit 1
+    fi
+
+    if ! command -v findmnt >/dev/null 2>&1; then
+        error "$(printf "verify_filesystem: findmnt is required but not installed\n")"
+        exit 1
+    fi
+
+    if findmnt -rno SOURCE "${dev}" >/dev/null 2>&1 || grep -q "^${dev} " /proc/mounts 2>/dev/null; then
+        error "$(printf "verify_filesystem: %s is mounted, cannot check it\n" "${dev}")"
+        findmnt -R "${dev}" || true
+        grep "^${dev} " /proc/mounts || true
+        exit 1
+    fi
+
+    local fs_type
+    fs_type="$(blkid -o value -s TYPE "${dev}" 2>/dev/null)"
+
+    local check_cmd
+    case "${fs_type}" in
+    xfs)
+        replay_log_xfs "${dev}"
+        check_cmd=(xfs_repair -n "${dev}")
+        ;;
+    ext2|ext3|ext4)
+        check_cmd=(e2fsck -f -n "${dev}")
+        ;;
+    vfat|fat|msdos)
+        check_cmd=(fsck.vfat -n "${dev}")
+        ;;
+    *)
+        info "$(printf "verify_filesystem: No checker for '%s' on %s, skipping\n" "${fs_type}" "${dev}")"
+        return 0
+        ;;
+    esac
+
+    if ! command -v "${check_cmd[0]}" >/dev/null 2>&1; then
+        info "$(printf "verify_filesystem: %s not installed, skipping check of %s\n" "${check_cmd[0]}" "${dev}")"
+        return 0
+    fi
+
+    info "$(printf "Verifying %s (%s)%s\n" "${dev}" "${fs_type}" "${context:+ after: ${context}}")"
+
+    if ! "${check_cmd[@]}"; then
+        error "$(printf "Filesystem check failed on %s (%s)%s\n" \
+                        "${dev}" "${fs_type}" "${context:+ after: ${context}}")"
+        info "$(printf "loop devices:\n")"
+        losetup -l || true
+        info "$(printf "kernel log (tail):\n")"
+        dmesg | tail -n 80 || true
+        error "$(printf "Set VERIFY_FS=0 to skip filesystem verification\n")"
+        exit 1
+    fi
+}
+
 install_rootfs() {
     local rootfs_dev
     rootfs_dev="${1}"
@@ -1743,7 +1919,7 @@ install_rootfs() {
     set_default_root_pw "${mnt_path}/etc/shadow"
     cat ${mnt_path}/etc/shadow
 
-    umount "${rootfs_dev}"
+    unmount_recursive "${mnt_path}"
 }
 
 # Merge the stage4 binpkgs onto the stage3 rootfs install_rootfs just
@@ -1769,6 +1945,7 @@ gentoo_install_stage4_binpkgs() {
 
     info "$(printf "Gentoo: Extracting stage4 binpkgs\n")"
     tar xpf "${stage4_file}" --xattrs-include='*.*' --numeric-owner --directory "${mnt_path}"
+    verify_stage_fs "${rootfs_dev}" "${mnt_path}" "stage4: tar extract"
 
     info "$(printf "Gentoo: Installing Portage config\n")"
     git clone --depth 1 "${gentoo_config_url}"
@@ -1781,15 +1958,13 @@ gentoo_install_stage4_binpkgs() {
 
     # DNS resolution inside the chroot (emerge-webrsync needs network)
     cp /etc/resolv.conf "${mnt_path}/etc/resolv.conf"
+    verify_stage_fs "${rootfs_dev}" "${mnt_path}" "stage4: portage config"
 
-    mount --types proc /proc "${mnt_path}/proc"
-    mount --rbind /sys "${mnt_path}/sys"
-    mount --make-rslave "${mnt_path}/sys"
-    mount --rbind /dev "${mnt_path}/dev"
-    mount --make-rslave "${mnt_path}/dev"
+    chroot_mounts "${mnt_path}"
 
     info "$(printf "Gentoo: Syncing Portage tree\n")"
     chroot "${mnt_path}" emerge-webrsync
+    verify_stage_fs "${rootfs_dev}" "${mnt_path}" "stage4: emerge-webrsync" 1
 
     # Mirror gentoo-build/emerge.sh's set list per flavour - keep in
     # sync with that script if the sets it installs ever change
@@ -1821,10 +1996,7 @@ gentoo_install_stage4_binpkgs() {
     ls -la "${mnt_path}/usr/bin/podman" || true
     sync
 
-    umount -R "${mnt_path}/dev"
-    umount -R "${mnt_path}/sys"
-    umount "${mnt_path}/proc"
-    umount "${rootfs_dev}"
+    unmount_recursive "${mnt_path}"
 }
 
 set_default_root_pw() {
@@ -2020,7 +2192,7 @@ provision() {
 
     info "$(printf "Unmounting %s\n" "${mnt_path}")"
     cd
-    umount "${mnt_path}"
+    unmount_recursive "${mnt_path}"
 }
 
 filesystem() {
@@ -2176,7 +2348,7 @@ gentoo_create_disk() {
             error "$(printf "Error: Failed to create filesystem\n")"
             exit 1
         fi
-        if ! sudo mkfs.xfs "${rootfs_dev}"; then
+        if ! sudo mkfs.xfs -m rmapbt=0 "${rootfs_dev}"; then
             error "$(printf "Error: Failed to create filesystem\n")"
             exit 1
         fi
@@ -2189,7 +2361,7 @@ gentoo_create_disk() {
             loop_unmount_freebsd 99
             exit 1
         fi
-        if ! mkfs.xfs "${rootfs_dev}"; then
+        if ! mkfs.xfs -m rmapbt=0 "${rootfs_dev}"; then
             error "$(printf "Error: Failed to create filesystem\n")"
             exit 1
         fi
@@ -2843,11 +3015,13 @@ main() {
                            "${kernel_file}"
 
             install_rootfs "${rootfs_dev}" "${mnt_path}" "xfs"
+            verify_filesystem "${rootfs_dev}" "install_rootfs"
 
             gentoo_install_stage4_binpkgs "${target_flavour}" \
                                           "${target_arch}" \
                                           "${rootfs_dev}" \
                                           "${mnt_path}"
+            verify_filesystem "${rootfs_dev}" "stage4 binpkgs"
 
             info "$(printf "Gentoo: Provisioning image\n")"
 
@@ -2864,6 +3038,9 @@ main() {
                       "${ansible_roles_path}" \
                       "${ansible_roles}" \
                       "${net_mode}"
+
+            verify_filesystem "${rootfs_dev}" "provision"
+            verify_filesystem "${esp_dev}" "provision"
 
             # Tear down loop devices after installation steps
             loop_unmount ""
@@ -2944,7 +3121,7 @@ main() {
 
     # Unmount
     if [ "umount" == "${1}" ]; then
-        umount "${mnt_path}"
+        unmount_recursive "${mnt_path}"
         exit 0
     fi
 
