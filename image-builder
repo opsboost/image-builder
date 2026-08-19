@@ -685,8 +685,8 @@ error() {
 }
 
 create_boot_entry() {
-    local rootfs_dev
-    rootfs_dev="${1}"
+    local root_spec
+    root_spec="${1}"
     local entry_file
     entry_file="${2}"
     local title
@@ -703,7 +703,7 @@ create_boot_entry() {
 cat << EOF > "${entry_file}"
 title         ${title}
 linux         /bzImage
-options       root=${rootfs_dev} rw init=/lib/systemd/systemd enforcing=1 console=tty0 console=ttyS0,115200n8
+options       root=${root_spec} rw init=/lib/systemd/systemd enforcing=1 console=tty0 console=ttyS0,115200n8
 EOF
 }
 
@@ -983,7 +983,15 @@ install_bootloader_efi() {
     # Create boot entry
     local boot_entry_title
     boot_entry_title="linux-${version}"
-    create_boot_entry "/dev/sda3" "${boot_entry_file}" "${boot_entry_title}"
+
+    local root_partuuid
+    root_partuuid="$(blkid -o value -s PARTUUID "${rootfs_dev}")"
+    if [ -z "${root_partuuid}" ]; then
+        error "$(printf "install_bootloader_efi: Failed to read PARTUUID of %s\n" "${rootfs_dev}")"
+        exit 1
+    fi
+
+    create_boot_entry "PARTUUID=${root_partuuid}" "${boot_entry_file}" "${boot_entry_title}"
 
     printf "\n"
     ls -al "${mnt_path}"
@@ -2690,7 +2698,7 @@ main() {
 
         local img_path
         local img_file
-        img_file="$build_target".raw
+        img_file="$build_target-$target_arch".raw
 
         if [ -n "${OLDPWD}" ]; then
             img_path="${OLDPWD}"
