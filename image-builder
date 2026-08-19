@@ -2685,6 +2685,8 @@ main() {
 
     # Create disk image
     if [ "create" == "${1}" ]; then
+        reexec_privileged "$@"
+
         local build_target
         build_target="${2}"
         local target_arch
