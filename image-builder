@@ -7,8 +7,8 @@
 #
 # Kernel and userland are either build locally or downloaded
 #
-# © 2022 Björn Busse (see also: LICENSE)
-# bj.rn@baerlin.eu
+# SPDX-FileCopyrightText: Björn Busse <bj.rn@baerlin.eu>
+# SPDX-License-Identifier: BSD-3-Clause
 #
 # Dependencies:
 #
