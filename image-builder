@@ -1681,7 +1681,7 @@ build_gentoo_stage4() {
 
     info "$(printf "Gentoo: Building stage4")"
 
-    git clone --depth 1 "$gentoo_build_container_url"
+    git clone --depth 1 --branch "${GENTOO_BUILD_REF:-main}" "$gentoo_build_container_url"
     cd gentoo-build
     mkdir output
 
