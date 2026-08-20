@@ -606,6 +606,8 @@ EOF
 cat <<EOF > "${path}/net-dhcp.service"
 [Unit]
 Description=gokrazy DHCP client
+After=sys-subsystem-net-devices-${net_device}.device
+Wants=sys-subsystem-net-devices-${net_device}.device
 
 [Service]
 Type=simple
