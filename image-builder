@@ -1950,21 +1950,24 @@ install_rootfs() {
 
 # Register and clone one or more Portage overlays given as a
 # space-separated list of git URLs (e.g. GENTOO_OVERLAYS=
-# "https://github.com/bbusse/bbusse-overlay"). The repo name used for
-# both the repos.conf section and /var/db/repos path is the URL's
-# basename with a trailing .git stripped.
+# "https://github.com/bbusse/bbusse-overlay"). The repos.conf section
+# name must match the repo's own profiles/repo_name (Portage silently
+# ignores the repo otherwise), which doesn't necessarily match the
+# URL's basename - read it from the clone instead of guessing.
 gentoo_add_overlays() {
     local mnt_path
     mnt_path="${1}"
     local overlays
     overlays="${2}"
 
-    mkdir -p "${mnt_path}/etc/portage/repos.conf"
+    mkdir -p "${mnt_path}/etc/portage/repos.conf" "${mnt_path}/var/db/repos"
 
-    local url name
+    local url tmp_dir name
     # shellcheck disable=SC2086 # $overlays is an intentional word-split URL list
     for url in ${overlays}; do
-        name="$(basename "${url%.git}")"
+        tmp_dir="$(mktemp -d)"
+        git clone --depth 1 "${url}" "${tmp_dir}"
+        name="$(cat "${tmp_dir}/profiles/repo_name")"
         info "$(printf "Gentoo: Adding overlay %s (%s)\n" "${name}" "${url}")"
 
         cat <<EOF > "${mnt_path}/etc/portage/repos.conf/${name}.conf"
@@ -1974,7 +1977,7 @@ sync-type = git
 sync-uri = ${url}
 auto-sync = yes
 EOF
-        git clone --depth 1 "${url}" "${mnt_path}/var/db/repos/${name}"
+        mv "${tmp_dir}" "${mnt_path}/var/db/repos/${name}"
     done
 }
 
