@@ -1712,6 +1712,7 @@ build_u_root() {
 
     info "podman: Building u-root for ${platform}"
     podman_install
+    mkdir -p output
     podman buildx build --platform="${platform}" \
                         -v "${PWD}"/output:/output \
                         -t "u-root" \
