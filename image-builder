@@ -1680,6 +1680,7 @@ build_gentoo_stage4() {
                         --platform="${platform}" \
                         --build-arg TARGET_ARCH="$target_arch" \
                         --build-arg TARGET_FLAVOUR="$target_flavour" \
+                        --build-arg GENTOO_OVERLAYS="${GENTOO_OVERLAYS}" \
                         -v "${PWD}"/output:/output \
                         -t gentoo-stage4-"$target_flavour-$target_arch" \
                         -f Containerfile
@@ -1924,6 +1925,36 @@ install_rootfs() {
     unmount_recursive "${mnt_path}"
 }
 
+# Register and clone one or more Portage overlays given as a
+# space-separated list of git URLs (e.g. GENTOO_OVERLAYS=
+# "https://github.com/bbusse/bbusse-overlay"). The repo name used for
+# both the repos.conf section and /var/db/repos path is the URL's
+# basename with a trailing .git stripped.
+gentoo_add_overlays() {
+    local mnt_path
+    mnt_path="${1}"
+    local overlays
+    overlays="${2}"
+
+    mkdir -p "${mnt_path}/etc/portage/repos.conf"
+
+    local url name
+    # shellcheck disable=SC2086 # $overlays is an intentional word-split URL list
+    for url in ${overlays}; do
+        name="$(basename "${url%.git}")"
+        info "$(printf "Gentoo: Adding overlay %s (%s)\n" "${name}" "${url}")"
+
+        cat <<EOF > "${mnt_path}/etc/portage/repos.conf/${name}.conf"
+[${name}]
+location = /var/db/repos/${name}
+sync-type = git
+sync-uri = ${url}
+auto-sync = yes
+EOF
+        git clone --depth 1 "${url}" "${mnt_path}/var/db/repos/${name}"
+    done
+}
+
 # Merge the stage4 binpkgs onto the stage3 rootfs install_rootfs just
 # extracted. The "stage4" artifact from gentoo-build is just a
 # /var/cache/binpkgs cache (see its Containerfile), not a mergeable
@@ -1957,6 +1988,11 @@ gentoo_install_stage4_binpkgs() {
     cp gentoo-config/package.unmask/* "${mnt_path}/etc/portage/package.unmask/"
     cp gentoo-config/package.accept_keywords "${mnt_path}/etc/portage/package.accept_keywords/"
     cp -r gentoo-config/sets "${mnt_path}/etc/portage/sets"
+
+    if [ -n "${GENTOO_OVERLAYS}" ]; then
+        gentoo_add_overlays "${mnt_path}" "${GENTOO_OVERLAYS}"
+        verify_stage_fs "${rootfs_dev}" "${mnt_path}" "stage4: overlays"
+    fi
 
     # DNS resolution inside the chroot (emerge-webrsync needs network)
     cp /etc/resolv.conf "${mnt_path}/etc/resolv.conf"
