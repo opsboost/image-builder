@@ -46,7 +46,6 @@ SCRIPT_PATH="$(dirname -- "${BASH_SOURCE[0]}")"
 SCRIPT_PATH="$(cd -- "${SCRIPT_PATH}" && pwd)"
 
 target_arch="amd64"
-platform="pine64"
 
 # Kernel
 kernel_src_url="https://github.com/torvalds/linux"
@@ -712,6 +711,8 @@ EOF
 create_disk() {
     local file_disk
     file_disk="${1}"
+    local reduce_gpt_table
+    reduce_gpt_table="${2}"
 
     info "$(printf "Creating disk file %s..\n" "${file_disk}")"
     # 16GB: shared by gentoo_create_disk's callers (Gentoo, Alma), but
@@ -731,6 +732,16 @@ create_disk() {
         parted "${file_disk}" mkpart xfs 260 16GB
         parted "${file_disk}" set 2 boot on
         parted "${file_disk}" print
+
+        if [ -n "${reduce_gpt_table}" ]; then
+            # A default GPT reserves 128 entries (16KiB, up to byte
+            # 17408) for the partition array, which overlaps the byte
+            # 8192 offset a pine64 U-Boot SPL gets dd'd into. Only 3
+            # partitions are ever used here, so 8 entries (1KiB) is
+            # plenty and clears that offset with room to spare
+            info "Shrinking GPT partition entry table to clear the pine64 U-Boot SPL offset"
+            sgdisk --resize-table=8 "${file_disk}"
+        fi
         ;;
     freebsd|macos)
         loop_mount_freebsd "${file_disk}"
@@ -1687,6 +1698,18 @@ build_gentoo_stage4() {
 }
 
 build_u_root() {
+    local target_arch
+    target_arch="$1"
+
+    local platform
+    platform=$(container_platform "$target_arch")
+
+    if [ -z "$platform" ]; then
+        error "$(printf "u-root-build: Unsupported target platform: %s\n" "${target_arch}")"
+        error "u-root-build: target_arch must be amd64 or arm64\n"
+        exit 1
+    fi
+
     info "podman: Building u-root for ${platform}"
     podman_install
     podman buildx build --platform="${platform}" \
@@ -2013,6 +2036,9 @@ gentoo_install_stage4_binpkgs() {
         ;;
     sway)
         sets="@dev @dev-lang @sway @essentials @virt @net"
+        ;;
+    k3s)
+        sets="@k8s @essentials @net"
         ;;
     esac
 
@@ -2353,6 +2379,8 @@ gentoo_create_disk() {
     disk_file="${path}/${2}"
     local mnt_path
     mnt_path="${3}"
+    local reduce_gpt_table
+    reduce_gpt_table="${5}"
     local rootfs_dev
     rootfs_dev=$(rootfs)
     local esp_dev
@@ -2367,7 +2395,7 @@ gentoo_create_disk() {
         error "$(printf "Missing disk file.\n Please provide a disk file to use.\nAborting..")"
     fi
 
-    create_disk "${disk_file}"
+    create_disk "${disk_file}" "${reduce_gpt_table}"
 
     case "$os" in
     ubuntu|fedora)
@@ -2829,6 +2857,23 @@ main() {
             build_gentoo_stage4 "$target_flavour" "$target_arch"
             return
             ;;
+        gentoo-sway-pine64)
+            local target_flavour
+            target_flavour="sway"
+            # pine64 is real Allwinner arm64 hardware, not a target
+            # arch choice - force it regardless of what was passed
+            target_arch="arm64"
+
+            build_gentoo_stage4 "$target_flavour" "$target_arch"
+            return
+            ;;
+        gentoo-k3s)
+            local target_flavour
+            target_flavour="k3s"
+
+            build_gentoo_stage4 "$target_flavour" "$target_arch"
+            return
+            ;;
         gentoo-stage3)
             build_gentoo_stage3
             gentoo_fetch_stage3 "${target_arch}"
@@ -2887,7 +2932,7 @@ main() {
             exit 0
             ;;
         u-root)
-            build_u_root
+            build_u_root "$target_arch"
             exit 0
             ;;
         esac
@@ -2907,6 +2952,12 @@ main() {
             host_arch=$(sys_arch)
             target_arch="${TARGET_ARCH:-$host_arch}"
         fi
+
+        # pine64 is real Allwinner arm64 hardware, not a target arch
+        # choice - force it regardless of what was passed
+        case "$build_target" in
+        *-pine64) target_arch="arm64" ;;
+        esac
 
         local img_path
         local img_file
@@ -2995,12 +3046,13 @@ main() {
             #                "${ansible_roles}"
             exit 0
             ;;
-        gentoo-containeros|gentoo-sway)
+        gentoo-containeros|gentoo-sway|gentoo-sway-pine64|gentoo-k3s)
             local rootfs_dev
             rootfs_dev=$(rootfs)
 
             local target_flavour
             target_flavour=${build_target#*gentoo-}
+            target_flavour=${target_flavour%-pine64}
 
             # download_miss/gentoo_fetch_stage3 (called below) expect a
             # "path" in scope to fetch into - it was never actually set
@@ -3011,12 +3063,25 @@ main() {
             local path
             path="${img_path}"
 
+            local reduce_gpt_table
+            if [ "gentoo-sway-pine64" = "${build_target}" ]; then
+                reduce_gpt_table="1"
+            fi
+
             gentoo_create_disk  "${img_path}" \
                                 "${img_file}" \
-                                "${mnt_path}"
+                                "${mnt_path}" \
+                                "" \
+                                "${reduce_gpt_table}"
 
             local kernel_file
-            kernel_file="$(kernel_file_for_arch "${target_arch}")"
+            if [ "gentoo-sway-pine64" = "${build_target}" ]; then
+                # Real Allwinner hardware, not the QEMU virt machine -
+                # no virtio, needs the pine64-specific kernel build
+                kernel_file="Image-pine64"
+            else
+                kernel_file="$(kernel_file_for_arch "${target_arch}")"
+            fi
 
             local kernel_download_file
             kernel_download_file="${kernel_file}-latest"
@@ -3188,8 +3253,12 @@ main() {
                 xz -d -k "${img_path}/${img_file}.xz"
             fi
             ;;
+        gentoo-sway-pine64)
+            # pine64 is always arm64 - matches the naming 'create' used
+            img_file="${img}-arm64.raw"
+            ;;
         *)
-            error "Please specify the image to write: One of 'alma, iss'\n"
+            error "Please specify the image to write: One of 'alma, iss, gentoo-sway-pine64'\n"
         esac
 
         if ! [ -f "${img_path}/${img_file}" ]; then
@@ -3224,7 +3293,7 @@ main() {
             error "Failed to write image"
         fi
 
-        if [ "pine64" = "${platform}" ]; then
+        if [ "gentoo-sway-pine64" = "${img}" ]; then
             # FreeBSD Ports contains builds for Pine64/RockPro64
             local img_bootloader
             img_bootloader="/usr/local/share/u-boot/u-boot-pine64/u-boot-sunxi-with-spl.bin"
