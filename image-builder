@@ -1717,6 +1717,12 @@ build_u_root() {
                         -v "${PWD}"/output:/output \
                         -t "u-root" \
                         -f Containerfile
+
+    local container_id
+    container_id=$(podman create u-root)
+    podman cp "${container_id}:/u-root-${target_arch}" "output/u-root-${target_arch}"
+    podman cp "${container_id}:/initramfs-${target_arch}.cpio" "output/initramfs-${target_arch}.cpio"
+    podman rm "${container_id}"
 }
 
 openwrt_build() {
