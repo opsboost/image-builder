@@ -2047,6 +2047,9 @@ gentoo_install_stage4_binpkgs() {
     sway)
         sets="@dev @dev-lang @sway @essentials @virt @net"
         ;;
+    sway-virt)
+        sets="@dev @dev-lang @sway-virt @essentials @virt @net"
+        ;;
     k3s)
         sets="@k8s @essentials @net"
         ;;
@@ -2863,6 +2866,13 @@ main() {
         gentoo-sway)
             local target_flavour
             target_flavour="sway"
+
+            build_gentoo_stage4 "$target_flavour" "$target_arch"
+            return
+            ;;
+        gentoo-sway-virt)
+            local target_flavour
+            target_flavour="sway-virt"
 
             build_gentoo_stage4 "$target_flavour" "$target_arch"
             return
