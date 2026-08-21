@@ -2055,6 +2055,13 @@ gentoo_install_stage4_binpkgs() {
         ;;
     esac
 
+    # Real hardware (pine64/x230), unlike sway-virt: build mesa with
+    # the Lima Gallium driver for Mali GPU acceleration - mirrors
+    # gentoo-build/emerge.sh's sway branch
+    if [ "sway" = "${target_flavour}" ]; then
+        cp gentoo-config/package.use.hwaccel "${mnt_path}/etc/portage/package.use/"
+    fi
+
     info "$(printf "Gentoo: Merging stage4 binpkgs (%s)\n" "${target_flavour}")"
     # --usepkgonly would refuse to resolve virtual/* (deliberately left
     # out of the binpkgs by emerge.sh's --buildpkg-exclude) at all; use
@@ -3066,7 +3073,7 @@ main() {
             #                "${ansible_roles}"
             exit 0
             ;;
-        gentoo-containeros|gentoo-sway|gentoo-sway-pine64|gentoo-k3s)
+        gentoo-containeros|gentoo-sway|gentoo-sway-virt|gentoo-sway-pine64|gentoo-k3s)
             local rootfs_dev
             rootfs_dev=$(rootfs)
 
