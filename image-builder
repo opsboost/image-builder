@@ -874,10 +874,20 @@ loop_mount_linux() {
 
     modprobe loop
 
-    if ! sudo losetup -P -f "${disk_file}"; then
-        error "$(printf "Failed to loop mount %s\n" "${disk_file}")"
-        dmesg
-        exit 1
+    if ! sudo losetup -P --direct-io=on -f "${disk_file}"; then
+        info "$(printf "loop_mount: --direct-io=on rejected, retrying buffered\n")"
+        if ! sudo losetup -P -f "${disk_file}"; then
+            error "$(printf "Failed to loop mount %s\n" "${disk_file}")"
+            dmesg
+            exit 1
+        fi
+    fi
+
+    local loop_dev
+    loop_dev="$(losetup -j "${disk_file}" -O NAME --noheadings 2>/dev/null | head -1)"
+    if [ -n "${loop_dev}" ]; then
+        info "$(printf "loop_mount: %s DIO=%s\n" "${loop_dev}" \
+            "$(losetup -l -O DIO --noheadings "${loop_dev}" 2>/dev/null | tr -d ' ')")"
     fi
 }
 
