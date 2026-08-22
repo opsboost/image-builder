@@ -1870,21 +1870,32 @@ verify_filesystem() {
     local context
     context="${2}"
 
+    local verify
+    verify=1
     if [ "0" == "${VERIFY_FS:-1}" ]; then
-        return 0
+        verify=0
     fi
 
     if [ ! -b "${dev}" ] && [ ! -c "${dev}" ]; then
+        if [ "0" == "${verify}" ]; then
+            return 0
+        fi
         error "$(printf "verify_filesystem: Device does not exist: %s\n" "${dev}")"
         exit 1
     fi
 
     if ! command -v findmnt >/dev/null 2>&1; then
+        if [ "0" == "${verify}" ]; then
+            return 0
+        fi
         error "$(printf "verify_filesystem: findmnt is required but not installed\n")"
         exit 1
     fi
 
     if findmnt -rno SOURCE "${dev}" >/dev/null 2>&1 || grep -q "^${dev} " /proc/mounts 2>/dev/null; then
+        if [ "0" == "${verify}" ]; then
+            return 0
+        fi
         error "$(printf "verify_filesystem: %s is mounted, cannot check it\n" "${dev}")"
         findmnt -R "${dev}" || true
         grep "^${dev} " /proc/mounts || true
@@ -1894,10 +1905,17 @@ verify_filesystem() {
     local fs_type
     fs_type="$(blkid -o value -s TYPE "${dev}" 2>/dev/null)"
 
+    if [ "xfs" == "${fs_type}" ]; then
+        replay_log_xfs "${dev}"
+    fi
+
+    if [ "0" == "${verify}" ]; then
+        return 0
+    fi
+
     local check_cmd
     case "${fs_type}" in
     xfs)
-        replay_log_xfs "${dev}"
         check_cmd=(xfs_repair -n "${dev}")
         ;;
     ext2|ext3|ext4)
