@@ -89,6 +89,21 @@ freebsd_config_url="https://github.com/bbusse/freebsd-config"
 freebsd_ci_root_password="freebsd-ci"
 freebsd_use_release_script="${FREEBSD_USE_RELEASE_SCRIPT:-true}"
 
+# NomadBSD
+# Upstream publishes amd64, i386 and mac images only, and its own build
+# system's ARCH takes those same three values - there is no arm64 image
+# to fetch or build. Point NOMADBSD_IMAGE at a locally built image to
+# compose an architecture upstream does not ship
+nomadbsd_version="141R-20240711"
+nomadbsd_repo_url="https://nomadbsd.org/download"
+nomadbsd_source_url="https://github.com/NomadBSD/NomadBSD"
+nomadbsd_filesystem="${NOMADBSD_FILESYSTEM:-ufs}"
+nomadbsd_loader_file="nomadbsd-loader.efi"
+
+# Kernel command lines shared by the Linux slots of a composition
+linux_cmdline_console="console=tty0 console=ttyS0,115200n8"
+linux_cmdline_default="rw init=/lib/systemd/systemd enforcing=1 ${linux_cmdline_console}"
+
 # gokrazy-dhcp
 gokrazy_dhcp_repo_url="https://github.com/bbusse/gokrazy-dhcp"
 gokrazy_dhcp_release_tag="ci_c150ed5_2"
@@ -685,27 +700,896 @@ error() {
     logger -p user.error -t "$SCRIPT_NAME" "$@"
 }
 
+# Write a single systemd-boot entry. BOOT_TYPE 'linux' boots a kernel
+# with an optional initrd, 'efi' chainloads an EFI binary - which is how
+# the BSD slots boot, through the loader taken from their own image
 create_boot_entry() {
-    local root_spec
-    root_spec="${1}"
     local entry_file
-    entry_file="${2}"
+    entry_file="${1}"
     local title
-    title="${3}"
+    title="${2}"
+    local boot_type
+    boot_type="${3}"
+    local kernel
+    kernel="${4}"
+    local initrd
+    initrd="${5}"
+    local root_spec
+    root_spec="${6}"
+    local cmdline
+    cmdline="${7}"
 
-    # Ensure parent directory exists and file is present
     local entry_dir
     entry_dir="$(dirname -- "${entry_file}")"
     mkdir -p "${entry_dir}"
-    if [ ! -e "${entry_file}" ]; then
-        : > "${entry_file}"
+
+    local options
+    options=""
+    if [ -n "${root_spec}" ]; then
+        options="root=${root_spec}"
+    fi
+    if [ -n "${cmdline}" ]; then
+        options="${options:+${options} }${cmdline}"
     fi
 
-cat << EOF > "${entry_file}"
-title         ${title}
-linux         /bzImage
-options       root=${root_spec} rw init=/lib/systemd/systemd enforcing=1 console=tty0 console=ttyS0,115200n8
-EOF
+    {
+        printf "title         %s\n" "${title}"
+
+        case "${boot_type}" in
+        linux)
+            printf "linux         /%s\n" "${kernel}"
+            if [ -n "${initrd}" ]; then
+                printf "initrd        /%s\n" "${initrd}"
+            fi
+            ;;
+        efi)
+            printf "efi           /%s\n" "${kernel}"
+            ;;
+        *)
+            error "$(printf "create_boot_entry: Unknown boot type: %s\n" "${boot_type}")"
+            exit 1
+            ;;
+        esac
+
+        if [ -n "${options}" ]; then
+            printf "options       %s\n" "${options}"
+        fi
+    } > "${entry_file}"
+}
+
+# Verify a file against a checksum file, accepting both the BSD style
+# "SHA256 (file) = hash" the BSDs publish and coreutils' "hash  file"
+checksum_verify() {
+    local csum_file
+    csum_file="${1}"
+    local file
+    file="${2}"
+    local algo
+    algo="${3:-sha256}"
+
+    if [ ! -f "${csum_file}" ]; then
+        error "$(printf "checksum_verify: Missing checksum file: %s\n" "${csum_file}")"
+        return 1
+    fi
+
+    local expected
+    expected="$(sed -n 's/.*=[[:space:]]*\([0-9a-fA-F][0-9a-fA-F]*\)[[:space:]]*$/\1/p' \
+                    "${csum_file}" | head -1)"
+    if [ -z "${expected}" ]; then
+        expected="$(awk '{ print $1; exit }' "${csum_file}")"
+    fi
+
+    local actual
+    local os
+    os="$(uname)"
+
+    case "$os" in
+    Linux)
+        actual="$("${algo}sum" "${file}" | awk '{ print $1 }')"
+        ;;
+    Darwin|FreeBSD)
+        actual="$("${algo}" -q "${file}")"
+        ;;
+    *)
+        error "$(printf "checksum_verify: Unsupported OS: %s\n" "${os}")"
+        return 1
+        ;;
+    esac
+
+    expected="$(printf "%s" "${expected}" | tr '[:upper:]' '[:lower:]')"
+    actual="$(printf "%s" "${actual}" | tr '[:upper:]' '[:lower:]')"
+
+    info "$(printf "Comparing checksums\nA: %s\nB: %s\n" "${expected}" "${actual}")"
+
+    [ -n "${expected}" ] && [ "${expected}" = "${actual}" ]
+}
+
+# Print "START_SECTOR SIZE_SECTORS" for the first partition filling a
+# given role in a disk image. Reads the partition table out of the file
+# itself, so it needs no loop device, and covers both the GPT type
+# GUIDs and the MBR type bytes FreeBSD-derived images come with
+image_partition_range() {
+    local img
+    img="${1}"
+    local role
+    role="${2}"
+
+    local types
+    case "${role}" in
+    ufs)
+        types="516E7CB6-6ECF-11D6-8FF8-00022D09712B a5"
+        ;;
+    esp)
+        types="C12A7328-F81F-11D2-BA4B-00A0C93EC93B ef"
+        ;;
+    *)
+        error "$(printf "image_partition_range: Unknown role: %s\n" "${role}")"
+        return 1
+        ;;
+    esac
+
+    local dump
+    dump="$(sfdisk -d "${img}" 2>/dev/null)" || return 1
+
+    local type
+    for type in ${types}; do
+        local line
+        line="$(printf "%s\n" "${dump}" | grep -i "type=${type}\(,\|$\)" | head -1)"
+
+        if [ -n "${line}" ]; then
+            local start
+            start="$(printf "%s" "${line}" | \
+                     sed -n 's/.*start=[[:space:]]*\([0-9][0-9]*\).*/\1/p')"
+            local size
+            size="$(printf "%s" "${line}" | \
+                    sed -n 's/.*size=[[:space:]]*\([0-9][0-9]*\).*/\1/p')"
+
+            if [ -n "${start}" ] && [ -n "${size}" ]; then
+                printf "%s %s" "${start}" "${size}"
+                return 0
+            fi
+        fi
+    done
+
+    return 1
+}
+
+# parted's fs-type hint for a filesystem name
+parted_fs_hint() {
+    case "${1}" in
+    vfat) echo "fat32" ;;
+    *)    echo "${1}" ;;
+    esac
+}
+
+# sgdisk type codes: FreeBSD UFS, Microsoft basic data, Linux filesystem
+gpt_type_code() {
+    case "${1}" in
+    ufs)  echo "A503" ;;
+    vfat) echo "0700" ;;
+    *)    echo "8300" ;;
+    esac
+}
+
+# GPT layout: p1 is a small reserved area, p2 the shared ESP, then one
+# partition per slot that needs a filesystem
+create_disk_parts_gpt() {
+    local file_disk
+    file_disk="${1}"
+
+    parted -s "${file_disk}" mklabel gpt
+    parted -s "${file_disk}" mkpart reserved 1MiB 2MiB
+
+    local esp_start
+    esp_start=3
+    local esp_end
+    esp_end=$((esp_start + comp_esp_size))
+
+    parted -s "${file_disk}" mkpart esp fat32 "${esp_start}MiB" "${esp_end}MiB"
+    parted -s "${file_disk}" set 2 boot on
+    sgdisk -t 2:EF00 "${file_disk}" >/dev/null
+
+    local start
+    start="${esp_end}"
+
+    local i
+    for i in "${!comp_name[@]}"; do
+        if [ 0 = "${comp_part[$i]}" ]; then
+            continue
+        fi
+
+        local end
+        if [ "rest" = "${comp_size[$i]}" ]; then
+            end="100%"
+        else
+            end="$((start + comp_size[i]))MiB"
+        fi
+
+        parted -s "${file_disk}" mkpart "${comp_name[$i]}" \
+                                        "$(parted_fs_hint "${comp_fs[$i]}")" \
+                                        "${start}MiB" "${end}"
+        sgdisk -t "${comp_part[$i]}:$(gpt_type_code "${comp_fs[$i]}")" \
+               "${file_disk}" >/dev/null
+
+        if [ "rest" != "${comp_size[$i]}" ]; then
+            start=$((start + comp_size[i]))
+        fi
+    done
+
+    parted -s "${file_disk}" print
+}
+
+#
+# Image composition
+#
+# An image is described as an ordered list of slots. A slot is one
+# bootable system: where its rootfs comes from, the partition holding
+# it, and the kernel, initrd and cmdline that boot it. All slots share
+# the single ESP, which carries every kernel and boot entry.
+#
+# bash has no nested containers, so slots live in parallel arrays
+# indexed by slot number, filled in by composition_load
+comp_name=()
+comp_provider=()
+comp_provider_arg=()
+comp_fs=()
+comp_size=()
+comp_part=()
+comp_kernel_src=()
+comp_kernel=()
+comp_initrd_src=()
+comp_initrd=()
+comp_cmdline=()
+comp_boot_type=()
+
+# Total image size in MiB. Set by composition_load for targets that
+# want a fixed size rather than one derived from their slots
+comp_disk_size=""
+comp_esp_size=256
+
+# Destinations already copied to the ESP, so slots sharing a kernel copy
+# it once. A newline separated list rather than an associative array,
+# which bash 3 does not have
+esp_installed=""
+
+composition_reset() {
+    comp_name=()
+    comp_provider=()
+    comp_provider_arg=()
+    comp_fs=()
+    comp_size=()
+    comp_part=()
+    comp_kernel_src=()
+    comp_kernel=()
+    comp_initrd_src=()
+    comp_initrd=()
+    comp_cmdline=()
+    comp_boot_type=()
+    comp_disk_size=""
+    comp_esp_size=256
+    esp_installed=""
+}
+
+# composition_add NAME PROVIDER PROVIDER_ARG FS SIZE_MIB KERNEL_SRC \
+#                 KERNEL INITRD_SRC INITRD CMDLINE BOOT_TYPE
+#
+# FS 'none' gives the slot no partition, for a system that runs
+# entirely from its initramfs. SIZE_MIB 'rest' extends the partition to
+# the end of the disk. BOOT_TYPE is one of linux, efi or none
+composition_add() {
+    comp_name+=("${1}")
+    comp_provider+=("${2}")
+    comp_provider_arg+=("${3}")
+    comp_fs+=("${4}")
+    comp_size+=("${5}")
+    comp_kernel_src+=("${6}")
+    comp_kernel+=("${7}")
+    comp_initrd_src+=("${8}")
+    comp_initrd+=("${9}")
+    comp_cmdline+=("${10}")
+    comp_boot_type+=("${11}")
+    comp_part+=(0)
+}
+
+comp_count() {
+    echo "${#comp_name[@]}"
+}
+
+# Assign partition numbers. p1 is reserved and p2 is the ESP, so slots
+# needing a filesystem start at p3. Slots without one keep 0 and are
+# skipped when partitioning
+composition_finalize() {
+    local n
+    n=3
+
+    local i
+    for i in "${!comp_name[@]}"; do
+        if [ "none" = "${comp_fs[$i]}" ]; then
+            comp_part[$i]=0
+        else
+            comp_part[$i]="${n}"
+            n=$((n+1))
+        fi
+    done
+}
+
+composition_disk_size_mib() {
+    if [ -n "${comp_disk_size}" ]; then
+        echo "${comp_disk_size}"
+        return 0
+    fi
+
+    # 3MiB ahead of the ESP, plus a 4MiB tail for the backup GPT
+    local total
+    total=$((3 + comp_esp_size + 4))
+
+    local i
+    for i in "${!comp_name[@]}"; do
+        if [ 0 = "${comp_part[$i]}" ] || [ "rest" = "${comp_size[$i]}" ]; then
+            continue
+        fi
+        total=$((total + comp_size[i]))
+    done
+
+    echo "${total}"
+}
+
+composition_show() {
+    info "$(printf "Image composition (%s MiB, %s MiB esp):\n" \
+                   "$(composition_disk_size_mib)" "${comp_esp_size}")"
+
+    local i
+    for i in "${!comp_name[@]}"; do
+        info "$(printf "  slot %s  %-20s provider=%-9s fs=%-5s part=%-2s size=%-6s kernel=%-22s initrd=%-26s boot=%s\n" \
+                       "${i}" \
+                       "${comp_name[$i]}" \
+                       "${comp_provider[$i]}" \
+                       "${comp_fs[$i]}" \
+                       "${comp_part[$i]}" \
+                       "${comp_size[$i]}" \
+                       "${comp_kernel[$i]:--}" \
+                       "${comp_initrd[$i]:--}" \
+                       "${comp_boot_type[$i]}")"
+    done
+}
+
+# Describe a build target as a set of slots
+composition_load() {
+    local build_target
+    build_target="${1}"
+    local target_arch
+    target_arch="${2}"
+
+    composition_reset
+
+    local kernel_file
+    local kernel_src
+
+    case "$build_target" in
+    gentoo-containeros|gentoo-sway|gentoo-sway-virt|gentoo-sway-pine64|gentoo-k3s)
+        local target_flavour
+        target_flavour=${build_target#*gentoo-}
+        target_flavour=${target_flavour%-pine64}
+
+        if [ "gentoo-sway-pine64" = "${build_target}" ]; then
+            # Real Allwinner hardware, not the QEMU virt machine - no
+            # virtio, needs the pine64-specific kernel build
+            kernel_file="Image-pine64"
+        else
+            kernel_file="$(kernel_file_for_arch "${target_arch}")"
+        fi
+
+        # A fixed 16GiB disk with a single partition filling it, as
+        # this target had before it was described as a composition.
+        # Partition boundaries now land on MiB rather than the MB that
+        # unitless parted arguments meant, which suits the 4096-byte
+        # sector size the xfs below is created with
+        comp_disk_size=16384
+
+        composition_add "gentoo-${target_flavour}" \
+                        "gentoo" \
+                        "${target_flavour}" \
+                        "xfs" \
+                        "rest" \
+                        "${kernel_file}-latest" \
+                        "${kernel_file}" \
+                        "" \
+                        "" \
+                        "${linux_cmdline_default}" \
+                        "linux"
+        ;;
+    containeros-virt)
+        kernel_file="$(kernel_file_for_arch "${target_arch}")"
+        kernel_src="${kernel_file}-latest"
+
+        # The ESP holds a Linux kernel, the u-root initramfs and
+        # NomadBSD's EFI loader rather than a single kernel
+        comp_esp_size=512
+
+        composition_add "gentoo-containeros" \
+                        "gentoo" \
+                        "containeros" \
+                        "xfs" \
+                        "10240" \
+                        "${kernel_src}" \
+                        "${kernel_file}" \
+                        "" \
+                        "" \
+                        "${linux_cmdline_default}" \
+                        "linux"
+
+        composition_add "nomadbsd" \
+                        "nomadbsd" \
+                        "${target_arch}" \
+                        "ufs" \
+                        "6144" \
+                        "${nomadbsd_loader_file}" \
+                        "EFI/nomadbsd/loader.efi" \
+                        "" \
+                        "" \
+                        "" \
+                        "efi"
+
+        # u-root runs from its initramfs alone, so it gets no partition
+        # and boots the kernel the Gentoo slot already put on the ESP
+        composition_add "u-root" \
+                        "none" \
+                        "" \
+                        "none" \
+                        "0" \
+                        "${kernel_src}" \
+                        "${kernel_file}" \
+                        "output/initramfs-${target_arch}.cpio" \
+                        "initramfs-${target_arch}.cpio" \
+                        "${linux_cmdline_console}" \
+                        "linux"
+        ;;
+    nomadbsd)
+        comp_esp_size=64
+
+        composition_add "nomadbsd" \
+                        "nomadbsd" \
+                        "${target_arch}" \
+                        "ufs" \
+                        "6144" \
+                        "${nomadbsd_loader_file}" \
+                        "EFI/nomadbsd/loader.efi" \
+                        "" \
+                        "" \
+                        "" \
+                        "efi"
+        ;;
+    *)
+        # Keeps targets that partition a disk without describing one -
+        # alma - on the layout they had before compositions existed
+        info "$(printf "composition_load: No composition for '%s', using a single xfs rootfs\n" \
+                       "${build_target}")"
+        comp_disk_size=16384
+
+        composition_add "${build_target}" \
+                        "none" \
+                        "" \
+                        "xfs" \
+                        "rest" \
+                        "" \
+                        "" \
+                        "" \
+                        "" \
+                        "" \
+                        "none"
+        ;;
+    esac
+
+    composition_finalize
+}
+
+# Fetch and stage everything the slots need before the disk image is
+# created, so a failed download does not leave a half-built image
+composition_fetch() {
+    local download_path
+    download_path="${1}"
+    local target_arch
+    target_arch="${2}"
+
+    local i
+    for i in "${!comp_name[@]}"; do
+        case "${comp_provider[$i]}" in
+        gentoo)
+            info "Fetching kernel"
+            download_miss "${download_path}" \
+                          "${kernel_repo_url}/${comp_kernel_src[$i]}" \
+                          "${kernel_repo_url}/${comp_kernel_src[$i]}.sha384" \
+                          "${comp_kernel_src[$i]}.sha384"
+
+            gentoo_fetch_stage3 "${target_arch}"
+            gentoo_fetch_stage4 "${comp_provider_arg[$i]}" "${target_arch}" "latest"
+            ;;
+        nomadbsd)
+            nomadbsd_fetch "${download_path}" "${comp_provider_arg[$i]}"
+            nomadbsd_stage_loader "${download_path}" "${comp_provider_arg[$i]}"
+            ;;
+        esac
+
+        # An initramfs is built by a separate 'build' run rather than
+        # fetched, so fail early with the command that produces it
+        local initrd_src
+        initrd_src="${comp_initrd_src[$i]}"
+        if [ -n "${initrd_src}" ] && \
+           [ ! -f "${initrd_src}" ] && \
+           [ ! -f "${download_path}/${initrd_src}" ]; then
+            error "$(printf "Missing initramfs for slot '%s': %s\n" \
+                            "${comp_name[$i]}" "${initrd_src}")"
+            error "$(printf "Build it first:\n\n  # image-builder build u-root %s\n" \
+                            "${target_arch}")"
+            exit 1
+        fi
+    done
+}
+
+# Create each slot's filesystem. UFS slots are skipped: their
+# filesystem is copied in whole from an upstream image, which would
+# overwrite anything created here
+composition_mkfs() {
+    local i
+    for i in "${!comp_name[@]}"; do
+        if [ 0 = "${comp_part[$i]}" ]; then
+            continue
+        fi
+
+        local dev
+        dev="$(part_dev "${comp_part[$i]}")"
+
+        case "${comp_fs[$i]}" in
+        xfs)
+            if ! mkfs.xfs -s size=4096 "${dev}"; then
+                error "$(printf "Error: Failed to create filesystem on %s\n" "${dev}")"
+                exit 1
+            fi
+            ;;
+        vfat)
+            if ! mkfs.vfat "${dev}"; then
+                error "$(printf "Error: Failed to create filesystem on %s\n" "${dev}")"
+                exit 1
+            fi
+            ;;
+        ufs)
+            info "$(printf "Skipping mkfs on %s: its UFS filesystem is copied in whole\n" "${dev}")"
+            ;;
+        *)
+            error "$(printf "composition_mkfs: Unsupported filesystem: %s\n" "${comp_fs[$i]}")"
+            exit 1
+            ;;
+        esac
+    done
+}
+
+# Populate every slot that has a partition, using the slot's provider
+install_rootfs_slots() {
+    local mnt_path
+    mnt_path="${1}"
+    local src_path
+    src_path="${2}"
+
+    local i
+    for i in "${!comp_name[@]}"; do
+        if [ 0 = "${comp_part[$i]}" ]; then
+            continue
+        fi
+
+        local dev
+        dev="$(part_dev "${comp_part[$i]}")"
+
+        info "$(printf "Installing rootfs for slot %s (%s) to %s\n" \
+                       "${i}" "${comp_name[$i]}" "${dev}")"
+
+        case "${comp_provider[$i]}" in
+        gentoo)
+            install_rootfs "${dev}" "${mnt_path}" "${comp_fs[$i]}"
+            ;;
+        nomadbsd)
+            nomadbsd_install_rootfs "${dev}" \
+                                    "${src_path}" \
+                                    "${comp_provider_arg[$i]}"
+            ;;
+        none)
+            info "$(printf "Slot %s has no rootfs provider, leaving %s empty\n" \
+                           "${comp_name[$i]}" "${dev}")"
+            ;;
+        *)
+            error "$(printf "install_rootfs_slots: Unknown rootfs provider: %s\n" \
+                            "${comp_provider[$i]}")"
+            exit 1
+            ;;
+        esac
+
+        verify_filesystem "${dev}" "$(printf "install_rootfs %s" "${comp_name[$i]}")"
+    done
+}
+
+nomadbsd_arch() {
+    local target_arch
+    target_arch="${1}"
+
+    case "${target_arch}" in
+    amd64|x86_64) echo "amd64" ;;
+    i386|x86)     echo "i386" ;;
+    mac)          echo "mac" ;;
+    *)            echo "" ;;
+    esac
+}
+
+nomadbsd_image_file() {
+    local nomad_arch
+    nomad_arch="${1}"
+
+    printf "nomadbsd-%s.%s.%s.img" "${nomadbsd_version}" \
+                                   "${nomad_arch}" \
+                                   "${nomadbsd_filesystem}"
+}
+
+# Where the image to compose from lives. NOMADBSD_IMAGE overrides the
+# upstream one, which is the only way to get an architecture upstream
+# does not publish
+nomadbsd_image_path() {
+    local src_path
+    src_path="${1}"
+    local target_arch
+    target_arch="${2}"
+
+    if [ -n "${NOMADBSD_IMAGE}" ]; then
+        printf "%s" "${NOMADBSD_IMAGE}"
+        return 0
+    fi
+
+    printf "%s/%s" "${src_path}" \
+                   "$(nomadbsd_image_file "$(nomadbsd_arch "${target_arch}")")"
+}
+
+nomadbsd_fetch() {
+    local download_path
+    download_path="${1}"
+    local target_arch
+    target_arch="${2}"
+
+    if [ -n "${NOMADBSD_IMAGE}" ]; then
+        if [ ! -f "${NOMADBSD_IMAGE}" ]; then
+            error "$(printf "NomadBSD: NOMADBSD_IMAGE does not exist: %s\n" \
+                            "${NOMADBSD_IMAGE}")"
+            exit 1
+        fi
+        info "$(printf "NomadBSD: Using NOMADBSD_IMAGE: %s\n" "${NOMADBSD_IMAGE}")"
+        return 0
+    fi
+
+    local nomad_arch
+    nomad_arch="$(nomadbsd_arch "${target_arch}")"
+
+    if [ -z "${nomad_arch}" ]; then
+        error "$(printf "NomadBSD: There is no %s image\n" "${target_arch}")"
+        error "Upstream publishes amd64, i386 and mac only, and its own"
+        error "build system's ARCH takes those same three values"
+        error "$(printf "Build an image for %s yourself, then point NOMADBSD_IMAGE at it\n" \
+                        "${target_arch}")"
+        exit 1
+    fi
+
+    local img_file
+    img_file="$(nomadbsd_image_file "${nomad_arch}")"
+    local compressed_file
+    compressed_file="${img_file}.lzma"
+
+    if [ -f "${download_path}/${img_file}" ]; then
+        info "$(printf "NomadBSD: Image exists, not fetching again: %s\n" "${img_file}")"
+        return 0
+    fi
+
+    if [ ! -f "${download_path}/${compressed_file}" ]; then
+        download "${nomadbsd_repo_url}/${compressed_file}" \
+                 "${download_path}" \
+                 "${DOWNLOAD_RETRIES}"
+    fi
+
+    download "${nomadbsd_repo_url}/${compressed_file}.sha256" \
+             "${download_path}" \
+             "${DOWNLOAD_RETRIES}"
+
+    info "NomadBSD: Verifying checksum"
+    if ! checksum_verify "${download_path}/${compressed_file}.sha256" \
+                         "${download_path}/${compressed_file}" \
+                         "sha256"; then
+        error "$(printf "NomadBSD: Checksum mismatch: %s\n" "${compressed_file}")"
+        exit 1
+    fi
+
+    info "$(printf "NomadBSD: Decompressing %s\n" "${compressed_file}")"
+    if ! xz -d -k -f "${download_path}/${compressed_file}"; then
+        error "NomadBSD: Failed to decompress image"
+        exit 1
+    fi
+}
+
+# NomadBSD boots through FreeBSD's EFI loader. Take it out of the
+# image's own ESP so a systemd-boot entry can chainload it
+nomadbsd_stage_loader() {
+    local src_path
+    src_path="${1}"
+    local target_arch
+    target_arch="${2}"
+
+    local dest
+    dest="${src_path}/${nomadbsd_loader_file}"
+
+    if [ -f "${dest}" ]; then
+        info "$(printf "NomadBSD: EFI loader already staged: %s\n" "${dest}")"
+        return 0
+    fi
+
+    local src_img
+    src_img="$(nomadbsd_image_path "${src_path}" "${target_arch}")"
+
+    local range
+    range="$(image_partition_range "${src_img}" "esp")"
+    if [ -z "${range}" ]; then
+        error "$(printf "NomadBSD: Found no ESP in %s\n" "${src_img}")"
+        sfdisk -d "${src_img}" || true
+        exit 1
+    fi
+
+    local start_sector
+    start_sector="${range%% *}"
+    local size_sectors
+    size_sectors="${range##* }"
+
+    local esp_img
+    esp_img="${src_path}/nomadbsd-esp.img"
+    local esp_mnt
+    esp_mnt="${src_path}/nomadbsd-esp"
+
+    info "$(printf "NomadBSD: Reading the image's ESP (%s MiB)\n" \
+                   "$((size_sectors / 2048))")"
+
+    if ! dd if="${src_img}" of="${esp_img}" bs=4M \
+            iflag=skip_bytes,count_bytes \
+            skip="$((start_sector * 512))" \
+            count="$((size_sectors * 512))"; then
+        error "NomadBSD: Failed to read the image's ESP"
+        rm -f "${esp_img}"
+        exit 1
+    fi
+
+    mkdir -p "${esp_mnt}"
+
+    # Attach and detach the loop device explicitly rather than leaving
+    # it to mount's autoclear: this runs before the image being built
+    # claims a device, and loop_mount_linux refuses to continue if one
+    # is still held when it starts
+    local loop_dev
+    loop_dev="$(losetup --find --show --read-only "${esp_img}")"
+
+    if [ -z "${loop_dev}" ]; then
+        error "$(printf "NomadBSD: Failed to attach the image's ESP: %s\n" "${esp_img}")"
+        rm -f "${esp_img}"
+        exit 1
+    fi
+
+    if ! mount -t vfat -o ro "${loop_dev}" "${esp_mnt}"; then
+        error "$(printf "NomadBSD: Failed to mount the image's ESP: %s\n" "${loop_dev}")"
+        losetup -d "${loop_dev}" || true
+        rm -f "${esp_img}"
+        exit 1
+    fi
+
+    # The binary is BOOTAA64.EFI on arm64 and BOOTX64.EFI on amd64, and
+    # vfat is case insensitive, so search for it rather than guess
+    local loader
+    loader="$(find "${esp_mnt}" \
+                   \( -iname 'boot*.efi' -o -iname 'loader.efi' \) \
+                   -type f | head -1)"
+
+    if [ -n "${loader}" ]; then
+        info "$(printf "NomadBSD: Staging EFI loader %s\n" "${loader}")"
+        cp "${loader}" "${dest}"
+    else
+        error "NomadBSD: Found no EFI loader on the image's ESP"
+        find "${esp_mnt}" || true
+    fi
+
+    umount "${esp_mnt}"
+    losetup -d "${loop_dev}" || true
+    rmdir "${esp_mnt}" || true
+    rm -f "${esp_img}"
+
+    if [ ! -f "${dest}" ]; then
+        exit 1
+    fi
+}
+
+# NomadBSD ships a whole disk image rather than a rootfs tarball, and
+# Linux can not write UFS, so move the filesystem across as a block
+# range instead of copying files into a mounted UFS
+nomadbsd_install_rootfs() {
+    local dest_dev
+    dest_dev="${1}"
+    local src_path
+    src_path="${2}"
+    local target_arch
+    target_arch="${3}"
+
+    local src_img
+    src_img="$(nomadbsd_image_path "${src_path}" "${target_arch}")"
+
+    if [ ! -f "${src_img}" ]; then
+        error "$(printf "NomadBSD: Missing image: %s\n" "${src_img}")"
+        exit 1
+    fi
+
+    local range
+    range="$(image_partition_range "${src_img}" "ufs")"
+    if [ -z "${range}" ]; then
+        error "$(printf "NomadBSD: Found no UFS partition in %s\n" "${src_img}")"
+        sfdisk -d "${src_img}" || true
+        exit 1
+    fi
+
+    local start_sector
+    start_sector="${range%% *}"
+    local size_sectors
+    size_sectors="${range##* }"
+
+    local src_bytes
+    src_bytes=$((size_sectors * 512))
+    local dest_bytes
+    dest_bytes="$(blockdev --getsize64 "${dest_dev}")"
+
+    if [ "${dest_bytes}" -lt "${src_bytes}" ]; then
+        error "$(printf "NomadBSD: Slot %s holds %s bytes but the UFS filesystem needs %s\n" \
+                        "${dest_dev}" "${dest_bytes}" "${src_bytes}")"
+        error "Raise the slot's size in composition_load"
+        exit 1
+    fi
+
+    info "$(printf "NomadBSD: Copying UFS filesystem (%s MiB) to %s\n" \
+                   "$((src_bytes / 1048576))" "${dest_dev}")"
+
+    if ! dd if="${src_img}" of="${dest_dev}" bs=4M \
+            iflag=skip_bytes,count_bytes \
+            skip="$((start_sector * 512))" \
+            count="${src_bytes}" \
+            status=progress conv=fsync; then
+        error "NomadBSD: Failed to copy the UFS filesystem"
+        exit 1
+    fi
+
+    sync
+}
+
+# NomadBSD's build system runs on FreeBSD and takes ARCH=amd64|i386|mac
+nomadbsd_build() {
+    local target_arch
+    target_arch="${1}"
+
+    local os
+    os="$(sys_os)"
+    if [ "freebsd" != "${os}" ]; then
+        error "$(printf "NomadBSD: Its build system runs on FreeBSD only (host is %s)\n" \
+                        "${os}")"
+        exit 1
+    fi
+
+    local nomad_arch
+    nomad_arch="$(nomadbsd_arch "${target_arch}")"
+    if [ -z "${nomad_arch}" ]; then
+        error "$(printf "NomadBSD: Can not build for %s: ARCH takes amd64, i386 or mac\n" \
+                        "${target_arch}")"
+        exit 1
+    fi
+
+    info "$(printf "NomadBSD: Building a %s %s image\n" \
+                   "${nomad_arch}" "${nomadbsd_filesystem}")"
+
+    git clone --depth 1 "${nomadbsd_source_url}"
+    cd NomadBSD
+    ./build -a "${nomad_arch}" -f "${nomadbsd_filesystem}" all
 }
 
 create_disk() {
@@ -714,31 +1598,25 @@ create_disk() {
     local reduce_gpt_table
     reduce_gpt_table="${2}"
 
-    info "$(printf "Creating disk file %s..\n" "${file_disk}")"
-    # 16GB: shared by gentoo_create_disk's callers (Gentoo, Alma), but
-    # this size only matters for Gentoo - its xfs partition now also
-    # holds a synced Portage tree (~1GB) plus stage4 binpkgs on top of
-    # stage3, which no longer fit in the previous 8GB total. Alma just
-    # inherits the larger disk incidentally
-    dd if=/dev/zero of="${file_disk}" bs=1M count=16384 status=progress
+    local os
+    os="$(sys_os)"
 
+    local disk_size_mib
+    disk_size_mib="$(composition_disk_size_mib)"
+
+    info "$(printf "Creating disk file %s (%s MiB)..\n" "${file_disk}" "${disk_size_mib}")"
+    dd if=/dev/zero of="${file_disk}" bs=1M count="${disk_size_mib}" status=progress
 
     case "$os" in
     ubuntu|fedora)
-        # Create partition layout
-        parted "${file_disk}" mklabel gpt
-        parted "${file_disk}" mkpart fat32 1 2
-        parted "${file_disk}" mkpart fat32 3 259
-        parted "${file_disk}" mkpart xfs 260 16GB
-        parted "${file_disk}" set 2 boot on
-        parted "${file_disk}" print
+        create_disk_parts_gpt "${file_disk}"
 
         if [ -n "${reduce_gpt_table}" ]; then
             # A default GPT reserves 128 entries (16KiB, up to byte
             # 17408) for the partition array, which overlaps the byte
-            # 8192 offset a pine64 U-Boot SPL gets dd'd into. Only 3
-            # partitions are ever used here, so 8 entries (1KiB) is
-            # plenty and clears that offset with room to spare
+            # 8192 offset a pine64 U-Boot SPL gets dd'd into. Only a
+            # handful of partitions are ever used here, so 8 entries
+            # (1KiB) is plenty and clears that offset with room to spare
             info "Shrinking GPT partition entry table to clear the pine64 U-Boot SPL offset"
             sgdisk --resize-table=8 "${file_disk}"
         fi
@@ -746,7 +1624,7 @@ create_disk() {
     freebsd|macos)
         loop_mount_freebsd "${file_disk}"
         gpart create -s gpt /dev/md99
-        gpart add -t efi -s 512m -l efi0 /dev/md99
+        gpart add -t efi -s "${comp_esp_size}m" -l efi0 /dev/md99
         gpart add -t linux-data -l rootfs0 /dev/md99
         loop_unmount_freebsd 99
         ;;
@@ -778,12 +1656,23 @@ loop_device() {
     fi
 }
 
-esp() {
-    echo "/dev/loop0p2"
+# Partition device for a partition number. loop_mount_linux asserts
+# that images are attached to loop0, so this stays in step with it
+part_dev() {
+    local part_no
+    part_no="${1}"
+
+    echo "/dev/loop0p${part_no}"
 }
 
+esp() {
+    part_dev 2
+}
+
+# The first rootfs partition. Compositions with several of them address
+# each slot's partition through part_dev instead
 rootfs() {
-    echo "/dev/loop0p3"
+    part_dev 3
 }
 
 # Set up loop mount
@@ -944,22 +1833,61 @@ install_bootctl() {
     sudo apt-get install systemd-boot
 }
 
+# Mount the ESP, repairing it once if the first attempt fails
+esp_mount() {
+    local esp_dev
+    esp_dev="${1}"
+    local mnt_path
+    mnt_path="${2}"
+
+    local opts
+    opts="codepage=437,iocharset=utf8,shortname=mixed,umask=077"
+
+    if [ -z "${esp_dev}" ]; then
+        error "esp_mount: Missing ESP device"
+        exit 1
+    fi
+
+    if [ ! -b "${esp_dev}" ] && [ ! -c "${esp_dev}" ]; then
+        error "$(printf "esp_mount: ESP device does not exist: %s\n" "${esp_dev}")"
+        lsblk -f || true
+        exit 1
+    fi
+
+    mkdir -p "${mnt_path}"
+    chmod 700 "${mnt_path}" || true
+
+    if findmnt -rno TARGET "${mnt_path}" >/dev/null 2>&1; then
+        info "$(printf "ESP already mounted at %s\n" "${mnt_path}")"
+        return 0
+    fi
+
+    if mount -t vfat -o "${opts}" "${esp_dev}" "${mnt_path}"; then
+        return 0
+    fi
+
+    info "Mount failed, running fsck.vfat then retrying"
+    command -v fsck.vfat >/dev/null 2>&1 && fsck.vfat -a "${esp_dev}" || true
+    sleep 1
+
+    if ! mount -t vfat -o "${opts}" "${esp_dev}" "${mnt_path}"; then
+        error "$(printf "Failed to mount esp %s at %s\n" "${esp_dev}" "${mnt_path}")"
+        dmesg | tail -n 50 || true
+        exit 1
+    fi
+}
+
 install_bootloader_efi() {
     local esp_dev
     esp_dev="${1}"
-    local rootfs_dev
-    rootfs_dev="${2}"
     local mnt_path
-    mnt_path="${3}"
-    local boot_entry_file
-    boot_entry_file="${4}"
-    local version
-    version="${5}"
+    mnt_path="${2}"
 
     info "Installing bootloader to ESP"
     reexec_privileged
 
-    # Ensure bootctl is available; install it on Ubuntu if missing (e.g. if run from github action
+    # Ensure bootctl is available; install it on Ubuntu if missing
+    # (e.g. if run from a github action)
     if ! command -v bootctl >/dev/null 2>&1; then
         local os
         os="$(sys_os)"
@@ -969,41 +1897,12 @@ install_bootloader_efi() {
         fi
     fi
 
-    mkdir -p "${mnt_path}"
-    chmod 700 "${mnt_path}" || true
+    esp_mount "${esp_dev}" "${mnt_path}"
 
-    # Sanity checks: device must exist
-    if [ -z "${esp_dev}" ]; then
-        error "install_bootloader_efi: Missing ESP device (arg #1)"
-        exit 1
-    fi
-    if [ ! -b "${esp_dev}" ] && [ ! -c "${esp_dev}" ]; then
-        error "install_bootloader_efi: ESP device does not exist: ${esp_dev}"
-        lsblk -f || true
-        exit 1
-    fi
-
-    # Avoid double-mount: mount only if not already mounted
-    if findmnt -rno TARGET "${mnt_path}" >/dev/null 2>&1; then
-        info "ESP already mounted at ${mnt_path}"
-    else
-        # Prefer explicit vfat mount with safe options
-        if ! mount -t vfat -o codepage=437,iocharset=utf8,shortname=mixed,umask=077 "${esp_dev}" "${mnt_path}"; then
-            info "Mount failed, attempting vfat fsck"
-            command -v fsck.vfat >/dev/null 2>&1 && fsck.vfat -a "${esp_dev}" || true
-            sleep 1
-            if ! mount -t vfat -o codepage=437,iocharset=utf8,shortname=mixed,umask=077 "${esp_dev}" "${mnt_path}"; then
-                error "$(printf "Failed to install bootloader to efi system partition (esp): %s at path: %s\n" "${esp_dev}" "${mnt_path}")"
-                dmesg | tail -n 50 || true
-                exit 1
-            fi
-        fi
-    fi
-
-    # Populate esp partition
     printf "\n"
     printf "Creating esp content at path %s..\n" "${mnt_path}"
     bootctl --esp-path="${mnt_path}" install
+
     # Fix random-seed permissions warnings from bootctl
     chmod 700 "${mnt_path}" || true
     if [ -d "${mnt_path}/loader" ]; then
@@ -1011,85 +1910,163 @@ install_bootloader_efi() {
         find "${mnt_path}/loader" -maxdepth 1 -type f -name ".#bootctlrandom-seed*" -exec chmod 600 {} \; 2>/dev/null || true
     fi
 
-    # Create boot entry
-    local boot_entry_title
-    boot_entry_title="linux-${version}"
-
-    local root_partuuid
-    root_partuuid="$(blkid -o value -s PARTUUID "${rootfs_dev}")"
-    if [ -z "${root_partuuid}" ]; then
-        error "$(printf "install_bootloader_efi: Failed to read PARTUUID of %s\n" "${rootfs_dev}")"
-        exit 1
-    fi
-
-    create_boot_entry "PARTUUID=${root_partuuid}" "${boot_entry_file}" "${boot_entry_title}"
-
     printf "\n"
     ls -al "${mnt_path}"
-    printf "\n"
-    info "$(printf "Boot entry:\n")"
-    cat "${boot_entry_file}"
     printf "\n"
 
     unmount_recursive "${mnt_path}"
     sleep 3
 }
 
-install_kernel() {
-    local kernel
-    kernel="${1}"
-    local esp_dev
-    esp_dev="${2}"
+# Copy one file onto the mounted ESP, skipping destinations already
+# written so slots sharing a kernel do not copy it twice
+esp_install_file() {
+    local src_path
+    src_path="${1}"
+    local src
+    src="${2}"
     local mnt_path
     mnt_path="${3}"
-    local fs_type
-    fs_type="vfat"
+    local dest
+    dest="${4}"
 
-    info "Installing kernel"
+    if [ -z "${src}" ] || [ -z "${dest}" ]; then
+        return 0
+    fi
+
+    if printf "%s" "${esp_installed}" | grep -qxF "${dest}"; then
+        return 0
+    fi
+
+    local src_file
+    if [ -f "${src}" ]; then
+        src_file="${src}"
+    else
+        src_file="${src_path}/${src}"
+    fi
+
+    if [ ! -f "${src_file}" ]; then
+        error "$(printf "esp_install_file: Missing source file: %s\n" "${src_file}")"
+        unmount_recursive "${mnt_path}"
+        exit 1
+    fi
+
+    mkdir -p "$(dirname -- "${mnt_path}/${dest}")"
+
+    info "$(printf "Installing %s to ESP as /%s\n" "${src_file}" "${dest}")"
+    if ! cp "${src_file}" "${mnt_path}/${dest}"; then
+        error "$(printf "esp_install_file: Failed to copy %s to ESP\n" "${src_file}")"
+        unmount_recursive "${mnt_path}"
+        exit 1
+    fi
+
+    esp_installed="$(printf "%s\n%s" "${esp_installed}" "${dest}")"
+}
+
+# Put every slot's kernel and initrd on the ESP under its own name, so
+# one image can boot several systems
+install_kernels() {
+    local esp_dev
+    esp_dev="${1}"
+    local mnt_path
+    mnt_path="${2}"
+    local src_path
+    src_path="${3}"
+
+    info "Installing kernels"
     reexec_privileged
     modprobe vfat || true
-    mkdir -p "${mnt_path}"
-    chmod 700 "${mnt_path}" || true
 
-    info "Installing kernel\n"
+    esp_mount "${esp_dev}" "${mnt_path}"
 
-    if [ -z "${esp_dev}" ]; then
-        error "install_kernel: Missing device for ESP (arg #2)"
-        exit 1
-    fi
-    if [ ! -b "${esp_dev}" ] && [ ! -c "${esp_dev}" ]; then
-        error "install_kernel: Device does not exist: ${esp_dev}"
-        lsblk -f || true
-        exit 1
-    fi
+    local i
+    for i in "${!comp_name[@]}"; do
+        esp_install_file "${src_path}" "${comp_kernel_src[$i]}" \
+                         "${mnt_path}" "${comp_kernel[$i]}"
+        esp_install_file "${src_path}" "${comp_initrd_src[$i]}" \
+                         "${mnt_path}" "${comp_initrd[$i]}"
+    done
 
-    info "Mounting disk image: ${esp_dev} with ${fs_type} at ${mnt_path}"
+    printf "\n"
+    ls -alR "${mnt_path}"
+    printf "\n"
 
-    # Verify filesystem type before mounting
-    if command -v blkid >/dev/null 2>&1; then
-        fs_probe=$(blkid -o value -s TYPE "${esp_dev}" || true)
-        if [ -n "${fs_probe}" ] && [ "vfat" != "${fs_probe}" ] && [ "fat" != "${fs_probe}" ] && [ "msdos" != "${fs_probe}" ]; then
-            error "install_kernel: ESP is not FAT/vfat (detected: ${fs_probe})"
+    unmount_recursive "${mnt_path}"
+    sleep 1
+}
+
+# Write one boot entry per slot plus a loader.conf defaulting to the
+# first of them
+install_boot_entries() {
+    local esp_dev
+    esp_dev="${1}"
+    local mnt_path
+    mnt_path="${2}"
+
+    info "Installing boot entries to ESP"
+    reexec_privileged
+
+    esp_mount "${esp_dev}" "${mnt_path}"
+
+    local default_entry
+    default_entry=""
+
+    local i
+    for i in "${!comp_name[@]}"; do
+        if [ "none" = "${comp_boot_type[$i]}" ]; then
+            continue
         fi
-    fi
 
-    # Avoid double-mount
-    if findmnt -rno TARGET "${mnt_path}" >/dev/null 2>&1; then
-        info "ESP already mounted at ${mnt_path}"
-    else
-        if ! mount -t "${fs_type}" -o codepage=437,iocharset=utf8,shortname=mixed,umask=077 "${esp_dev}" "${mnt_path}"; then
-            info "Mount failed, running fsck.vfat then retry"
-            command -v fsck.vfat >/dev/null 2>&1 && fsck.vfat -a "${esp_dev}" || true
-            sleep 1
-            if ! mount -t "${fs_type}" -o codepage=437,iocharset=utf8,shortname=mixed,umask=077 "${esp_dev}" "${mnt_path}"; then
-                error "$(printf "Failed to mount %s at %s with %s\n" "${esp_dev}" "${mnt_path}" "${fs_type}")"
-                dmesg | tail -n 50 || true
+        local entry_id
+        entry_id="${comp_name[$i]}"
+        local entry_file
+        entry_file="${mnt_path}/loader/entries/${entry_id}.conf"
+
+        # A Linux slot needs to be told its root filesystem; an EFI
+        # loader finds its own
+        local root_spec
+        root_spec=""
+        if [ "linux" = "${comp_boot_type[$i]}" ] && [ 0 != "${comp_part[$i]}" ]; then
+            local part
+            part="$(part_dev "${comp_part[$i]}")"
+            local partuuid
+            partuuid="$(blkid -o value -s PARTUUID "${part}")"
+            if [ -z "${partuuid}" ]; then
+                error "$(printf "install_boot_entries: Failed to read PARTUUID of %s\n" \
+                                "${part}")"
+                unmount_recursive "${mnt_path}"
                 exit 1
             fi
+            root_spec="PARTUUID=${partuuid}"
         fi
-        # Copy kernel once mounted
-        info "Copying kernel to ESP"
-        cp "${kernel}" "${mnt_path}/bzImage"
+
+        create_boot_entry "${entry_file}" \
+                          "${entry_id}" \
+                          "${comp_boot_type[$i]}" \
+                          "${comp_kernel[$i]}" \
+                          "${comp_initrd[$i]}" \
+                          "${root_spec}" \
+                          "${comp_cmdline[$i]}"
+
+        if [ -z "${default_entry}" ]; then
+            default_entry="${entry_id}"
+        fi
+
+        info "$(printf "Boot entry %s:\n" "${entry_id}")"
+        cat "${entry_file}"
+        printf "\n"
+    done
+
+    if [ -z "${default_entry}" ]; then
+        info "No bootable slots: not writing loader.conf"
+    else
+        cat << EOF > "${mnt_path}/loader/loader.conf"
+default ${default_entry}.conf
+timeout 5
+console-mode keep
+editor no
+EOF
+        info "$(printf "Default boot entry: %s\n" "${default_entry}")"
     fi
 
     unmount_recursive "${mnt_path}"
@@ -1812,6 +2789,14 @@ chroot_mounts() {
     local mnt_path
     mnt_path="${1}"
 
+    # Detach the mount point from the propagation tree before rbinding
+    # anything into it. Without this the rootfs mount propagates into every
+    # peer mount namespace - on a systemd host that is most system services -
+    # and umount_recursive only removes our own copy. The others keep the
+    # filesystem mounted and the loop device busy, invisible to findmnt, so
+    # xfs_repair then reads a live filesystem and reports a dirty log with
+    # thousands of phantom inconsistencies
+    mount --make-rprivate "${mnt_path}"
     mount --types proc /proc "${mnt_path}/proc"
     mount --rbind /sys "${mnt_path}/sys"
     mount --make-rslave "${mnt_path}/sys"
@@ -2433,14 +3418,18 @@ gentoo_create_disk() {
     rootfs_dev=$(rootfs)
     local esp_dev
     esp_dev=$(esp)
-    local boot_entry_file
-    boot_entry_file="${4}"
 
     local os
     os="$(sys_os)"
 
     if [ -z "$disk_file" ]; then
         error "$(printf "Missing disk file.\n Please provide a disk file to use.\nAborting..")"
+    fi
+
+    # Reached by targets that partition a disk without describing a
+    # composition; give them the single-rootfs layout they had before
+    if [ 0 = "$(comp_count)" ]; then
+        composition_load "default" "${target_arch}"
     fi
 
     create_disk "${disk_file}" "${reduce_gpt_table}"
@@ -2454,18 +3443,15 @@ gentoo_create_disk() {
         ;;
     esac
 
-    # Create filesystems
+    # Create filesystems: the ESP, then one per slot
     case "$os" in
     ubuntu|fedora)
         info "Creating file systems"
-        if ! sudo mkfs.vfat "${esp_dev}"; then
-            error "$(printf "Error: Failed to create filesystem\n")"
+        if ! mkfs.vfat "${esp_dev}"; then
+            error "$(printf "Error: Failed to create filesystem on %s\n" "${esp_dev}")"
             exit 1
         fi
-        if ! sudo mkfs.xfs -s size=4096 "${rootfs_dev}"; then
-            error "$(printf "Error: Failed to create filesystem\n")"
-            exit 1
-        fi
+        composition_mkfs
         ;;
     freebsd)
         esp_dev="/dev/md99p1"
@@ -2748,18 +3734,33 @@ show_usage() {
     printf "\n"
     printf "  Usage:\n"
     printf "\n"
-    printf "    image-builder build      TARGET\n"
+    printf "    image-builder build      TARGET [ARCH]\n"
     printf "    image-builder chroot     PARTITION_NUMBER\n"
-    printf "    image-builder create     TARGET\n"
+    printf "    image-builder create     TARGET [ARCH]\n"
     printf "    image-builder install\n"
     printf "    image-builder mount      PARTITION_NUMBER\n"
     printf "    image-builder provision  PARTITION_NUMBER\n"
-    printf "    image-builder write      DEVICE\n"
+    printf "    image-builder write      TARGET DEVICE [ARCH]\n"
     printf "\n"
     printf "\n"
-    printf "  TARGET            One of alpine-sway|alpine-containeros|gentoo|freebsd\n"
+    printf "  build TARGET      alpine-containeros | alpine-sway | freebsd |\n"
+    printf "                    gentoo-containeros | gentoo-k3s | gentoo-sway |\n"
+    printf "                    gentoo-sway-pine64 | gentoo-sway-virt |\n"
+    printf "                    gentoo-stage3 | linux-kernel | nanobsd |\n"
+    printf "                    nomadbsd | openwrt | u-root\n"
+    printf "\n"
+    printf "  create TARGET     alma | alpine-containeros | alpine-sway |\n"
+    printf "                    containeros-virt | freebsd |\n"
+    printf "                    gentoo-containeros | gentoo-k3s | gentoo-sway |\n"
+    printf "                    gentoo-sway-pine64 | gentoo-sway-virt | nomadbsd\n"
+    printf "\n"
+    printf "  ARCH              amd64 or arm64\n"
     printf "  DEVICE            A raw block device e.g. /dev/sdX, /dev/mmcblk0\n"
     printf "  PARTITION_NUMBER  A partition number to work on\n"
+    printf "\n"
+    printf "  containeros-virt is a multi-boot image: it composes a Gentoo\n"
+    printf "  containeros rootfs, a NomadBSD rootfs and a u-root initramfs\n"
+    printf "  onto one disk, each with its own boot entry\n"
     printf "\n"
 }
 
@@ -2974,6 +3975,10 @@ main() {
                                "${target_arch}"
             exit 0
             ;;
+        nomadbsd)
+            nomadbsd_build "${target_arch}"
+            exit 0
+            ;;
         openwrt)
 
             if [ -n "${3}" ]; then
@@ -3101,27 +4106,25 @@ main() {
             #                "${ansible_roles}"
             exit 0
             ;;
-        gentoo-containeros|gentoo-sway|gentoo-sway-virt|gentoo-sway-pine64|gentoo-k3s)
-            local rootfs_dev
-            rootfs_dev=$(rootfs)
-
-            local target_flavour
-            target_flavour=${build_target#*gentoo-}
-            target_flavour=${target_flavour%-pine64}
-
+        gentoo-containeros|gentoo-sway|gentoo-sway-virt|gentoo-sway-pine64|gentoo-k3s|containeros-virt|nomadbsd)
             # download_miss/gentoo_fetch_stage3 (called below) expect a
-            # "path" in scope to fetch into - it was never actually set
-            # anywhere in this call chain, so it silently expanded to "",
-            # and cd "" happens to no-op on this runner instead of erroring,
-            # meaning downloads landed in whatever the cwd happened to be
-            # rather than alongside the image we're building
+            # "path" in scope to fetch into
             local path
             path="${img_path}"
+
+            # Describe the image as a set of slots, then build it slot
+            # by slot: one rootfs, kernel and boot entry per system
+            composition_load "${build_target}" "${target_arch}"
+            composition_show
 
             local reduce_gpt_table
             if [ "gentoo-sway-pine64" = "${build_target}" ]; then
                 reduce_gpt_table="1"
             fi
+
+            # Fetch and stage every slot's payload before the disk is
+            # touched, so a failed download leaves no half-built image
+            composition_fetch "${path}" "${target_arch}"
 
             gentoo_create_disk  "${img_path}" \
                                 "${img_file}" \
@@ -3129,79 +4132,57 @@ main() {
                                 "" \
                                 "${reduce_gpt_table}"
 
-            local kernel_file
-            if [ "gentoo-sway-pine64" = "${build_target}" ]; then
-                # Real Allwinner hardware, not the QEMU virt machine -
-                # no virtio, needs the pine64-specific kernel build
-                kernel_file="Image-pine64"
-            else
-                kernel_file="$(kernel_file_for_arch "${target_arch}")"
-            fi
-
-            local kernel_download_file
-            kernel_download_file="${kernel_file}-latest"
-            local kernel_download_csum_file
-            kernel_download_csum_file="${kernel_download_file}.sha384"
-
-            # Named after the actual kernel file being installed, not the
-            # unrelated global "kernel_version" (a stale placeholder left
-            # over from an old single-flavour x86 naming scheme)
-            local boot_entry_file
-            boot_entry_file="${mnt_path}/loader/entries/linux-${kernel_file}.conf"
-
-            info "Fetching kernel"
-            download_miss "${path}" \
-                          "${kernel_repo_url}/${kernel_download_file}" \
-                          "${kernel_repo_url}/${kernel_download_csum_file}" \
-                          "${kernel_download_csum_file}"
-
-            gentoo_fetch_stage3 "${target_arch}"
-            gentoo_fetch_stage4 "$target_flavour" "$target_arch" "latest"
-
-            # Install EFI bootloader
             local esp_dev
             esp_dev=$(esp)
-            install_bootloader_efi "${esp_dev}" \
-                                   "${rootfs_dev}" \
-                                   "${mnt_path}" \
-                                   "${boot_entry_file}" \
-                                   "${kernel_file}"
 
-            install_kernel "${kernel_download_file}" \
-                           "${esp_dev}" \
-                           "${mnt_path}" \
-                           "${kernel_file}"
+            install_bootloader_efi "${esp_dev}" "${mnt_path}"
+            install_kernels "${esp_dev}" "${mnt_path}" "${path}"
+            install_rootfs_slots "${mnt_path}" "${path}"
+            install_boot_entries "${esp_dev}" "${mnt_path}"
 
-            install_rootfs "${rootfs_dev}" "${mnt_path}" "xfs"
-            verify_filesystem "${rootfs_dev}" "install_rootfs"
+            # Binpkgs and provisioning apply to the Gentoo slots only
+            local i
+            for i in "${!comp_name[@]}"; do
+                if [ "gentoo" != "${comp_provider[$i]}" ]; then
+                    continue
+                fi
 
-            gentoo_install_stage4_binpkgs "${target_flavour}" \
-                                          "${target_arch}" \
-                                          "${rootfs_dev}" \
-                                          "${mnt_path}"
-            verify_filesystem "${rootfs_dev}" "stage4 binpkgs"
+                local slot_dev
+                slot_dev="$(part_dev "${comp_part[$i]}")"
 
-            info "$(printf "Gentoo: Provisioning image\n")"
+                gentoo_install_stage4_binpkgs "${comp_provider_arg[$i]}" \
+                                              "${target_arch}" \
+                                              "${slot_dev}" \
+                                              "${mnt_path}"
+                verify_filesystem "${slot_dev}" "stage4 binpkgs"
 
-            # We need to apply changes to both partitions: A/B
-            # But we do not have partition B yet (not implemented for Gentoo)
-            provision "${img_path}/${img_file}" \
-                      "${mnt_path}" \
-                      "${user}" \
-                      3 \
-                      "${net_dev}" \
-                      "${net_address}" \
-                      "${net_gateway}" \
-                      "${ansible_user}" \
-                      "${ansible_roles_path}" \
-                      "${ansible_roles}" \
-                      "${net_mode}"
+                info "$(printf "Gentoo: Provisioning %s\n" "${comp_name[$i]}")"
 
-            verify_filesystem "${rootfs_dev}" "provision"
+                # We need to apply changes to both partitions: A/B
+                # But we do not have partition B yet (not implemented for Gentoo)
+                provision "${img_path}/${img_file}" \
+                          "${mnt_path}" \
+                          "${user}" \
+                          "${comp_part[$i]}" \
+                          "${net_dev}" \
+                          "${net_address}" \
+                          "${net_gateway}" \
+                          "${ansible_user}" \
+                          "${ansible_roles_path}" \
+                          "${ansible_roles}" \
+                          "${net_mode}"
+
+                verify_filesystem "${slot_dev}" "provision"
+            done
+
             verify_filesystem "${esp_dev}" "provision"
 
             # Tear down loop devices after installation steps
             loop_unmount ""
+
+            printf "\n"
+            info "$(printf "%s\n\n" "You can continue with")"
+            info "$(printf " # image-builder write %s [DEVICE]\n" "${build_target}")"
 
             exit 0
             ;;
@@ -3212,7 +4193,10 @@ main() {
         *)
             printf "\n"
             printf "You need to specify a valid target system OS\n"
-            printf "  One of: alpine, gentoo, freebsd\n"
+            printf "  One of: alma, alpine-containeros, alpine-sway,\n"
+            printf "          containeros-virt, freebsd, gentoo-containeros,\n"
+            printf "          gentoo-k3s, gentoo-sway, gentoo-sway-pine64,\n"
+            printf "          gentoo-sway-virt, nomadbsd\n"
             show_usage
             exit 1
         esac
@@ -3313,7 +4297,12 @@ main() {
             img_file="${img}-arm64.raw"
             ;;
         *)
-            error "Please specify the image to write: One of 'alma, iss, gentoo-sway-pine64'\n"
+            # Every composed target is written as "<target>-<arch>.raw",
+            # the same name 'create' gave it
+            local write_arch
+            write_arch="${4:-${TARGET_ARCH:-$(sys_arch)}}"
+            img_file="${img}-${write_arch}.raw"
+            ;;
         esac
 
         if ! [ -f "${img_path}/${img_file}" ]; then
