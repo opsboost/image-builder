@@ -2059,11 +2059,11 @@ gentoo_install_stage4_binpkgs() {
     cp /etc/resolv.conf "${mnt_path}/etc/resolv.conf"
     verify_stage_fs "${rootfs_dev}" "${mnt_path}" "stage4: portage config"
 
+    chroot_mounts "${mnt_path}"
+
     info "$(printf "Gentoo: Syncing Portage tree\n")"
     chroot "${mnt_path}" emerge-webrsync
-    verify_stage_fs "${rootfs_dev}" "${mnt_path}" "stage4: emerge-webrsync"
-
-    chroot_mounts "${mnt_path}"
+    verify_stage_fs "${rootfs_dev}" "${mnt_path}" "stage4: emerge-webrsync" 1
 
     # Mirror gentoo-build/emerge.sh's set list per flavour - keep in
     # sync with that script if the sets it installs ever change
