@@ -2462,7 +2462,7 @@ gentoo_create_disk() {
             error "$(printf "Error: Failed to create filesystem\n")"
             exit 1
         fi
-        if ! sudo mkfs.xfs -m crc=1,finobt=0,rmapbt=0,reflink=0,inobtcount=0 -i sparse=0 "${rootfs_dev}"; then
+        if ! sudo mkfs.xfs -s size=4096 "${rootfs_dev}"; then
             error "$(printf "Error: Failed to create filesystem\n")"
             exit 1
         fi
@@ -2475,7 +2475,7 @@ gentoo_create_disk() {
             loop_unmount_freebsd 99
             exit 1
         fi
-        if ! mkfs.xfs -m crc=1,finobt=0,rmapbt=0,reflink=0,inobtcount=0 -i sparse=0 "${rootfs_dev}"; then
+        if ! mkfs.xfs -s size=4096 "${rootfs_dev}"; then
             error "$(printf "Error: Failed to create filesystem\n")"
             exit 1
         fi
