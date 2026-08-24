@@ -90,12 +90,14 @@ freebsd_ci_root_password="freebsd-ci"
 freebsd_use_release_script="${FREEBSD_USE_RELEASE_SCRIPT:-true}"
 
 # NomadBSD
-# Upstream publishes amd64, i386 and mac images only, and its own build
-# system's ARCH takes those same three values - there is no arm64 image
-# to fetch or build. Point NOMADBSD_IMAGE at a locally built image to
-# compose an architecture upstream does not ship
-nomadbsd_version="141R-20240711"
-nomadbsd_repo_url="https://nomadbsd.org/download"
+# Upstream publishes amd64, i386 and mac only - there is no arm64 build,
+# and its own build system's ARCH takes those same three values. Slots
+# needing an architecture upstream does not ship are refused rather than
+# fetched, so a build fails up front instead of part way through.
+# NOMADBSD_REPO_URL selects a mirror; NOMADBSD_IMAGE overrides the whole
+# lookup with a locally supplied image
+nomadbsd_version="${NOMADBSD_VERSION:-141R-20240711}"
+nomadbsd_repo_url="${NOMADBSD_REPO_URL:-https://nomadbsd.org/download}"
 nomadbsd_source_url="https://github.com/NomadBSD/NomadBSD"
 nomadbsd_filesystem="${NOMADBSD_FILESYSTEM:-ufs}"
 nomadbsd_loader_file="nomadbsd-loader.efi"
@@ -103,6 +105,13 @@ nomadbsd_loader_file="nomadbsd-loader.efi"
 # Kernel command lines shared by the Linux slots of a composition
 linux_cmdline_console="console=tty0 console=ttyS0,115200n8"
 linux_cmdline_default="rw init=/lib/systemd/systemd enforcing=1 ${linux_cmdline_console}"
+
+# u-root
+# Prebuilt initramfs artifacts, as with the kernel. The release
+# publishes one per architecture and no checksum files to verify them
+# against, so these are fetched unverified
+u_root_repo_url="https://github.com/bbusse/u-root-build/releases/download/latest"
+u_root_release_url="https://github.com/bbusse/u-root-build/releases/tag/latest"
 
 # gokrazy-dhcp
 gokrazy_dhcp_repo_url="https://github.com/bbusse/gokrazy-dhcp"
@@ -854,6 +863,94 @@ image_partition_range() {
     return 1
 }
 
+# Read a little endian unsigned integer of WIDTH bytes from a file at a
+# byte offset. od's native word order matches the on-disk format on the
+# platforms this runs on
+read_uint_le() {
+    local file
+    file="${1}"
+    local offset
+    offset="${2}"
+    local width
+    width="${3}"
+
+    od -An "-tu${width}" -j "${offset}" "-N${width}" "${file}" | tr -d ' \n'
+}
+
+# A FreeBSD MBR slice normally holds a BSD disklabel rather than a bare
+# filesystem, so its UFS partition sits some way into the slice rather
+# than at its start. Print "START_SECTOR SIZE_SECTORS", in absolute
+# sectors, for the label's first UFS partition
+bsd_label_ufs_range() {
+    local img
+    img="${1}"
+    local slice_start
+    slice_start="${2}"
+
+    # The label lives in the slice's second sector
+    local label
+    label=$(( (slice_start + 1) * 512 ))
+
+    # 2186691927 is 0x82564557, the disklabel magic
+    if [ "2186691927" != "$(read_uint_le "${img}" "${label}" 4)" ]; then
+        return 1
+    fi
+
+    local npartitions
+    npartitions="$(read_uint_le "${img}" "$((label + 138))" 2)"
+    if [ -z "${npartitions}" ] || [ "${npartitions}" -le 0 ]; then
+        return 1
+    fi
+
+    local i
+    for i in $(seq 0 "$((npartitions - 1))"); do
+        local entry
+        entry=$((label + 148 + i * 16))
+
+        local size
+        size="$(read_uint_le "${img}" "${entry}" 4)"
+        local offset
+        offset="$(read_uint_le "${img}" "$((entry + 4))" 4)"
+
+        # p_fstype is the low byte of the word at +12, and 7 is
+        # FS_BSDFFS - a UFS filesystem
+        local fstype
+        fstype="$(read_uint_le "${img}" "$((entry + 12))" 4)"
+        fstype=$((fstype & 255))
+
+        if [ 7 = "${fstype}" ] && [ "${size}" -gt 0 ]; then
+            printf "%s %s" "$((slice_start + offset))" "${size}"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# The UFS filesystem to copy out of a disk image. Descends into a BSD
+# disklabel when the slice carries one, and falls back to the slice
+# itself when it holds a filesystem directly
+image_ufs_range() {
+    local img
+    img="${1}"
+
+    local range
+    range="$(image_partition_range "${img}" "ufs")" || return 1
+
+    local slice_start
+    slice_start="${range%% *}"
+
+    local nested
+    if nested="$(bsd_label_ufs_range "${img}" "${slice_start}")"; then
+        info "$(printf "Found a BSD disklabel in the slice at sector %s: using its UFS partition\n" \
+                       "${slice_start}")"
+        printf "%s" "${nested}"
+        return 0
+    fi
+
+    printf "%s" "${range}"
+}
+
 # parted's fs-type hint for a filesystem name
 parted_fs_hint() {
     case "${1}" in
@@ -1099,6 +1196,10 @@ composition_load() {
                         "linux"
         ;;
     containeros-virt)
+        # One of its slots is NomadBSD, so the whole target is limited to
+        # the architectures NomadBSD is published for
+        nomadbsd_require_arch "${target_arch}" "containeros-virt"
+
         kernel_file="$(kernel_file_for_arch "${target_arch}")"
         kernel_src="${kernel_file}-latest"
 
@@ -1133,18 +1234,20 @@ composition_load() {
         # u-root runs from its initramfs alone, so it gets no partition
         # and boots the kernel the Gentoo slot already put on the ESP
         composition_add "u-root" \
-                        "none" \
-                        "" \
+                        "u-root" \
+                        "${target_arch}" \
                         "none" \
                         "0" \
                         "${kernel_src}" \
                         "${kernel_file}" \
-                        "output/initramfs-${target_arch}.cpio" \
+                        "initramfs-${target_arch}.cpio" \
                         "initramfs-${target_arch}.cpio" \
                         "${linux_cmdline_console}" \
                         "linux"
         ;;
     nomadbsd)
+        nomadbsd_require_arch "${target_arch}" "nomadbsd"
+
         comp_esp_size=64
 
         composition_add "nomadbsd" \
@@ -1208,10 +1311,13 @@ composition_fetch() {
             nomadbsd_fetch "${download_path}" "${comp_provider_arg[$i]}"
             nomadbsd_stage_loader "${download_path}" "${comp_provider_arg[$i]}"
             ;;
+        u-root)
+            u_root_fetch "${download_path}" "${comp_provider_arg[$i]}"
+            ;;
         esac
 
-        # An initramfs is built by a separate 'build' run rather than
-        # fetched, so fail early with the command that produces it
+        # Catch a slot whose initramfs neither its provider fetched nor
+        # a local build produced, before the disk is touched
         local initrd_src
         initrd_src="${comp_initrd_src[$i]}"
         if [ -n "${initrd_src}" ] && \
@@ -1291,8 +1397,8 @@ install_rootfs_slots() {
                                     "${src_path}" \
                                     "${comp_provider_arg[$i]}"
             ;;
-        none)
-            info "$(printf "Slot %s has no rootfs provider, leaving %s empty\n" \
+        none|u-root)
+            info "$(printf "Slot %s installs no rootfs, leaving %s empty\n" \
                            "${comp_name[$i]}" "${dev}")"
             ;;
         *)
@@ -1306,6 +1412,7 @@ install_rootfs_slots() {
     done
 }
 
+# Map a target arch onto the token NomadBSD image names use
 nomadbsd_arch() {
     local target_arch
     target_arch="${1}"
@@ -1316,6 +1423,30 @@ nomadbsd_arch() {
     mac)          echo "mac" ;;
     *)            echo "" ;;
     esac
+}
+
+# Refuse a NomadBSD slot on an architecture upstream does not build,
+# at composition time rather than part way through a build. An
+# explicitly supplied image is the caller's business, so it passes
+nomadbsd_require_arch() {
+    local target_arch
+    target_arch="${1}"
+    local context
+    context="${2}"
+
+    if [ -n "${NOMADBSD_IMAGE}" ]; then
+        return 0
+    fi
+
+    if [ -n "$(nomadbsd_arch "${target_arch}")" ]; then
+        return 0
+    fi
+
+    error "$(printf "%s: NomadBSD publishes no %s image\n" "${context}" "${target_arch}")"
+    error "Upstream builds amd64, i386 and mac only; there is no arm64 image"
+    error "$(printf "Compose %s for one of those, or set NOMADBSD_IMAGE to a\n" "${context}")"
+    error "locally supplied image to override this"
+    exit 1
 }
 
 nomadbsd_image_file() {
@@ -1365,12 +1496,7 @@ nomadbsd_fetch() {
     nomad_arch="$(nomadbsd_arch "${target_arch}")"
 
     if [ -z "${nomad_arch}" ]; then
-        error "$(printf "NomadBSD: There is no %s image\n" "${target_arch}")"
-        error "Upstream publishes amd64, i386 and mac only, and its own"
-        error "build system's ARCH takes those same three values"
-        error "$(printf "Build an image for %s yourself, then point NOMADBSD_IMAGE at it\n" \
-                        "${target_arch}")"
-        exit 1
+        nomadbsd_require_arch "${target_arch}" "NomadBSD"
     fi
 
     local img_file
@@ -1383,10 +1509,21 @@ nomadbsd_fetch() {
         return 0
     fi
 
+    # download exits on failure, so run it in a subshell to say which
+    # architecture is missing rather than just that a fetch failed.
+    # nomadbsd.org carries amd64, i386 and mac; anything else needs
+    # NOMADBSD_REPO_URL or NOMADBSD_IMAGE
     if [ ! -f "${download_path}/${compressed_file}" ]; then
-        download "${nomadbsd_repo_url}/${compressed_file}" \
-                 "${download_path}" \
-                 "${DOWNLOAD_RETRIES}"
+        if ! ( download "${nomadbsd_repo_url}/${compressed_file}" \
+                        "${download_path}" \
+                        "${DOWNLOAD_RETRIES}" ); then
+            error "$(printf "NomadBSD: No %s image at %s\n" \
+                            "${nomad_arch}" "${nomadbsd_repo_url}")"
+            error "$(printf "Looked for %s\n" "${compressed_file}")"
+            error "Set NOMADBSD_REPO_URL to a mirror carrying it, or"
+            error "NOMADBSD_IMAGE to an already built image"
+            exit 1
+        fi
     fi
 
     download "${nomadbsd_repo_url}/${compressed_file}.sha256" \
@@ -1524,9 +1661,9 @@ nomadbsd_install_rootfs() {
     fi
 
     local range
-    range="$(image_partition_range "${src_img}" "ufs")"
+    range="$(image_ufs_range "${src_img}")"
     if [ -z "${range}" ]; then
-        error "$(printf "NomadBSD: Found no UFS partition in %s\n" "${src_img}")"
+        error "$(printf "NomadBSD: Found no UFS filesystem in %s\n" "${src_img}")"
         sfdisk -d "${src_img}" || true
         exit 1
     fi
@@ -1770,13 +1907,6 @@ loop_mount_linux() {
             dmesg
             exit 1
         fi
-    fi
-
-    local loop_dev
-    loop_dev="$(losetup -j "${disk_file}" -O NAME --noheadings 2>/dev/null | head -1)"
-    if [ -n "${loop_dev}" ]; then
-        info "$(printf "loop_mount: %s DIO=%s\n" "${loop_dev}" \
-            "$(losetup -l -O DIO --noheadings "${loop_dev}" 2>/dev/null | tr -d ' ')")"
     fi
 }
 
@@ -2684,6 +2814,38 @@ build_gentoo_stage4() {
                         -f Containerfile
 }
 
+# Fetch a prebuilt u-root initramfs rather than building one. The
+# release carries no checksums, so there is nothing to verify against
+u_root_fetch() {
+    local download_path
+    download_path="${1}"
+    local target_arch
+    target_arch="${2}"
+
+    local initramfs_file
+    initramfs_file="initramfs-${target_arch}.cpio"
+
+    if [ -f "${download_path}/${initramfs_file}" ]; then
+        info "$(printf "u-root: Initramfs exists, not fetching again: %s\n" \
+                       "${initramfs_file}")"
+        return 0
+    fi
+
+    info "$(printf "u-root: Fetching %s\n" "${initramfs_file}")"
+
+    # download exits on failure, so run it in a subshell to report which
+    # architecture is missing rather than just that a fetch failed
+    if ! ( download "${u_root_repo_url}/${initramfs_file}" \
+                    "${download_path}" \
+                    "${DOWNLOAD_RETRIES}" ); then
+        error "$(printf "u-root: No initramfs published for %s\n" "${target_arch}")"
+        error "$(printf "See %s\n" "${u_root_release_url}")"
+        error "$(printf "Or build one locally:\n\n  # image-builder build u-root %s\n" \
+                        "${target_arch}")"
+        exit 1
+    fi
+}
+
 build_u_root() {
     local target_arch
     target_arch="$1"
@@ -2859,6 +3021,62 @@ replay_log_xfs() {
     info "$(printf "replay_log_xfs: log replayed on %s\n" "${dev}")"
 }
 
+# Resolved argv of the last fs_check_cmd call
+fs_check_argv=()
+
+# Resolve the read only check command for a filesystem type into
+# fs_check_argv. Most types need no entry here: util-linux installs an
+# fsck.TYPE helper and the generic branch uses it. Entries exist only
+# where that helper is not a real checker - fsck.xfs and fsck.btrfs are
+# deliberate no-op stubs - where a check has to be forced, or where the
+# tool goes by another name
+fs_check_cmd() {
+    local fs_type
+    fs_type="${1}"
+    local dev
+    dev="${2}"
+
+    fs_check_argv=()
+
+    case "${fs_type}" in
+    "")
+        return 1
+        ;;
+    xfs)
+        fs_check_argv=(xfs_repair -n "${dev}")
+        ;;
+    btrfs)
+        fs_check_argv=(btrfs check --readonly "${dev}")
+        ;;
+    ext2|ext3|ext4)
+        # -f checks even a filesystem already marked clean
+        fs_check_argv=(e2fsck -f -n "${dev}")
+        ;;
+    ufs|ufs2)
+        # The BSDs call it fsck_ffs and util-linux ships no fsck.ufs
+        fs_check_argv=(fsck_ffs -n "${dev}")
+        ;;
+    *)
+        fs_check_argv=("fsck.${fs_type}" -n "${dev}")
+        ;;
+    esac
+}
+
+# Work a filesystem needs before a read only check will succeed
+fs_prepare() {
+    local fs_type
+    fs_type="${1}"
+    local dev
+    dev="${2}"
+
+    case "${fs_type}" in
+    xfs)
+        # xfs_repair refuses a dirty log, so mount once to replay it
+        replay_log_xfs "${dev}"
+        ;;
+    esac
+}
+
 verify_filesystem() {
     local dev
     dev="${1}"
@@ -2900,39 +3118,26 @@ verify_filesystem() {
     local fs_type
     fs_type="$(blkid -o value -s TYPE "${dev}" 2>/dev/null)"
 
-    if [ "xfs" == "${fs_type}" ]; then
-        replay_log_xfs "${dev}"
-    fi
+    fs_prepare "${fs_type}" "${dev}"
 
     if [ "0" == "${verify}" ]; then
         return 0
     fi
 
-    local check_cmd
-    case "${fs_type}" in
-    xfs)
-        check_cmd=(xfs_repair -n "${dev}")
-        ;;
-    ext2|ext3|ext4)
-        check_cmd=(e2fsck -f -n "${dev}")
-        ;;
-    vfat|fat|msdos)
-        check_cmd=(fsck.vfat -n "${dev}")
-        ;;
-    *)
-        info "$(printf "verify_filesystem: No checker for '%s' on %s, skipping\n" "${fs_type}" "${dev}")"
+    if ! fs_check_cmd "${fs_type}" "${dev}"; then
+        info "$(printf "verify_filesystem: No filesystem detected on %s, skipping\n" "${dev}")"
         return 0
-        ;;
-    esac
+    fi
 
-    if ! command -v "${check_cmd[0]}" >/dev/null 2>&1; then
-        info "$(printf "verify_filesystem: %s not installed, skipping check of %s\n" "${check_cmd[0]}" "${dev}")"
+    if ! command -v "${fs_check_argv[0]}" >/dev/null 2>&1; then
+        info "$(printf "verify_filesystem: %s not installed, skipping check of %s (%s)\n" \
+                       "${fs_check_argv[0]}" "${dev}" "${fs_type}")"
         return 0
     fi
 
     info "$(printf "Verifying %s (%s)%s\n" "${dev}" "${fs_type}" "${context:+ after: ${context}}")"
 
-    if ! "${check_cmd[@]}"; then
+    if ! "${fs_check_argv[@]}"; then
         error "$(printf "Filesystem check failed on %s (%s)%s\n" \
                         "${dev}" "${fs_type}" "${context:+ after: ${context}}")"
         info "$(printf "loop devices:\n")"
@@ -3042,7 +3247,6 @@ gentoo_install_stage4_binpkgs() {
 
     # DNS resolution inside the chroot (emerge-webrsync needs network)
     cp /etc/resolv.conf "${mnt_path}/etc/resolv.conf"
-    verify_stage_fs "${rootfs_dev}" "${mnt_path}" "stage4: portage config"
 
     chroot_mounts "${mnt_path}"
 
@@ -3108,9 +3312,23 @@ install_fonts() {
     local user
     user="${2}"
 
+    local urls
+    urls="${FONT_URLS:-}"
+
+    [ -n "${urls}" ] || return 0
+
     mkdir -p "${path}"
-    download "https://wiki.c-base.org/dokuwiki/_media/ceva-c2.ttf" \
-              "${path}"
+
+    local url
+    # shellcheck disable=SC2086 # $urls is an intentional word-split URL list
+    for url in ${urls}; do
+        # download() aborts the build on failure, which a decorative font
+        # fetched from a third-party host does not warrant; the subshell
+        # contains that exit so the image still gets built without it
+        if ! ( download "${url}" "${path}" ); then
+            info "$(printf "Optional font not fetched from %s, continuing without it\n" "${url}")"
+        fi
+    done
 }
 
 # Create a temporary playbook to
