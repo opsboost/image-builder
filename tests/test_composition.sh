@@ -41,7 +41,7 @@ test_gentoo_composition_has_a_single_rootfs() {
     assert_equals "3" "${comp_part[0]}" "its rootfs is p3"
     assert_equals "rest" "${comp_size[0]}" "its rootfs fills the disk"
     assert_equals "xfs" "${comp_fs[0]}" "its rootfs is xfs"
-    assert_equals "Image-arm64-vm" "${comp_kernel[0]}" "arm64 uses an Image, not a bzImage"
+    assert_equals "Image-virt-arm64" "${comp_kernel[0]}" "arm64 uses an Image, not a bzImage"
 }
 
 test_pine64_keeps_its_own_kernel() {
@@ -99,11 +99,11 @@ test_linux_boot_entry_names_its_root_and_kernel() {
     local f
     f="$(mktemp)"
 
-    create_boot_entry "${f}" "gentoo" "linux" "Image-arm64-vm" "" \
+    create_boot_entry "${f}" "gentoo" "linux" "Image-virt-arm64" "" \
                       "PARTUUID=abc" "rw quiet"
 
     assert_equals "title         gentoo" "$(sed -n 1p "${f}")"
-    assert_equals "linux         /Image-arm64-vm" "$(sed -n 2p "${f}")"
+    assert_equals "linux         /Image-virt-arm64" "$(sed -n 2p "${f}")"
     assert_equals "options       root=PARTUUID=abc rw quiet" "$(sed -n 3p "${f}")"
 
     rm -f "${f}"
@@ -204,17 +204,65 @@ test_missing_ufs_partition_is_reported_rather_than_guessed() {
     unset -f sfdisk
 }
 
-test_nomadbsd_maps_only_the_architectures_upstream_publishes() {
+test_nomadbsd_maps_only_the_arches_upstream_builds() {
     assert_equals "amd64" "$(nomadbsd_arch amd64)"
     assert_equals "amd64" "$(nomadbsd_arch x86_64)"
     assert_equals "i386" "$(nomadbsd_arch i386)"
     assert_equals "mac" "$(nomadbsd_arch mac)"
     assert_equals "" "$(nomadbsd_arch arm64)" "upstream publishes no arm64 image"
+    assert_equals "" "$(nomadbsd_arch riscv64)"
 }
 
-test_nomadbsd_refuses_an_architecture_it_can_not_fetch() {
+test_nomadbsd_image_name_follows_the_arch() {
+    assert_equals "nomadbsd-${nomadbsd_version}.amd64.ufs.img" \
+                  "$(nomadbsd_image_file amd64)"
+    assert_equals "nomadbsd-${nomadbsd_version}.i386.ufs.img" \
+                  "$(nomadbsd_image_file i386)"
+}
+
+test_nomadbsd_image_path_prefers_an_explicit_image() {
+    assert_equals "/tmp/built.img" \
+                  "$(NOMADBSD_IMAGE=/tmp/built.img nomadbsd_image_path /dl amd64)" \
+                  "NOMADBSD_IMAGE overrides the fetched name"
+    assert_equals "/dl/nomadbsd-${nomadbsd_version}.amd64.ufs.img" \
+                  "$(NOMADBSD_IMAGE='' nomadbsd_image_path /dl amd64)"
+}
+
+test_nomadbsd_arch_gate_passes_arches_upstream_builds() {
+    assert "NOMADBSD_IMAGE='' nomadbsd_require_arch amd64 ctx"
+    assert "NOMADBSD_IMAGE='' nomadbsd_require_arch i386 ctx"
+}
+
+test_nomadbsd_arch_gate_refuses_arm64() {
+    assert_fails "NOMADBSD_IMAGE='' nomadbsd_require_arch arm64 ctx" \
+                 "there is no arm64 NomadBSD image to compose"
     assert_fails "NOMADBSD_IMAGE='' nomadbsd_fetch /tmp arm64" \
-                 "fetching arm64 fails rather than requesting a 404"
+                 "and fetching one is refused before any download"
+}
+
+test_nomadbsd_arch_gate_yields_to_an_explicit_image() {
+    assert "NOMADBSD_IMAGE=/tmp/mine.img nomadbsd_require_arch arm64 ctx" \
+           "a supplied image is the caller's business"
+}
+
+test_nomadbsd_can_not_be_built_for_arm64() {
+    # Stub the host check, so this exercises the architecture check
+    # rather than passing because the test host is not FreeBSD
+    sys_os() { echo "freebsd"; }
+
+    assert_fails "nomadbsd_build arm64" \
+                 "upstream's build system takes amd64, i386 or mac"
+
+    unset -f sys_os
+}
+
+test_nomadbsd_build_needs_a_freebsd_host() {
+    sys_os() { echo "fedora"; }
+
+    assert_fails "nomadbsd_build amd64" \
+                 "NomadBSD's build system only runs on FreeBSD"
+
+    unset -f sys_os
 }
 
 test_checksum_verify_reads_the_bsd_format() {
@@ -267,8 +315,7 @@ test_a_shared_kernel_is_copied_to_the_esp_once() {
     mkdir -p "${d}/esp" "${d}/src"
     echo kernel > "${d}/src/bzImage-virt-amd64-latest"
     echo loader > "${d}/src/nomadbsd-loader.efi"
-    mkdir -p "${d}/src/output"
-    echo initrd > "${d}/src/output/initramfs-amd64.cpio"
+    echo initrd > "${d}/src/initramfs-amd64.cpio"
 
     composition_load "containeros-virt" "amd64"
 
@@ -289,11 +336,381 @@ test_a_shared_kernel_is_copied_to_the_esp_once() {
     rm -rf "${d}"
 }
 
-test_combined_image_is_arch_parameterized() {
-    composition_load "containeros-virt" "arm64"
+test_combined_image_is_refused_where_its_bsd_slot_has_no_image() {
+    assert_fails "NOMADBSD_IMAGE='' composition_load containeros-virt arm64" \
+                 "the whole target is limited by its NomadBSD slot"
+}
 
-    assert_equals "3" "$(comp_count)" "the same three slots on arm64"
-    assert_equals "Image-arm64-vm" "${comp_kernel[0]}" "with the arm64 kernel"
-    assert_equals "initramfs-arm64.cpio" "${comp_initrd[2]}" "and the arm64 initramfs"
-    assert_equals "arm64" "${comp_provider_arg[1]}" "the BSD slot is told the arch"
+test_combined_image_composes_where_every_slot_exists() {
+    NOMADBSD_IMAGE='' composition_load "containeros-virt" "amd64"
+
+    assert_equals "3" "$(comp_count)" "all three slots on amd64"
+    assert_equals "bzImage-virt-amd64" "${comp_kernel[0]}" "with the amd64 kernel"
+    assert_equals "initramfs-amd64.cpio" "${comp_initrd[2]}" "and the amd64 initramfs"
+    assert_equals "amd64" "${comp_provider_arg[1]}" "the BSD slot is told the arch"
+}
+
+test_u_root_slot_fetches_its_own_initramfs() {
+    composition_load "containeros-virt" "amd64"
+
+    assert_equals "u-root" "${comp_provider[2]}" "the slot has a provider that fetches"
+    assert_equals "amd64" "${comp_provider_arg[2]}" "which is told the arch to fetch for"
+    assert_equals "initramfs-amd64.cpio" "${comp_initrd_src[2]}" \
+                  "the initramfs is fetched into the download path"
+    assert_equals "none" "${comp_fs[2]}" "and it still needs no partition"
+}
+
+# Build a disk image carrying a BSD disklabel in a slice, the layout
+# FreeBSD-derived images such as NomadBSD's actually use
+make_labelled_image() {
+    local img
+    img="${1}"
+    local slice_start
+    slice_start="${2}"
+    shift 2
+
+    dd if=/dev/zero of="${img}" bs=1024 count=64 2>/dev/null
+
+    local label
+    label=$(( (slice_start + 1) * 512 ))
+
+    # 0x82564557, little endian
+    printf '\x57\x45\x56\x82' | \
+        dd of="${img}" bs=1 seek="${label}" conv=notrunc 2>/dev/null
+
+    # d_npartitions at +138
+    printf '\x08\x00' | \
+        dd of="${img}" bs=1 seek="$((label + 138))" conv=notrunc 2>/dev/null
+
+    # Each remaining argument is one "size_le4:offset_le4:fstype" entry
+    local i
+    i=0
+    local spec
+    for spec in "$@"; do
+        local entry
+        entry=$((label + 148 + i * 16))
+
+        printf "$(echo "${spec}" | cut -d: -f1)" | \
+            dd of="${img}" bs=1 seek="${entry}" conv=notrunc 2>/dev/null
+        printf "$(echo "${spec}" | cut -d: -f2)" | \
+            dd of="${img}" bs=1 seek="$((entry + 4))" conv=notrunc 2>/dev/null
+        printf "$(echo "${spec}" | cut -d: -f3)" | \
+            dd of="${img}" bs=1 seek="$((entry + 12))" conv=notrunc 2>/dev/null
+
+        i=$((i + 1))
+    done
+}
+
+test_read_uint_le_reads_widths() {
+    local img
+    img="$(mktemp)"
+    printf '\x57\x45\x56\x82' > "${img}"
+
+    assert_equals "2186691927" "$(read_uint_le "${img}" 0 4)" "the disklabel magic"
+    assert_equals "17751" "$(read_uint_le "${img}" 0 2)" "its low half"
+
+    rm -f "${img}"
+}
+
+test_disklabel_ufs_partition_is_found_inside_a_slice() {
+    local img
+    img="$(mktemp)"
+
+    # partition a: size 8280064 sectors, offset 2048, fstype 7 (UFS)
+    make_labelled_image "${img}" 64 '\x00\x58\x7e\x00:\x00\x08\x00\x00:\x07\x00\x00\x00'
+
+    # The offset is slice relative, so the result is 64 + 2048
+    assert_equals "2112 8280064" "$(bsd_label_ufs_range "${img}" 64)" \
+                  "the UFS partition sits inside the slice, not at its start"
+
+    rm -f "${img}"
+}
+
+test_disklabel_skips_non_ufs_partitions() {
+    local img
+    img="$(mktemp)"
+
+    # entry 0 is swap (fstype 1), entry 1 is the UFS partition
+    make_labelled_image "${img}" 64 \
+        '\x00\x08\x00\x00:\x00\x08\x00\x00:\x01\x00\x00\x00' \
+        '\x00\x58\x7e\x00:\x00\x10\x00\x00:\x07\x00\x00\x00'
+
+    assert_equals "4160 8280064" "$(bsd_label_ufs_range "${img}" 64)" \
+                  "a swap partition ahead of the filesystem is skipped"
+
+    rm -f "${img}"
+}
+
+test_a_slice_without_a_disklabel_is_reported_as_such() {
+    local img
+    img="$(mktemp)"
+    dd if=/dev/zero of="${img}" bs=1024 count=64 2>/dev/null
+
+    assert_fails "bsd_label_ufs_range ${img} 64" \
+                 "no magic means no label to descend into"
+
+    rm -f "${img}"
+}
+
+test_ufs_range_descends_into_a_disklabel() {
+    local img
+    img="$(mktemp)"
+    make_labelled_image "${img}" 64 '\x00\x58\x7e\x00:\x00\x08\x00\x00:\x07\x00\x00\x00'
+
+    # A FreeBSD MBR slice, as sfdisk reports one
+    sfdisk() { printf 'img1 : start=  64, size= 8282112, type=a5\n'; }
+
+    assert_equals "2112 8280064" "$(image_ufs_range "${img}")" \
+                  "the nested filesystem wins over the slice it sits in"
+
+    unset -f sfdisk
+    rm -f "${img}"
+}
+
+test_ufs_range_falls_back_to_a_bare_slice() {
+    local img
+    img="$(mktemp)"
+    dd if=/dev/zero of="${img}" bs=1024 count=64 2>/dev/null
+
+    # A GPT freebsd-ufs partition holds a filesystem directly
+    sfdisk() {
+        printf 'img1 : start=2048, size=9203712, type=516E7CB6-6ECF-11D6-8FF8-00022D09712B\n'
+    }
+
+    assert_equals "2048 9203712" "$(image_ufs_range "${img}")" \
+                  "a partition holding a filesystem directly is used as is"
+
+    unset -f sfdisk
+    rm -f "${img}"
+}
+
+test_fs_check_uses_the_generic_fsck_helper() {
+    fs_check_cmd vfat /dev/loop0p2
+    assert_equals "fsck.vfat -n /dev/loop0p2" "${fs_check_argv[*]}" \
+                  "a filesystem with a working fsck helper needs no special case"
+
+    fs_check_cmd f2fs /dev/loop0p9
+    assert_equals "fsck.f2fs -n /dev/loop0p9" "${fs_check_argv[*]}" \
+                  "including one the script has never heard of"
+}
+
+test_fs_check_overrides_helpers_that_do_not_check() {
+    # fsck.xfs and fsck.btrfs are no-op stubs, so the generic branch
+    # would silently verify nothing
+    fs_check_cmd xfs /dev/loop0p3
+    assert_equals "xfs_repair -n /dev/loop0p3" "${fs_check_argv[*]}"
+
+    fs_check_cmd btrfs /dev/loop0p3
+    assert_equals "btrfs check --readonly /dev/loop0p3" "${fs_check_argv[*]}"
+}
+
+test_fs_check_forces_a_check_on_ext() {
+    fs_check_cmd ext4 /dev/loop0p3
+    assert_equals "e2fsck -f -n /dev/loop0p3" "${fs_check_argv[*]}" \
+                  "-f checks a filesystem already marked clean"
+}
+
+test_fs_check_knows_the_bsd_name_for_ufs() {
+    fs_check_cmd ufs /dev/loop0p4
+    assert_equals "fsck_ffs -n /dev/loop0p4" "${fs_check_argv[*]}" \
+                  "util-linux ships no fsck.ufs"
+}
+
+test_fs_check_reports_an_undetected_filesystem() {
+    assert_fails "fs_check_cmd '' /dev/loop0p3" \
+                 "an empty type is not turned into an fsck. command"
+}
+
+test_fs_check_commands_are_read_only() {
+    local fs
+    for fs in xfs btrfs ext4 ufs vfat f2fs; do
+        fs_check_cmd "${fs}" /dev/loop0p3
+        assert_matches "(-n|--readonly)" "${fs_check_argv[*]}" \
+                       "the ${fs} check must not modify the filesystem"
+    done
+}
+
+test_fs_prepare_replays_only_a_dirty_log_filesystem() {
+    local replayed
+    replayed=""
+    replay_log_xfs() { replayed="${1}"; }
+
+    fs_prepare xfs /dev/loop0p3
+    assert_equals "/dev/loop0p3" "${replayed}" "xfs_repair refuses a dirty log"
+
+    replayed=""
+    fs_prepare vfat /dev/loop0p2
+    assert_equals "" "${replayed}" "other filesystems need no log replay"
+
+    unset -f replay_log_xfs
+}
+
+test_verify_filesystem_skips_a_checker_that_is_not_installed() {
+    findmnt() { return 1; }
+    blkid() { echo "zfs_member"; }
+
+    assert "verify_filesystem /dev/null 'test'" \
+           "a missing checker is skipped rather than failing the build"
+
+    unset -f findmnt blkid
+}
+
+test_edk2_firmware_spec_names_the_per_arch_build() {
+    local code vars pad
+
+    read -r code vars pad <<< "$(edk2_firmware_spec amd64)"
+    assert_equals "RELEASEX64_OVMF_CODE.fd" "${code}"
+    assert_equals "RELEASEX64_OVMF_VARS.fd" "${vars}"
+    assert_equals "0" "${pad}" "q35 takes the split OVMF build as built"
+
+    read -r code vars pad <<< "$(edk2_firmware_spec arm64)"
+    assert_equals "RELEASEAARCH64_QEMU_EFI.fd" "${code}"
+    assert_equals "64" "${pad}" "the arm64 virt machine needs a 64MiB pflash"
+}
+
+test_edk2_firmware_spec_refuses_an_unbuilt_arch() {
+    assert_fails "edk2_firmware_spec riscv64"
+}
+
+test_edk2_pad_grows_firmware_to_the_pflash_size() {
+    local f
+    f="$(mktemp)"
+    dd if=/dev/zero of="${f}" bs=1024 count=64 2>/dev/null
+
+    edk2_pad "${f}" 1
+    assert_equals "1048576" "$(wc -c < "${f}" | tr -d ' ')" "padded to 1MiB"
+
+    # Running again must not grow it further
+    edk2_pad "${f}" 1
+    assert_equals "1048576" "$(wc -c < "${f}" | tr -d ' ')" "padding is idempotent"
+
+    rm -f "${f}"
+}
+
+test_edk2_pad_refuses_to_shrink_firmware() {
+    local f
+    f="$(mktemp)"
+    # Larger than the pflash it would be padded to
+    dd if=/dev/zero of="${f}" bs=1024 count=2048 2>/dev/null
+
+    assert_fails "edk2_pad ${f} 1" "truncating firmware would corrupt it"
+
+    rm -f "${f}"
+}
+
+test_firmware_paths_uses_a_supplied_directory() {
+    local d
+    d="$(mktemp -d)"
+    touch "${d}/RELEASEX64_OVMF_CODE.fd" "${d}/RELEASEX64_OVMF_VARS.fd"
+
+    assert_equals "${d}/RELEASEX64_OVMF_CODE.fd ${d}/RELEASEX64_OVMF_VARS.fd" \
+                  "$(EDK2_DIR="${d}" firmware_paths /unused amd64)" \
+                  "EDK2_DIR is used instead of fetching"
+
+    rm -rf "${d}"
+}
+
+test_firmware_paths_reports_an_incomplete_directory() {
+    local d
+    d="$(mktemp -d)"
+    touch "${d}/RELEASEX64_OVMF_CODE.fd"
+
+    assert_fails "EDK2_DIR=${d} firmware_paths /unused amd64" \
+                 "firmware without its variable store is not usable"
+
+    rm -rf "${d}"
+}
+
+test_qemu_binary_and_machine_follow_the_arch() {
+    assert_equals "qemu-system-x86_64" "$(qemu_bin_for_arch amd64)"
+    assert_equals "qemu-system-aarch64" "$(qemu_bin_for_arch arm64)"
+    assert_equals "" "$(qemu_bin_for_arch riscv64)"
+
+    assert_equals "q35" "$(qemu_machine_for_arch amd64)"
+    assert_matches "virt" "$(qemu_machine_for_arch arm64)"
+}
+
+test_qemu_uses_kvm_only_for_a_matching_host() {
+    sys_arch() { echo "amd64"; }
+
+    assert_equals "kvm" "$(qemu_accel_for_arch amd64)" "a matching guest can use kvm"
+    assert_equals "kvm" "$(qemu_accel_for_arch x86_64)" "however the arch is spelled"
+    assert_equals "tcg" "$(qemu_accel_for_arch arm64)" "a foreign guest has to be emulated"
+
+    unset -f sys_arch
+}
+
+test_qemu_cpu_matches_the_accelerator() {
+    assert_equals "host" "$(qemu_cpu_for_arch arm64 kvm)"
+    assert_equals "max" "$(qemu_cpu_for_arch arm64 tcg)"
+}
+
+test_boot_test_pattern_follows_the_provider() {
+    assert_equals "login:" "$(BOOT_TEST_PATTERN='' boot_test_pattern gentoo)" \
+                  "a systemd slot is up once it runs a getty"
+    assert_equals "u-root" "$(BOOT_TEST_PATTERN='' boot_test_pattern u-root)"
+    assert_equals "FreeBSD" "$(BOOT_TEST_PATTERN='' boot_test_pattern nomadbsd)"
+}
+
+test_boot_test_pattern_can_be_overridden() {
+    assert_equals "my marker" \
+                  "$(BOOT_TEST_PATTERN='my marker' boot_test_pattern gentoo)"
+}
+
+test_boot_test_fails_on_output_that_means_a_dead_guest() {
+    local p
+    p="$(boot_test_fail_pattern)"
+
+    local line
+    for line in \
+        "Kernel panic - not syncing: VFS: Unable to mount root fs" \
+        "BdsDxe: No bootable option or device was found." \
+        "mountroot: waiting for device /dev/ufs/rootfs"
+    do
+        assert "echo '${line}' | grep -qE '${p}'" \
+               "should be treated as a failed boot: ${line}"
+    done
+}
+
+test_boot_test_does_not_fail_a_healthy_boot() {
+    local p
+    p="$(boot_test_fail_pattern)"
+
+    # systemd reports individual unit failures on boots that go on to
+    # reach a login prompt, so these must not abort the test
+    local line
+    for line in \
+        "[FAILED] Failed to start Load Kernel Modules." \
+        "systemd[1]: Failed to start chronyd.service." \
+        "gentoo login:"
+    do
+        assert_fails "echo '${line}' | grep -qE '${p}'" \
+                     "should not be treated as a failed boot: ${line}"
+    done
+}
+
+test_boot_test_recognises_a_booted_slot() {
+    # The marker each provider's default pattern looks for
+    assert "echo 'gentoo login:' | grep -qE \"$(BOOT_TEST_PATTERN='' boot_test_pattern gentoo)\""
+    assert "echo 'Welcome to u-root!' | grep -qE \"$(BOOT_TEST_PATTERN='' boot_test_pattern u-root)\""
+    assert "echo 'FreeBSD/amd64 (nomad) (ttyu0)' | grep -qE \"$(BOOT_TEST_PATTERN='' boot_test_pattern nomadbsd)\""
+}
+
+test_serial_console_follows_the_arch() {
+    # qemu's arm64 virt machine has a pl011, not an 8250
+    assert_matches "ttyAMA0" "$(linux_cmdline_console arm64)"
+    assert_matches "ttyS0" "$(linux_cmdline_console amd64)"
+
+    assert_matches "ttyAMA0" "$(linux_cmdline_default arm64)" \
+                  "the default cmdline carries the right console too"
+    assert_matches "init=/lib/systemd/systemd" "$(linux_cmdline_default amd64)"
+}
+
+test_composition_gives_each_slot_the_right_console() {
+    composition_load "gentoo-containeros" "arm64"
+    assert_matches "ttyAMA0" "${comp_cmdline[0]}" "an arm64 image logs to ttyAMA0"
+
+    NOMADBSD_IMAGE='' composition_load "containeros-virt" "amd64"
+    assert_matches "ttyS0" "${comp_cmdline[0]}" "an amd64 image logs to ttyS0"
+    assert_matches "ttyS0" "${comp_cmdline[2]}" "including the initramfs slot"
 }
