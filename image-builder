@@ -102,9 +102,26 @@ nomadbsd_source_url="https://github.com/NomadBSD/NomadBSD"
 nomadbsd_filesystem="${NOMADBSD_FILESYSTEM:-ufs}"
 nomadbsd_loader_file="nomadbsd-loader.efi"
 
-# Kernel command lines shared by the Linux slots of a composition
-linux_cmdline_console="console=tty0 console=ttyS0,115200n8"
-linux_cmdline_default="rw init=/lib/systemd/systemd enforcing=1 ${linux_cmdline_console}"
+# Kernel command lines shared by the Linux slots of a composition.
+# The serial console differs by architecture: qemu's arm64 virt machine
+# gives a pl011 at ttyAMA0, where x86 has an 8250 at ttyS0
+linux_cmdline_console() {
+    case "${1}" in
+    arm64|aarch64) echo "console=tty0 console=ttyAMA0,115200n8" ;;
+    *)             echo "console=tty0 console=ttyS0,115200n8" ;;
+    esac
+}
+
+linux_cmdline_default() {
+    printf "rw init=/lib/systemd/systemd enforcing=1 %s" "$(linux_cmdline_console "${1}")"
+}
+
+# edk2
+# Upstream's own releases carry source only, so prebuilt firmware comes
+# from a nightly build of the same tree. Distributions package edk2 well
+# behind upstream, which is why this is preferred over their copy
+edk2_repo_url="${EDK2_REPO_URL:-https://raw.githubusercontent.com/retrage/edk2-nightly/master/bin}"
+edk2_build="${EDK2_BUILD:-RELEASE}"
 
 # u-root
 # Prebuilt initramfs artifacts, as with the kernel. The release
@@ -1192,7 +1209,7 @@ composition_load() {
                         "${kernel_file}" \
                         "" \
                         "" \
-                        "${linux_cmdline_default}" \
+                        "$(linux_cmdline_default "${target_arch}")" \
                         "linux"
         ;;
     containeros-virt)
@@ -1216,7 +1233,7 @@ composition_load() {
                         "${kernel_file}" \
                         "" \
                         "" \
-                        "${linux_cmdline_default}" \
+                        "$(linux_cmdline_default "${target_arch}")" \
                         "linux"
 
         composition_add "nomadbsd" \
@@ -1242,7 +1259,7 @@ composition_load() {
                         "${kernel_file}" \
                         "initramfs-${target_arch}.cpio" \
                         "initramfs-${target_arch}.cpio" \
-                        "${linux_cmdline_console}" \
+                        "$(linux_cmdline_console "${target_arch}")" \
                         "linux"
         ;;
     nomadbsd)
@@ -2317,7 +2334,7 @@ kernel_file_for_arch() {
     target_arch="${1}"
 
     if [ "arm64" = "${target_arch}" ]; then
-        echo "Image-arm64-vm"
+        echo "Image-virt-arm64"
     else
         echo "bzImage-virt-amd64"
     fi
@@ -2734,9 +2751,22 @@ gentoo_fetch_stage4() {
     local target_version
     target_version="$3"
 
-    info "gentoo: Fetching stage4"
     gentoo_stage4_file="gentoo-stage4-${target_flavour}-${target_arch}.tar.xz"
     gentoo_stage4_url="${gentoo_stage4_repo_url}/${target_version}/${gentoo_stage4_file}"
+
+    # A stage4 staged locally wins over the release. The release tag is
+    # published by a separate workflow, so fetching it here races that
+    # upload: a disk image job that starts before the upload finishes gets
+    # the *previous* stage4 and silently builds an image from stale
+    # packages, with no error anywhere. CI should download the stage4
+    # artifact from its own run into this path instead.
+    if [ -f "${path:-.}/${gentoo_stage4_file}" ]; then
+        info "$(printf "gentoo: Using locally staged stage4: %s\n" \
+                       "${gentoo_stage4_file}")"
+        return 0
+    fi
+
+    info "gentoo: Fetching stage4"
 
     # "/" isn't writable by a non-root CI user; use the same destination
     # stage3 fetches into
@@ -3272,11 +3302,28 @@ gentoo_install_stage4_binpkgs() {
         ;;
     esac
 
-    # Real hardware (pine64/x230), unlike sway-virt: build mesa with
-    # the Lima Gallium driver for Mali GPU acceleration - mirrors
-    # gentoo-build/emerge.sh's sway branch
+    # Hardware graphics USE flags, mirroring gentoo-build/emerge.sh. This
+    # matters as much here as it does there: the merge below runs --newuse,
+    # so a flag missing from this rootfs makes portage rebuild the package
+    # from source with default USE and quietly discard the matching binpkg
+    # out of the stage4 cache - no error, just a different rootfs.
+    #
+    # Only the hardware split needs a branch, and it keys on arch rather
+    # than flavour: one rootfs per arch serves every board of that arch, and
+    # lima/panfrost are meaningless on x86 as crocus is on arm64. Everything
+    # else, virgl included, lives in package.use, which is copied
+    # unconditionally above and so cannot drift out of sync with emerge.sh.
     if [ "sway" = "${target_flavour}" ]; then
-        cp gentoo-config/package.use.hwaccel "${mnt_path}/etc/portage/package.use/"
+        case "${target_arch}" in
+        arm64 | aarch64)
+            cp gentoo-config/package.use.hwaccel \
+               "${mnt_path}/etc/portage/package.use/"
+            ;;
+        amd64 | x86_64)
+            cp gentoo-config/package.use.hwaccel-amd64 \
+               "${mnt_path}/etc/portage/package.use/"
+            ;;
+        esac
     fi
 
     info "$(printf "Gentoo: Merging stage4 binpkgs (%s)\n" "${target_flavour}")"
@@ -3713,6 +3760,237 @@ write_image_to_disk() {
     fi
 }
 
+# edk2 builds its firmware under a per architecture name. The third
+# field is the size in MiB a pflash image has to have, or 0 where the
+# firmware is used at its natural size: qemu's arm64 virt machine only
+# accepts flash devices of exactly 64MiB, while q35 takes the split
+# OVMF build as built
+edk2_firmware_spec() {
+    local target_arch
+    target_arch="${1}"
+
+    case "${target_arch}" in
+    amd64|x86_64)
+        echo "${edk2_build}X64_OVMF_CODE.fd ${edk2_build}X64_OVMF_VARS.fd 0"
+        ;;
+    arm64|aarch64)
+        echo "${edk2_build}AARCH64_QEMU_EFI.fd ${edk2_build}AARCH64_QEMU_VARS.fd 64"
+        ;;
+    *)
+        return 1
+        ;;
+    esac
+}
+
+# Grow a firmware image with zeroes to the size qemu's pflash expects
+edk2_pad() {
+    local file
+    file="${1}"
+    local size_mib
+    size_mib="${2}"
+
+    local want
+    want=$((size_mib * 1048576))
+    local have
+    have="$(wc -c < "${file}" | tr -d ' ')"
+
+    if [ "${have}" -eq "${want}" ]; then
+        return 0
+    fi
+
+    if [ "${have}" -gt "${want}" ]; then
+        error "$(printf "edk2: %s is %s bytes, larger than the %s byte pflash\n" \
+                        "${file}" "${have}" "${want}")"
+        return 1
+    fi
+
+    info "$(printf "edk2: Padding %s to %s MiB for pflash\n" "${file}" "${size_mib}")"
+
+    if command -v truncate >/dev/null 2>&1; then
+        truncate -s "${want}" "${file}"
+    else
+        dd if=/dev/zero of="${file}" bs=1 count=0 seek="${want}" 2>/dev/null
+    fi
+}
+
+# Fetch prebuilt upstream edk2 firmware for an architecture, padding it
+# where qemu needs a fixed size. Prints "CODE_PATH VARS_PATH"
+edk2_fetch() {
+    local download_path
+    download_path="${1}"
+    local target_arch
+    target_arch="${2}"
+
+    local spec
+    if ! spec="$(edk2_firmware_spec "${target_arch}")"; then
+        error "$(printf "edk2: No firmware is built for %s\n" "${target_arch}")"
+        return 1
+    fi
+
+    local code_file
+    local vars_file
+    local pflash_mib
+    read -r code_file vars_file pflash_mib <<< "${spec}"
+
+    local fw_dir
+    fw_dir="${download_path}/firmware"
+    mkdir -p "${fw_dir}"
+
+    local f
+    for f in "${code_file}" "${vars_file}"; do
+        if [ -f "${fw_dir}/${f}" ]; then
+            continue
+        fi
+
+        # download exits on failure, so run it in a subshell to report
+        # what could not be fetched
+        if ! ( download "${edk2_repo_url}/${f}" "${fw_dir}" "${DOWNLOAD_RETRIES}" ); then
+            error "$(printf "edk2: Failed to fetch %s from %s\n" "${f}" "${edk2_repo_url}")"
+            return 1
+        fi
+
+        if [ 0 != "${pflash_mib}" ]; then
+            edk2_pad "${fw_dir}/${f}" "${pflash_mib}" || return 1
+        fi
+    done
+
+    printf "%s %s" "${fw_dir}/${code_file}" "${fw_dir}/${vars_file}"
+}
+
+# Where distributions put qemu's UEFI firmware. The names and locations
+# differ between them, so search rather than assume one
+firmware_paths_distro() {
+    local target_arch
+    target_arch="${1}"
+
+    local candidates
+    case "${target_arch}" in
+    amd64|x86_64)
+        candidates="/usr/share/OVMF/OVMF_CODE_4M.fd:/usr/share/OVMF/OVMF_VARS_4M.fd
+/usr/share/OVMF/OVMF_CODE.fd:/usr/share/OVMF/OVMF_VARS.fd
+/usr/share/edk2/ovmf/OVMF_CODE.fd:/usr/share/edk2/ovmf/OVMF_VARS.fd
+/usr/share/qemu/ovmf-x86_64-code.bin:/usr/share/qemu/ovmf-x86_64-vars.bin
+/usr/local/share/uefi-firmware/OVMF_CODE.fd:/usr/local/share/uefi-firmware/OVMF_VARS.fd"
+        ;;
+    arm64|aarch64)
+        candidates="/usr/share/AAVMF/AAVMF_CODE.fd:/usr/share/AAVMF/AAVMF_VARS.fd
+/usr/share/edk2/aarch64/QEMU_EFI-silent-pflash.raw:/usr/share/edk2/aarch64/vars-template-pflash.raw
+/usr/share/edk2/aarch64/QEMU_EFI-pflash.raw:/usr/share/edk2/aarch64/vars-template-pflash.raw
+/usr/share/qemu-efi-aarch64/QEMU_EFI.fd:/usr/share/AAVMF/AAVMF_VARS.fd"
+        ;;
+    *)
+        return 1
+        ;;
+    esac
+
+    local pair
+    for pair in ${candidates}; do
+        local code
+        code="${pair%%:*}"
+        local vars
+        vars="${pair##*:}"
+
+        if [ -f "${code}" ] && [ -f "${vars}" ]; then
+            printf "%s %s" "${code}" "${vars}"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# UEFI firmware for a target architecture, as "CODE_PATH VARS_PATH".
+#
+# Distributions package edk2 well behind upstream, so prebuilt upstream
+# firmware is fetched by default. EDK2_USE_DISTRO=1 uses the packaged
+# copy instead, and EDK2_DIR points at firmware built elsewhere
+firmware_paths() {
+    local download_path
+    download_path="${1}"
+    local target_arch
+    target_arch="${2}"
+
+    local spec
+    if ! spec="$(edk2_firmware_spec "${target_arch}")"; then
+        error "$(printf "firmware: No UEFI firmware is known for %s\n" "${target_arch}")"
+        return 1
+    fi
+
+    if [ -n "${EDK2_DIR}" ]; then
+        local code_file
+        local vars_file
+        local pflash_mib
+        read -r code_file vars_file pflash_mib <<< "${spec}"
+
+        if [ -f "${EDK2_DIR}/${code_file}" ] && [ -f "${EDK2_DIR}/${vars_file}" ]; then
+            printf "%s %s" "${EDK2_DIR}/${code_file}" "${EDK2_DIR}/${vars_file}"
+            return 0
+        fi
+
+        error "$(printf "firmware: EDK2_DIR holds no %s and %s\n" "${code_file}" "${vars_file}")"
+        return 1
+    fi
+
+    if [ "1" = "${EDK2_USE_DISTRO:-0}" ]; then
+        if firmware_paths_distro "${target_arch}"; then
+            return 0
+        fi
+
+        error "$(printf "firmware: Found no packaged UEFI firmware for %s\n" "${target_arch}")"
+        error "Unset EDK2_USE_DISTRO to fetch prebuilt upstream edk2 instead"
+        return 1
+    fi
+
+    edk2_fetch "${download_path}" "${target_arch}"
+}
+
+qemu_bin_for_arch() {
+    case "${1}" in
+    amd64|x86_64)  echo "qemu-system-x86_64" ;;
+    arm64|aarch64) echo "qemu-system-aarch64" ;;
+    *)             echo "" ;;
+    esac
+}
+
+qemu_machine_for_arch() {
+    case "${1}" in
+    arm64|aarch64) echo "virt,gic-version=max" ;;
+    *)             echo "q35" ;;
+    esac
+}
+
+# kvm only where the guest architecture matches the host, since
+# anything else has to be emulated
+qemu_accel_for_arch() {
+    local target_arch
+    target_arch="${1}"
+
+    local host_arch
+    host_arch="$(sys_arch)"
+
+    case "${target_arch}" in
+    x86_64)  target_arch="amd64" ;;
+    aarch64) target_arch="arm64" ;;
+    esac
+
+    if [ "${target_arch}" = "${host_arch}" ]; then
+        echo "kvm"
+    else
+        echo "tcg"
+    fi
+}
+
+qemu_cpu_for_arch() {
+    local accel
+    accel="${2}"
+
+    if [ "kvm" = "${accel}" ]; then
+        echo "host"
+    else
+        echo "max"
+    fi
+}
+
 ovmf_path() {
     local path
     local os
@@ -3879,47 +4157,302 @@ run_virt_podman_machine() {
     podman machine start "$name"
 }
 
+# Output that means a slot reached a working userland. Each system
+# announces itself differently, so the marker follows the provider.
+# BOOT_TEST_PATTERN overrides it for one off checks
+boot_test_pattern() {
+    local provider
+    provider="${1}"
+
+    if [ -n "${BOOT_TEST_PATTERN}" ]; then
+        echo "${BOOT_TEST_PATTERN}"
+        return 0
+    fi
+
+    case "${provider}" in
+    gentoo)
+        # systemd has started a getty on the serial console
+        echo "login:"
+        ;;
+    u-root)
+        echo "u-root"
+        ;;
+    nomadbsd)
+        # FreeBSD's loader has handed over to its kernel
+        echo "FreeBSD"
+        ;;
+    *)
+        echo "login:"
+        ;;
+    esac
+}
+
+# Output that means the guest is not going to get any further, so a
+# failing boot fails now rather than after the whole timeout.
+#
+# Deliberately not "Failed to start": systemd prints that for any unit
+# that fails, including on a boot that reaches a login prompt perfectly
+# well
+boot_test_fail_pattern() {
+    echo "Kernel panic|not syncing|No bootable option|Boot failed|mountroot: waiting|Fatal error"
+}
+
+# Point systemd-boot at one entry, so a slot can be booted without
+# driving the menu. Prints the loader.conf it replaced
+boot_test_select_entry() {
+    local disk_file
+    disk_file="${1}"
+    local mnt_path
+    mnt_path="${2}"
+    local entry_id
+    entry_id="${3}"
+
+    loop_mount "${disk_file}"
+
+    local esp_dev
+    esp_dev="$(esp)"
+
+    esp_mount "${esp_dev}" "${mnt_path}"
+
+    local entry_file
+    entry_file="${mnt_path}/loader/entries/${entry_id}.conf"
+
+    if [ ! -f "${entry_file}" ]; then
+        error "$(printf "boot-test: The image has no boot entry '%s'\n" "${entry_id}")"
+        ls "${mnt_path}/loader/entries" || true
+        unmount_recursive "${mnt_path}"
+        loop_unmount ""
+        return 1
+    fi
+
+    local previous
+    previous="$(cat "${mnt_path}/loader/loader.conf" 2>/dev/null)"
+
+    # timeout 0 boots straight into the entry rather than waiting for a
+    # keypress that automation is never going to send
+    cat << EOF > "${mnt_path}/loader/loader.conf"
+default ${entry_id}.conf
+timeout 0
+console-mode keep
+editor no
+EOF
+
+    unmount_recursive "${mnt_path}"
+    loop_unmount ""
+
+    printf "%s" "${previous}"
+}
+
+# Put back the loader.conf a boot-test run replaced
+boot_test_restore_loader() {
+    local disk_file
+    disk_file="${1}"
+    local mnt_path
+    mnt_path="${2}"
+    local previous
+    previous="${3}"
+
+    if [ -z "${previous}" ]; then
+        return 0
+    fi
+
+    loop_mount "${disk_file}"
+    esp_mount "$(esp)" "${mnt_path}"
+    printf "%s\n" "${previous}" > "${mnt_path}/loader/loader.conf"
+    unmount_recursive "${mnt_path}"
+    loop_unmount ""
+
+    info "boot-test: Restored the image's boot entry default"
+}
+
+# Boot an image under qemu with nothing but a serial console and wait
+# for a pattern meaning it got far enough. Returns 0 on a match, 1 on a
+# failure marker or on running out of time
+boot_test_run() {
+    local disk_file
+    disk_file="${1}"
+    local target_arch
+    target_arch="${2}"
+    local pattern
+    pattern="${3}"
+    local timeout_s
+    timeout_s="${4}"
+
+    local qemu_bin
+    qemu_bin="$(qemu_bin_for_arch "${target_arch}")"
+    if [ -z "${qemu_bin}" ] || ! command -v "${qemu_bin}" >/dev/null 2>&1; then
+        error "$(printf "boot-test: %s is not installed\n" "${qemu_bin:-a qemu for ${target_arch}}")"
+        return 1
+    fi
+
+    local fw
+    if ! fw="$(firmware_paths "$(dirname -- "${disk_file}")" "${target_arch}")"; then
+        return 1
+    fi
+
+    local fw_code
+    local fw_vars
+    read -r fw_code fw_vars <<< "${fw}"
+
+    local work
+    work="${disk_file%.raw}-boot-test"
+    mkdir -p "${work}"
+
+    local log
+    log="${work}/serial.log"
+    : > "${log}"
+
+    # qemu writes to the variable store, so give each run a fresh copy
+    cp "${fw_vars}" "${work}/efi-vars.fd"
+
+    local accel
+    accel="$(qemu_accel_for_arch "${target_arch}")"
+
+    info "$(printf "boot-test: Booting %s (%s, %s) for up to %ss\n" \
+                   "$(basename "${disk_file}")" "${target_arch}" "${accel}" "${timeout_s}")"
+    info "$(printf "boot-test: Waiting for /%s/\n" "${pattern}")"
+
+    # -nic none: without it a guest that fails to boot falls through to
+    # a PXE attempt and burns the rest of the timeout
+
+    "${qemu_bin}" -m "${QEMU_MEMORY:-2048}" \
+                  -machine "type=$(qemu_machine_for_arch "${target_arch}"),accel=${accel}" \
+                  -cpu "$(qemu_cpu_for_arch "${target_arch}" "${accel}")" \
+                  -display none \
+                  -serial "file:${log}" \
+                  -no-reboot \
+                  -nic none \
+                  -drive "if=pflash,format=raw,unit=0,file=${fw_code},readonly=on" \
+                  -drive "if=pflash,format=raw,unit=1,file=${work}/efi-vars.fd" \
+                  -drive "format=raw,file=${disk_file}" &
+
+    local qemu_pid
+    qemu_pid=$!
+
+    local fail_pattern
+    fail_pattern="$(boot_test_fail_pattern)"
+
+    local result
+    result=1
+    local reason
+    reason="timed out"
+    local waited
+    waited=0
+
+    while [ "${waited}" -lt "${timeout_s}" ]; do
+        if grep -qE "${pattern}" "${log}" 2>/dev/null; then
+            result=0
+            reason="matched"
+            break
+        fi
+
+        if grep -qE "${fail_pattern}" "${log}" 2>/dev/null; then
+            reason="the guest reported a failure"
+            break
+        fi
+
+        # qemu exiting on its own is only a pass if the marker is there
+        if ! kill -0 "${qemu_pid}" 2>/dev/null; then
+            if grep -qE "${pattern}" "${log}" 2>/dev/null; then
+                result=0
+                reason="matched"
+            else
+                reason="qemu exited before the guest booted"
+            fi
+            break
+        fi
+
+        sleep 2
+        waited=$((waited + 2))
+    done
+
+    kill "${qemu_pid}" 2>/dev/null || true
+    wait "${qemu_pid}" 2>/dev/null || true
+
+    if [ 0 = "${result}" ]; then
+        info "$(printf "boot-test: PASS after %ss (%s)\n" "${waited}" "${reason}")"
+    else
+        error "$(printf "boot-test: FAIL after %ss (%s)\n" "${waited}" "${reason}")"
+        error "$(printf "boot-test: serial log %s\n" "${log}")"
+        printf "\n----- serial console (last 40 lines) -----\n" >&2
+        tail -n 40 "${log}" >&2 2>/dev/null || true
+        printf -- "------------------------------------------\n\n" >&2
+    fi
+
+    return "${result}"
+}
+
 run_virt_linux() {
     local disk_file
     disk_file="${1}"
-    local cmd
-    qemu_bin="qemu-system-x86_64"
-    local fw_path
-    fw_path="$(ovmf_path)"
-    local fw_file
-    fw_file="OVMF_CODE.fd"
-    local fw_file_vars
-    fw_file_vars="OVMF_VARS.fd"
+    local target_arch
+    target_arch="${2:-$(sys_arch)}"
+
+    local qemu_bin
+    qemu_bin="$(qemu_bin_for_arch "${target_arch}")"
+    if [ -z "${qemu_bin}" ]; then
+        error "$(printf "run: No qemu binary is known for %s\n" "${target_arch}")"
+        exit 1
+    fi
+    if ! command -v "${qemu_bin}" >/dev/null 2>&1; then
+        error "$(printf "run: %s is not installed\n" "${qemu_bin}")"
+        exit 1
+    fi
+
     local fw
-    fw="${fw_path}/${fw_file}"
+    if ! fw="$(firmware_paths "$(dirname -- "${disk_file}")" "${target_arch}")"; then
+        error "$(printf "run: No UEFI firmware for %s\n" "${target_arch}")"
+        exit 1
+    fi
+
+    local fw_code
     local fw_vars
-    fw_vars="${fw_path}/${fw_file_vars}"
+    read -r fw_code fw_vars <<< "${fw}"
+
+    # qemu writes to the variable store, so boot from a copy and leave
+    # the fetched firmware as it is
+    local fw_vars_local
+    fw_vars_local="${disk_file%.raw}-efi-vars.fd"
+    if ! cp "${fw_vars}" "${fw_vars_local}"; then
+        error "$(printf "Failed to copy the EFI variable store\n")"
+        exit 1
+    fi
+
+    local accel
+    accel="$(qemu_accel_for_arch "${target_arch}")"
+
     local net_dev_suffix
     net_dev_suffix="yyy"
     local net_local_address
     net_local_address="fd62:1d79:ef52:e133::1/64"
 
-    # We need a local writeable copy of EFI vars
-    if ! cp "${fw_vars}" .; then
-        error "$(printf "Failed to copy EFI vars\n")"
-        error "$(printf "Failed to run virtual machine\n")"
-        exit 1
+    # A graphical console is not much use when boot testing an image
+    local display_args
+    if [ "1" = "${QEMU_HEADLESS:-0}" ]; then
+        display_args="-nographic"
+    elif [ "arm64" = "${target_arch}" ] || [ "aarch64" = "${target_arch}" ]; then
+        display_args="-device virtio-gpu-pci -display gtk"
+    else
+        display_args="-device virtio-vga-gl -display gtk,gl=on"
     fi
 
-    chown "${SUDO_USER}" "${fw_file_vars}"
-    virt_setup_network "${net_dev_suffix}" "${net_local_address}"
-
     local cmd
-    cmd="runuser -u ${SUDO_USER} -- \
-                    ${qemu_bin} -m 2048 \
-                    -machine type=q35,accel=kvm \
-                    -nic tap,ifname=tap-${net_dev_suffix},script=no,downscript=no,vhost=on,model=virtio-net-pci \
-                    -device virtio-vga-gl \
-                    -display gtk,gl=on \
-                    -drive if=pflash,format=raw,unit=0,file=${fw},readonly=on \
-                    -drive if=pflash,format=raw,unit=1,file=${fw_file_vars} \
-                    -drive format=raw,file=${disk_file}"
+    cmd="${qemu_bin} -m ${QEMU_MEMORY:-2048} \
+         -machine type=$(qemu_machine_for_arch "${target_arch}"),accel=${accel} \
+         -cpu $(qemu_cpu_for_arch "${target_arch}" "${accel}") \
+         ${display_args} \
+         -drive if=pflash,format=raw,unit=0,file=${fw_code},readonly=on \
+         -drive if=pflash,format=raw,unit=1,file=${fw_vars_local} \
+         -drive format=raw,file=${disk_file}"
 
+    if [ -n "${SUDO_USER}" ]; then
+        chown "${SUDO_USER}" "${fw_vars_local}"
+        virt_setup_network "${net_dev_suffix}" "${net_local_address}"
+        cmd="${cmd} -nic tap,ifname=tap-${net_dev_suffix},script=no,downscript=no,vhost=on,model=virtio-net-pci"
+        cmd="runuser -u ${SUDO_USER} -- ${cmd}"
+    fi
+
+    info "$(printf "Firmware: %s\n" "${fw_code}")"
     info "$(printf "Running:\n%s\n" "$(echo -n "${cmd}" | fmt -u)")"
     $cmd
 }
@@ -3952,12 +4485,14 @@ show_usage() {
     printf "\n"
     printf "  Usage:\n"
     printf "\n"
+    printf "    image-builder boot-test  TARGET [ARCH] [SLOT]\n"
     printf "    image-builder build      TARGET [ARCH]\n"
     printf "    image-builder chroot     PARTITION_NUMBER\n"
     printf "    image-builder create     TARGET [ARCH]\n"
     printf "    image-builder install\n"
     printf "    image-builder mount      PARTITION_NUMBER\n"
     printf "    image-builder provision  PARTITION_NUMBER\n"
+    printf "    image-builder run        TARGET [ARCH]\n"
     printf "    image-builder write      TARGET DEVICE [ARCH]\n"
     printf "\n"
     printf "\n"
@@ -3975,6 +4510,7 @@ show_usage() {
     printf "  ARCH              amd64 or arm64\n"
     printf "  DEVICE            A raw block device e.g. /dev/sdX, /dev/mmcblk0\n"
     printf "  PARTITION_NUMBER  A partition number to work on\n"
+    printf "  SLOT              A slot name to boot-test on its own\n"
     printf "\n"
     printf "  containeros-virt is a multi-boot image: it composes a Gentoo\n"
     printf "  containeros rootfs, a NomadBSD rootfs and a u-root initramfs\n"
@@ -4004,6 +4540,15 @@ main() {
 
     local build_use_container
     build_use_container="${BUILD_USE_CONTAINER:-0}"
+
+    # Where disk images are read from and written to. reexec_privileged
+    # re-runs the script, so prefer the directory it was started in
+    local img_path
+    if [ -n "${OLDPWD}" ]; then
+        img_path="${OLDPWD}"
+    else
+        img_path="${PWD}"
+    fi
 
     local net_dev
     net_dev="${NET_DEV:-"enp0s1"}"
@@ -4173,7 +4718,7 @@ main() {
                     rockpro64)
                     target_arch="arm64"
                     ;;
-                    arm64-vm)
+                    virt-arm64)
                     target_arch="arm64"
                     ;;
                     x230)
@@ -4237,15 +4782,8 @@ main() {
         *-pine64) target_arch="arm64" ;;
         esac
 
-        local img_path
         local img_file
         img_file="$build_target-$target_arch".raw
-
-        if [ -n "${OLDPWD}" ]; then
-            img_path="${OLDPWD}"
-        else
-            img_path="${PWD}"
-        fi
 
         local img
         img="${img_path}/${img_file}"
@@ -4596,26 +5134,154 @@ main() {
         exit 0
     fi
 
-    # Run disk image
-    if [ "run" == "${1}" ]; then
-        if [ -e "${img}" ]; then
-            local os
-            os=$(sys_os)
+    # Boot the image under qemu and check it reaches a working userland
+    if [ "boot-test" == "${1}" ]; then
+        # Rewriting the image's loader.conf needs a loop device
+        reexec_privileged "$@"
 
-            case "$os" in
-            gentoo-containeros|fedora)
-                run_virt_linux "${img}"
-                 exit 0
-                 ;;
-            freebsd)
-                run_virt_freebsd "${img}"
-                 exit 0
-                 ;;
-            esac
-        else
-            error "$(printf "Can not find disk image: %s" "${img}")"
+        local build_target
+        build_target="${2}"
+
+        if [ -z "${build_target}" ]; then
+            error "$(printf "The 'boot-test' command needs a target to test\n")"
+            show_usage
             exit 1
         fi
+
+        local target_arch
+        target_arch="${3:-${TARGET_ARCH:-$(sys_arch)}}"
+
+        case "$build_target" in
+        *-pine64) target_arch="arm64" ;;
+        esac
+
+        # Without a slot, every bootable slot in the image is tested
+        local only_slot
+        only_slot="${4}"
+
+        local img
+        img="${img_path}/${build_target}-${target_arch}.raw"
+
+        if [ ! -e "${img}" ]; then
+            error "$(printf "Can not find disk image: %s\n" "${img}")"
+            info "$(printf "Create it first:\n\n  # image-builder create %s %s\n" \
+                           "${build_target}" "${target_arch}")"
+            exit 1
+        fi
+
+        composition_load "${build_target}" "${target_arch}"
+
+        local timeout_s
+        timeout_s="${BOOT_TEST_TIMEOUT:-180}"
+
+        local restore
+        restore=""
+        local failed
+        failed=0
+        local tested
+        tested=0
+        local summary
+        summary=""
+
+        local i
+        for i in "${!comp_name[@]}"; do
+            if [ "none" = "${comp_boot_type[$i]}" ]; then
+                continue
+            fi
+
+            if [ -n "${only_slot}" ] && [ "${only_slot}" != "${comp_name[$i]}" ]; then
+                continue
+            fi
+
+            local entry_id
+            entry_id="${comp_name[$i]}"
+
+            printf "\n"
+            info "$(printf "boot-test: === %s ===\n" "${entry_id}")"
+
+            local previous
+            if ! previous="$(boot_test_select_entry "${img}" "${mnt_path}" "${entry_id}")"; then
+                failed=$((failed + 1))
+                summary="${summary}\n  FAIL  ${entry_id} (no such boot entry)"
+                continue
+            fi
+
+            # Only the first replacement is the image's own loader.conf
+            if [ -z "${restore}" ]; then
+                restore="${previous}"
+            fi
+
+            tested=$((tested + 1))
+
+            if boot_test_run "${img}" \
+                             "${target_arch}" \
+                             "$(boot_test_pattern "${comp_provider[$i]}")" \
+                             "${timeout_s}"; then
+                summary="${summary}\n  PASS  ${entry_id}"
+            else
+                failed=$((failed + 1))
+                summary="${summary}\n  FAIL  ${entry_id}"
+            fi
+        done
+
+        boot_test_restore_loader "${img}" "${mnt_path}" "${restore}"
+
+        if [ 0 = "${tested}" ]; then
+            error "$(printf "boot-test: No bootable slot matched '%s'\n" "${only_slot}")"
+            exit 1
+        fi
+
+        printf "\n"
+        info "$(printf "boot-test: %s of %s slots booted%b\n" \
+                       "$((tested - failed))" "${tested}" "${summary}")"
+        printf "\n"
+
+        if [ 0 != "${failed}" ]; then
+            exit 1
+        fi
+
+        exit 0
+    fi
+
+    # Run disk image
+    if [ "run" == "${1}" ]; then
+        local build_target
+        build_target="${2}"
+
+        if [ -z "${build_target}" ]; then
+            error "$(printf "The 'run' command needs a target to run\n")"
+            show_usage
+            exit 1
+        fi
+
+        local target_arch
+        target_arch="${3:-${TARGET_ARCH:-$(sys_arch)}}"
+
+        case "$build_target" in
+        *-pine64) target_arch="arm64" ;;
+        esac
+
+        local img
+        img="${img_path}/${build_target}-${target_arch}.raw"
+
+        if [ ! -e "${img}" ]; then
+            error "$(printf "Can not find disk image: %s\n" "${img}")"
+            info "$(printf "Create it first:\n\n  # image-builder create %s %s\n" \
+                           "${build_target}" "${target_arch}")"
+            exit 1
+        fi
+
+        # The BSD targets boot under bhyve; everything else under qemu
+        case "$build_target" in
+        freebsd|nanobsd)
+            run_virt_freebsd "${img}"
+            ;;
+        *)
+            run_virt_linux "${img}" "${target_arch}"
+            ;;
+        esac
+
+        exit 0
     fi
 
     if [ -z "${1}" ]; then
