@@ -714,3 +714,83 @@ test_composition_gives_each_slot_the_right_console() {
     assert_matches "ttyS0" "${comp_cmdline[0]}" "an amd64 image logs to ttyS0"
     assert_matches "ttyS0" "${comp_cmdline[2]}" "including the initramfs slot"
 }
+
+test_board_pins_the_architecture_it_can_run() {
+    # armhf here is ARMv6: a pi zero or pi1
+    assert_equals "armhf" "$(board_arch rpi0)"
+    assert_equals "armhf" "$(board_arch rpi0w)"
+    assert_equals "armhf" "$(board_arch rpi1)"
+    assert_equals "armv7" "$(board_arch rpi2)"
+    assert_equals "arm64" "$(board_arch rpi3)"
+    assert_equals "arm64" "$(board_arch rpi4)"
+    assert_equals "arm64" "$(board_arch pine64)"
+    assert_equals "amd64" "$(board_arch x230)"
+    assert_equals "" "$(board_arch not-a-board)"
+}
+
+test_pi_zero_2_is_arm64_despite_the_name() {
+    assert_equals "arm64" "$(board_arch rpi02w)" \
+                  "the zero 2 W is a cortex-a53, unlike the original zero"
+}
+
+test_boot_method_follows_the_board() {
+    assert_equals "rpi-firmware" "$(board_boot_method rpi0)"
+    assert_equals "rpi-firmware" "$(board_boot_method rpi4)"
+    assert_equals "uefi" "$(board_boot_method pine64)"
+    assert_equals "uefi" "$(board_boot_method x230)"
+}
+
+test_target_names_are_split_into_flavour_and_board() {
+    assert_equals "rpi0" "$(target_board alpine-containeros-rpi0)"
+    assert_equals "containeros" "$(target_flavour_of alpine-containeros-rpi0 alpine-)"
+
+    assert_equals "rpi2" "$(target_board alpine-sway-rpi2)"
+    assert_equals "sway" "$(target_flavour_of alpine-sway-rpi2 alpine-)"
+
+    assert_equals "pine64" "$(target_board gentoo-sway-pine64)"
+    assert_equals "sway" "$(target_flavour_of gentoo-sway-pine64 gentoo-)"
+}
+
+test_a_target_without_a_board_keeps_its_whole_flavour() {
+    assert_equals "" "$(target_board alpine-containeros)"
+    assert_equals "containeros" "$(target_flavour_of alpine-containeros alpine-)"
+
+    # 'virt' is part of the flavour, not a board
+    assert_equals "" "$(target_board gentoo-sway-virt)"
+    assert_equals "sway-virt" "$(target_flavour_of gentoo-sway-virt gentoo-)"
+    assert_equals "" "$(target_board containeros-virt)"
+}
+
+test_alpine_architecture_names_are_translated() {
+    assert_equals "aarch64" "$(alpine_arch_for arm64)"
+    assert_equals "armv7" "$(alpine_arch_for armv7)"
+    assert_equals "armhf" "$(alpine_arch_for armhf)"
+    assert_equals "" "$(alpine_arch_for amd64)" "the Alpine images are arm boards only"
+}
+
+test_container_platform_covers_32_bit_arm() {
+    assert_equals "linux/arm/v7" "$(container_platform armv7)"
+    assert_equals "linux/arm/v6" "$(container_platform armhf)"
+    assert_equals "linux/arm64" "$(container_platform arm64)"
+    assert_equals "" "$(container_platform riscv64)"
+}
+
+test_no_kernel_is_published_for_32_bit_arm() {
+    assert_equals "" "$(kernel_file_for_arch armhf)" \
+                  "those boards take their kernel from their Alpine image"
+    assert_equals "" "$(kernel_file_for_arch armv7)"
+    assert_equals "Image-virt-arm64" "$(kernel_file_for_arch arm64)"
+}
+
+test_a_pi_is_refused_an_esp_and_systemd_boot_layout() {
+    assert_fails "require_uefi_board gentoo-containeros-rpi0" \
+                 "a pi cannot boot an ESP, so building one would be a dead image"
+    assert_fails "require_uefi_board gentoo-containeros-rpi4" \
+                 "not even the 64 bit pis, without third party UEFI firmware"
+}
+
+test_uefi_boards_and_boardless_targets_are_allowed() {
+    assert "require_uefi_board gentoo-sway-pine64" "u-boot chainloads systemd-boot"
+    assert "require_uefi_board gentoo-containeros" "no board named, nothing to check"
+    assert "require_uefi_board containeros-virt"
+}
