@@ -415,15 +415,58 @@ ssh_add_pubkey() {
     fi
 }
 
+# sway's shipped config sets a wallpaper that Gentoo does not install, so
+# every start logs "Unable to access background file" plus a config parse
+# error for that line. Comment the line out rather than pointing it at
+# another image or a solid colour: sway only spawns swaybg when a background
+# is configured, so dropping it removes the parse error and the dependency
+# on gui-apps/swaybg together
+sway_configure_background() {
+    local config
+    config="${mnt_path}/etc/sway/config"
+
+    [ -f "${config}" ] || return 0
+
+    sed -i 's|^\(output \* bg .*\)|# \1|' "${config}"
+}
+
+# sway ships "set $term foot", but the sets install x11-terms/ghostty and not
+# foot, so $mod+Return launches nothing on a stock config. Point $term at what
+# is actually installed
+sway_configure_terminal() {
+    local config
+    config="${mnt_path}/etc/sway/config"
+
+    [ -f "${config}" ] || return 0
+
+    sed -i 's|^set \$term .*|set $term ghostty|' "${config}"
+}
+
 sway_configure_payload() {
     local user
     user="${1}"
+    local payload_file
+    payload_file="${mnt_path}/etc/sway/config.d/exec-payload"
 
     mkdir -p "${mnt_path}/etc/sway/config.d"
 
-    # Overwrite existing file, then append
-    printf "exec %s\n" "pip install --user -r /home/${user}/requirements.txt" > "${mnt_path}/etc/sway/config.d/exec-payload"
-    printf "exec %s\n" "${PAYLOAD}" >> "${mnt_path}"/etc/sway/config.d/exec-payload
+    # Start empty, then append only lines that have something to run. sway
+    # parses config.d at startup and reports a bare "exec" as a config error,
+    # so an unset PAYLOAD or an image with no unprivileged user must produce
+    # no line at all rather than an empty one
+    : > "${payload_file}"
+
+    if [ -n "${user}" ]; then
+        printf 'exec %s\n' \
+               "pip install --user -r /home/${user}/requirements.txt" \
+               >> "${payload_file}"
+    else
+        debug "$(printf "sway: no user, skipping requirements.txt payload\n")"
+    fi
+
+    if [ -n "${PAYLOAD:-}" ]; then
+        printf 'exec %s\n' "${PAYLOAD}" >> "${payload_file}"
+    fi
 }
 
 wifi_enable() {
@@ -1180,18 +1223,28 @@ composition_load() {
     local kernel_src
 
     case "$build_target" in
-    gentoo-containeros|gentoo-sway|gentoo-sway-virt|gentoo-sway-pine64|gentoo-k3s)
+    gentoo-containeros|gentoo-sway|gentoo-sway-virt|gentoo-sway-pine64|gentoo-sway-rockpro64|gentoo-k3s)
         local target_flavour
         target_flavour=${build_target#*gentoo-}
         target_flavour=${target_flavour%-pine64}
+        target_flavour=${target_flavour%-rockpro64}
 
-        if [ "gentoo-sway-pine64" = "${build_target}" ]; then
-            # Real Allwinner hardware, not the QEMU virt machine - no
-            # virtio, needs the pine64-specific kernel build
+        # The board variants share the sway rootfs and differ only in the
+        # kernel: real hardware has no virtio, so the virt kernel is no use,
+        # and each board needs its own DRM and display drivers. The rootfs
+        # carries lima and panfrost together (see package.use.hwaccel), so one
+        # sway rootfs serves both boards
+        case "${build_target}" in
+        gentoo-sway-pine64)
             kernel_file="Image-pine64"
-        else
+            ;;
+        gentoo-sway-rockpro64)
+            kernel_file="Image-rockpro64"
+            ;;
+        *)
             kernel_file="$(kernel_file_for_arch "${target_arch}")"
-        fi
+            ;;
+        esac
 
         # A fixed 16GiB disk with a single partition filling it, as
         # this target had before it was described as a composition.
@@ -2269,6 +2322,12 @@ sys_arch() {
         x86_64)
         arch="amd64"
         ;;
+        armv7l)
+        arch="armv7"
+        ;;
+        armv6l)
+        arch="armhf"
+        ;;
         i686)
         arch="i386"
         ;;
@@ -2323,9 +2382,111 @@ container_platform() {
         echo "linux/amd64"
     elif [ "arm64" = "${target_arch}" ]; then
         echo "linux/arm64"
+    elif [ "armv7" = "${target_arch}" ]; then
+        echo "linux/arm/v7"
+    elif [ "armhf" = "${target_arch}" ] || [ "armv6" = "${target_arch}" ]; then
+        echo "linux/arm/v6"
     else
         echo ""
     fi
+}
+
+# Boards are hardware, not an architecture choice: each one pins the
+# architecture it can actually run. armhf here is ARMv6 - a pi zero or
+# pi1 - which is why it will not boot on a pi4
+board_arch() {
+    case "${1}" in
+    rpi0|rpi0w|rpi1)       echo "armhf" ;;
+    rpi2)                  echo "armv7" ;;
+    rpi02w|rpi3|rpi4|rpi5) echo "arm64" ;;
+    pine64|rockpro64)      echo "arm64" ;;
+    x230)                  echo "amd64" ;;
+    *)                     echo "" ;;
+    esac
+}
+
+# How a board's firmware finds a kernel.
+#
+# The Raspberry Pi's VideoCore firmware reads a FAT partition directly
+# and knows nothing about UEFI, so those boards cannot boot the ESP and
+# systemd-boot layout a composition builds. Third party UEFI firmware
+# exists for the pi3 and pi4, but not for the ARMv6 boards
+board_boot_method() {
+    case "${1}" in
+    rpi*) echo "rpi-firmware" ;;
+    *)    echo "uefi" ;;
+    esac
+}
+
+# The board a target names, if it names one
+target_board() {
+    local build_target
+    build_target="${1}"
+
+    local board
+    board="${build_target##*-}"
+
+    if [ -n "$(board_arch "${board}")" ]; then
+        echo "${board}"
+    else
+        echo ""
+    fi
+}
+
+# The flavour a target names, with its distribution prefix and any board
+# suffix removed: alpine-containeros-rpi0 is the containeros flavour
+target_flavour_of() {
+    local build_target
+    build_target="${1}"
+    local prefix
+    prefix="${2}"
+
+    local rest
+    rest="${build_target#"${prefix}"}"
+
+    local board
+    board="$(target_board "${build_target}")"
+    if [ -n "${board}" ]; then
+        rest="${rest%-"${board}"}"
+    fi
+
+    echo "${rest}"
+}
+
+# Alpine names architectures differently from the rest of this script
+alpine_arch_for() {
+    case "${1}" in
+    arm64|aarch64) echo "aarch64" ;;
+    armv7)         echo "armv7" ;;
+    armhf|armv6)   echo "armhf" ;;
+    *)             echo "" ;;
+    esac
+}
+
+# Refuse to build an ESP and systemd-boot image for a board whose
+# firmware cannot boot one, rather than producing an image that looks
+# fine and does not start
+require_uefi_board() {
+    local build_target
+    build_target="${1}"
+
+    local board
+    board="$(target_board "${build_target}")"
+    if [ -z "${board}" ]; then
+        return 0
+    fi
+
+    if [ "uefi" = "$(board_boot_method "${board}")" ]; then
+        return 0
+    fi
+
+    error "$(printf "%s: %s boots through its own firmware, not UEFI\n" \
+                    "${build_target}" "${board}")"
+    error "An ESP with systemd-boot is not something it can start, so this"
+    error "layout would produce an image that never boots"
+    error "$(printf "Build it through the Alpine images instead:\n\n  # image-builder create alpine-containeros-%s\n" \
+                    "${board}")"
+    exit 1
 }
 
 # arm64 kernels are "Image", not "bzImage" - that's x86-only naming
@@ -2333,11 +2494,19 @@ kernel_file_for_arch() {
     local target_arch
     target_arch="${1}"
 
-    if [ "arm64" = "${target_arch}" ]; then
+    case "${target_arch}" in
+    arm64|aarch64)
         echo "Image-virt-arm64"
-    else
+        ;;
+    amd64|x86_64)
         echo "bzImage-virt-amd64"
-    fi
+        ;;
+    *)
+        # No 32 bit arm kernel is published: those boards take their
+        # kernel from the Alpine image built for them
+        echo ""
+        ;;
+    esac
 }
 
 # FreeBSD's TARGET/TARGET_ARCH pair doesn't match arm64/aarch64
@@ -2712,10 +2881,28 @@ alpine_build() {
     target_flavour="$1"
     local target_image_name
     target_image_name="$2"
+    local target_arch
+    target_arch="$3"
 
     if [ -z "$target_image_name" ]; then
         target_image_name="${TARGET_IMAGE_NAME:-"alpine"}"
     fi
+
+    # The board picks the architecture; alpine_arch stays the fallback
+    # for a build that names no board
+    local arch
+    if [ -n "${target_arch}" ]; then
+        arch="$(alpine_arch_for "${target_arch}")"
+        if [ -z "${arch}" ]; then
+            error "$(printf "Alpine: No Alpine architecture matches %s\n" "${target_arch}")"
+            error "Alpine images are built for aarch64, armv7 or armhf"
+            exit 1
+        fi
+    else
+        arch="${alpine_arch}"
+    fi
+
+    info "$(printf "Alpine: Building %s for %s\n" "${target_flavour}" "${arch}")"
 
     git clone --depth 1 "$alpine_config_url"
 
@@ -2724,7 +2911,7 @@ alpine_build() {
     docker run --rm \
                --mount type=bind,source="${PWD}"/alpine-config/"$target_flavour"/input/image.sh,target=/input/image.sh \
                --mount type=bind,source="${PWD}"/alpine-config/"$target_flavour"/input/modules,target=/input/modules \
-               -e ARCH="${alpine_arch}" \
+               -e ARCH="${arch}" \
                -e DEFAULT_KERNEL_MODULES="*" \
                -e SIZE_ROOT_FS=1024M \
                -e SIZE_ROOT_PART=1024M \
@@ -2754,12 +2941,12 @@ gentoo_fetch_stage4() {
     gentoo_stage4_file="gentoo-stage4-${target_flavour}-${target_arch}.tar.xz"
     gentoo_stage4_url="${gentoo_stage4_repo_url}/${target_version}/${gentoo_stage4_file}"
 
-    # A stage4 staged locally wins over the release. The release tag is
-    # published by a separate workflow, so fetching it here races that
-    # upload: a disk image job that starts before the upload finishes gets
-    # the *previous* stage4 and silently builds an image from stale
-    # packages, with no error anywhere. CI should download the stage4
-    # artifact from its own run into this path instead.
+    # A stage4 already staged here wins over the release download: CI stages
+    # the artifact from the same run, so the image is built from the
+    # packages that run produced. The release fetch below is the fallback,
+    # for local and manual builds. Preferring the local file also keeps the
+    # image off the "latest" release tag, which a separate workflow
+    # publishes and which can therefore lag the build it belongs to
     if [ -f "${path:-.}/${gentoo_stage4_file}" ]; then
         info "$(printf "gentoo: Using locally staged stage4: %s\n" \
                        "${gentoo_stage4_file}")"
@@ -3312,7 +3499,7 @@ gentoo_install_stage4_binpkgs() {
     # than flavour: one rootfs per arch serves every board of that arch, and
     # lima/panfrost are meaningless on x86 as crocus is on arm64. Everything
     # else, virgl included, lives in package.use, which is copied
-    # unconditionally above and so cannot drift out of sync with emerge.sh.
+    # unconditionally above and so cannot drift out of sync with emerge.sh
     if [ "sway" = "${target_flavour}" ]; then
         case "${target_arch}" in
         arm64 | aarch64)
@@ -3539,6 +3726,8 @@ provision() {
     install_fonts "${mnt_path}/home/${user}/.local/share/fonts"
 
     info "Configuring Sway"
+    sway_configure_background
+    sway_configure_terminal
     sway_configure_payload "${user}"
 
     info "Enabling sshd"
@@ -3634,6 +3823,8 @@ alpine_create_disk() {
     user="${7}"
     local target_flavour
     target_flavour="${8}"
+    local target_arch
+    target_arch="${9}"
     local compressed_file
     compressed_file="${file}.xz"
 
@@ -3642,7 +3833,7 @@ alpine_create_disk() {
         alpine_fetch_image "$@"
         ;;
     build)
-        alpine_build "$target_flavour" ""
+        alpine_build "$target_flavour" "" "${target_arch}"
         ;;
     esac
 }
@@ -4496,18 +4687,25 @@ show_usage() {
     printf "    image-builder write      TARGET DEVICE [ARCH]\n"
     printf "\n"
     printf "\n"
-    printf "  build TARGET      alpine-containeros | alpine-sway | freebsd |\n"
+    printf "  build TARGET      alpine-containeros[-BOARD] | alpine-sway[-BOARD] |\n"
+    printf "                    freebsd |\n"
     printf "                    gentoo-containeros | gentoo-k3s | gentoo-sway |\n"
-    printf "                    gentoo-sway-pine64 | gentoo-sway-virt |\n"
+    printf "                    gentoo-sway-pine64 | gentoo-sway-rockpro64 |\n"
+    printf "                    gentoo-sway-virt |\n"
     printf "                    gentoo-stage3 | linux-kernel | nanobsd |\n"
     printf "                    nomadbsd | openwrt | u-root\n"
     printf "\n"
-    printf "  create TARGET     alma | alpine-containeros | alpine-sway |\n"
+    printf "  create TARGET     alma | alpine-containeros[-BOARD] |\n"
+    printf "                    alpine-sway[-BOARD] |\n"
     printf "                    containeros-virt | freebsd |\n"
     printf "                    gentoo-containeros | gentoo-k3s | gentoo-sway |\n"
-    printf "                    gentoo-sway-pine64 | gentoo-sway-virt | nomadbsd\n"
+    printf "                    gentoo-sway-pine64 | gentoo-sway-rockpro64 |\n"
+    printf "                    gentoo-sway-virt | nomadbsd\n"
     printf "\n"
-    printf "  ARCH              amd64 or arm64\n"
+    printf "  ARCH              amd64, arm64, armv7 or armhf\n"
+    printf "  BOARD             rpi0 | rpi0w | rpi1 | rpi2 | rpi02w | rpi3 |\n"
+    printf "                    rpi4 | rpi5 | pine64 | rockpro64 | x230\n"
+    printf "                    A board pins the architecture it can run\n"
     printf "  DEVICE            A raw block device e.g. /dev/sdX, /dev/mmcblk0\n"
     printf "  PARTITION_NUMBER  A partition number to work on\n"
     printf "  SLOT              A slot name to boot-test on its own\n"
@@ -4616,11 +4814,18 @@ main() {
         fi
 
         case "$build_target" in
-        alpine-sway|alpine-containeros)
+        alpine-sway|alpine-containeros|alpine-sway-*|alpine-containeros-*)
             local target_flavour
-            target_flavour=${build_target#*alpine-}
+            target_flavour="$(target_flavour_of "${build_target}" "alpine-")"
 
-            alpine_build "$target_flavour" ""
+            # A named board pins the architecture it can run
+            local board
+            board="$(target_board "${build_target}")"
+            if [ -n "${board}" ]; then
+                target_arch="$(board_arch "${board}")"
+            fi
+
+            alpine_build "$target_flavour" "" "${target_arch}"
             exit 0
             ;;
         freebsd)
@@ -4676,12 +4881,11 @@ main() {
             build_gentoo_stage4 "$target_flavour" "$target_arch"
             return
             ;;
-        gentoo-sway-pine64)
+        gentoo-sway-pine64|gentoo-sway-rockpro64)
             local target_flavour
-            target_flavour="sway"
-            # pine64 is real Allwinner arm64 hardware, not a target
-            # arch choice - force it regardless of what was passed
-            target_arch="arm64"
+            target_flavour="$(target_flavour_of "${build_target}" "gentoo-")"
+            # The board is hardware, not an architecture choice
+            target_arch="$(board_arch "$(target_board "${build_target}")")"
 
             build_gentoo_stage4 "$target_flavour" "$target_arch"
             return
@@ -4776,11 +4980,13 @@ main() {
             target_arch="${TARGET_ARCH:-$host_arch}"
         fi
 
-        # pine64 is real Allwinner arm64 hardware, not a target arch
-        # choice - force it regardless of what was passed
-        case "$build_target" in
-        *-pine64) target_arch="arm64" ;;
-        esac
+        # A board named by the target is hardware, not an architecture
+        # choice, so it wins over anything passed
+        local board
+        board="$(target_board "${build_target}")"
+        if [ -n "${board}" ]; then
+            target_arch="$(board_arch "${board}")"
+        fi
 
         local img_file
         img_file="$build_target-$target_arch".raw
@@ -4822,12 +5028,19 @@ main() {
             info "$(printf " # image-builder write %s [DEVICE]" "${build_target}")"
             exit 0
             ;;
-        alpine-sway|alpine-containeros)
+        alpine-sway|alpine-containeros|alpine-sway-*|alpine-containeros-*)
             # We need root privileges
             reexec_privileged "$@"
 
             local target_flavour
-            target_flavour=${build_target#*alpine-}
+            target_flavour="$(target_flavour_of "${build_target}" "alpine-")"
+
+            local board
+            board="$(target_board "${build_target}")"
+            if [ -n "${board}" ]; then
+                target_arch="$(board_arch "${board}")"
+                info "$(printf "Alpine: %s is %s hardware\n" "${board}" "${target_arch}")"
+            fi
 
             alpine_create_disk "build" \
                                "${img_path}" \
@@ -4836,7 +5049,8 @@ main() {
                                "${alpine_csum_url}" \
                                "${alpine_csum_file}" \
                                "${service_user}" \
-                               "${target_flavour}"
+                               "${target_flavour}" \
+                               "${target_arch}"
 
             info "$(printf "Alpine: Provisioning image\n")"
 
@@ -4862,17 +5076,25 @@ main() {
             #                "${ansible_roles}"
             exit 0
             ;;
-        gentoo-containeros|gentoo-sway|gentoo-sway-virt|gentoo-sway-pine64|gentoo-k3s|containeros-virt|nomadbsd)
+        gentoo-containeros|gentoo-sway|gentoo-sway-virt|gentoo-sway-pine64|gentoo-sway-rockpro64|gentoo-k3s|containeros-virt|nomadbsd)
             # download_miss/gentoo_fetch_stage3 (called below) expect a
             # "path" in scope to fetch into
             local path
             path="${img_path}"
+
+            # An ESP with systemd-boot is only bootable on hardware whose
+            # firmware speaks UEFI
+            require_uefi_board "${build_target}"
 
             # Describe the image as a set of slots, then build it slot
             # by slot: one rootfs, kernel and boot entry per system
             composition_load "${build_target}" "${target_arch}"
             composition_show
 
+            # Allwinner only: its SPL lands at byte 8192, inside the default
+            # GPT partition array. The RK3399 on a rockpro64 loads its
+            # idbloader from sector 64 (byte 32768), which is clear of the
+            # array already, so that board needs no shrink
             local reduce_gpt_table
             if [ "gentoo-sway-pine64" = "${build_target}" ]; then
                 reduce_gpt_table="1"
@@ -4952,6 +5174,7 @@ main() {
             printf "  One of: alma, alpine-containeros, alpine-sway,\n"
             printf "          containeros-virt, freebsd, gentoo-containeros,\n"
             printf "          gentoo-k3s, gentoo-sway, gentoo-sway-pine64,\n"
+    printf "          gentoo-sway-rockpro64,\n"
             printf "          gentoo-sway-virt, nomadbsd\n"
             show_usage
             exit 1
@@ -5048,15 +5271,15 @@ main() {
                 xz -d -k "${img_path}/${img_file}.xz"
             fi
             ;;
-        gentoo-sway-pine64)
-            # pine64 is always arm64 - matches the naming 'create' used
-            img_file="${img}-arm64.raw"
-            ;;
         *)
             # Every composed target is written as "<target>-<arch>.raw",
-            # the same name 'create' gave it
+            # the same name 'create' gave it. A board in the name pins
+            # the architecture, as it does everywhere else
             local write_arch
-            write_arch="${4:-${TARGET_ARCH:-$(sys_arch)}}"
+            write_arch="$(board_arch "$(target_board "${img}")")"
+            if [ -z "${write_arch}" ]; then
+                write_arch="${4:-${TARGET_ARCH:-$(sys_arch)}}"
+            fi
             img_file="${img}-${write_arch}.raw"
             ;;
         esac
@@ -5151,9 +5374,11 @@ main() {
         local target_arch
         target_arch="${3:-${TARGET_ARCH:-$(sys_arch)}}"
 
-        case "$build_target" in
-        *-pine64) target_arch="arm64" ;;
-        esac
+        local board
+        board="$(target_board "${build_target}")"
+        if [ -n "${board}" ]; then
+            target_arch="$(board_arch "${board}")"
+        fi
 
         # Without a slot, every bootable slot in the image is tested
         local only_slot
@@ -5257,9 +5482,11 @@ main() {
         local target_arch
         target_arch="${3:-${TARGET_ARCH:-$(sys_arch)}}"
 
-        case "$build_target" in
-        *-pine64) target_arch="arm64" ;;
-        esac
+        local board
+        board="$(target_board "${build_target}")"
+        if [ -n "${board}" ]; then
+            target_arch="$(board_arch "${board}")"
+        fi
 
         local img
         img="${img_path}/${build_target}-${target_arch}.raw"
