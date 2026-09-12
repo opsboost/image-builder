@@ -705,6 +705,98 @@ EOF
     ln -s -f "${path}/net-dhcp.service" "${path}/multi-user.target.wants/net-dhcp.service"
 }
 
+# Install a unit that mounts whatever virtio-9p shares the host exported
+#
+# 9p has no notion of a guest mount point: qemu hands over a mount_tag and
+# where it lands is the guest's decision. gentoo-build's run script sends the
+# guest half of each VM_MOUNTS pair across as the tag itself, so the guest can
+# read the tags back out of sysfs and mount each share where its tag says,
+# and the image needs no build-time knowledge of what will be shared with it
+#
+# Harmless on an image that is never given any shares - the loop finds no
+# mount_tag attributes and the unit exits 0
+virtio_9p_automount() {
+    local mnt_path
+    mnt_path="${1}"
+
+    local path
+    path="${mnt_path}/etc/systemd/system"
+
+cat <<'EOF' > "${mnt_path}/usr/local/sbin/9p-automount"
+#!/bin/sh
+#
+# Mount every virtio-9p share the host exported, at the path its mount tag
+# spells out. A tag that does not look like a path is skipped rather than
+# guessed at: 9p tags are free-form and something else may have set one
+
+set -u
+
+status=0
+
+for attr in /sys/bus/virtio/devices/*/mount_tag; do
+    [ -r "${attr}" ] || continue
+
+    # sysfs NUL-terminates the attribute and command substitution drops the
+    # byte with a warning, so strip it here instead
+    tag="$(tr -d '\0' < "${attr}")" || continue
+    [ -n "${tag}" ] || continue
+
+    # ~ crosses the wire literally, because only this side knows whose home
+    # it means, and on these images that is root's
+    case "${tag}" in
+    /*) target="${tag}" ;;
+    "~") target="/root" ;;
+    "~/"*) target="/root/${tag#\~/}" ;;
+    *) continue ;;
+    esac
+
+    if mountpoint -q "${target}" 2>/dev/null; then
+        continue
+    fi
+
+    if ! mkdir -p "${target}"; then
+        printf '9p-automount: cannot create %s\n' "${target}" >&2
+        status=1
+        continue
+    fi
+
+    # No cache= on purpose: the default keeps the guest seeing host edits as
+    # they happen, which is the point of sharing a source tree. It costs mmap
+    # on the share, so binaries cannot be executed from one
+    if ! mount -t 9p -o trans=virtio,version=9p2000.L,msize=262144 \
+        "${tag}" "${target}"; then
+        printf '9p-automount: failed to mount %s at %s\n' "${tag}" "${target}" >&2
+        status=1
+        continue
+    fi
+
+    printf '9p-automount: mounted %s at %s\n' "${tag}" "${target}"
+done
+
+exit "${status}"
+EOF
+    chmod 755 "${mnt_path}/usr/local/sbin/9p-automount"
+
+cat <<'EOF' > "${path}/9p-automount.service"
+[Unit]
+Description=Mount virtio-9p shares exported by the host
+After=local-fs.target
+Before=getty.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/9p-automount
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    mkdir -p "${path}/multi-user.target.wants"
+    ln -s -f "${path}/9p-automount.service" \
+        "${path}/multi-user.target.wants/9p-automount.service"
+}
+
 # Write config for wpa_supplicant
 write_wpa_supplicant_config() {
     local mnt_path
@@ -3732,6 +3824,9 @@ provision() {
 
     info "Enabling sshd"
     service_enable "${mnt_path}" "sshd" "getty"
+
+    info "Installing 9p automount"
+    virtio_9p_automount "${mnt_path}"
 
     if [ -n "${ansible_roles}" ]; then
         info "$(printf "Gentoo: Provisioning image with Ansible\n")"
