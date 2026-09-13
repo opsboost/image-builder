@@ -2070,6 +2070,38 @@ loop_mount_linux() {
             exit 1
         fi
     fi
+
+    loop_wait_partitions
+}
+
+loop_wait_partitions() {
+    local sys_dir
+    sys_dir="/sys/class/block/loop0"
+    [ -d "${sys_dir}" ] || return 0
+
+    if command -v udevadm >/dev/null 2>&1; then
+        udevadm settle --timeout=10 2>/dev/null || true
+    fi
+
+    local tries
+    tries=0
+    while [ "${tries}" -lt 50 ]; do
+        local expected=0
+        local missing=0
+        local entry
+        for entry in "${sys_dir}"/loop0p*; do
+            [ -e "${entry}" ] || continue
+            expected=$((expected + 1))
+            [ -e "/dev/$(basename "${entry}")" ] || missing=1
+        done
+        if [ "${expected}" -eq 0 ] || [ "${missing}" -eq 0 ]; then
+            return 0
+        fi
+        sleep 0.1
+        tries=$((tries + 1))
+    done
+
+    error "$(printf "loop_wait_partitions: /dev/loop0 partition nodes did not appear in time\n")"
 }
 
 loop_unmount() {
@@ -3860,16 +3892,10 @@ filesystem() {
         dev="${ret}p${part_no}"
     fi
 
-    if lsblk -f -n -ofstype "${dev}" ; then
-        # Some grace time is needed for the detection not to fail
-        sleep 1
-        fs="$(lsblk -f -n -ofstype "${dev}")"
-        if [ -z "${fs}" ]; then
-            error "$(printf "Failed to determine filesystem of %s\n" "${dev}")"
-            loop_unmount ""
-            exit 1
-        fi
-    else
+    # loop_mount already waits for loop0's partition device nodes to exist,
+    # so no extra grace sleep is needed here before reading fstype
+    fs="$(lsblk -f -n -ofstype "${dev}")"
+    if [ -z "${fs}" ]; then
         error "$(printf "Failed to determine filesystem of %s\n" "${dev}")"
         loop_unmount ""
         exit 1
