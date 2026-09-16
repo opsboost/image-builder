@@ -548,6 +548,31 @@ EOF
         "${path}/default.target"
 }
 
+write_mpv_config() {
+    local mnt_path
+    mnt_path="${1}"
+
+    mkdir -p "${mnt_path}/etc/mpv"
+cat <<'EOF' > "${mnt_path}/etc/mpv/mpv.conf"
+# Hardware decoding via the kernel's stateless V4L2 decoder, zero-copy to
+# the compositor. See image-builder write_mpv_config for the reasoning
+hwdec=v4l2request
+vo=dmabuf-wayland
+EOF
+}
+
+# sway drop-in: the pine64 kernel still carries vkms, which shows up as a
+# second DRM device with a phantom "Virtual-1" output. Left enabled, sway
+# renders a whole second desktop into it every frame on a Mali-400.
+# Disable it; the drop-in becomes a no-op once vkms is out of the kernel
+write_sway_dropins() {
+    local mnt_path
+    mnt_path="${1}"
+
+    mkdir -p "${mnt_path}/etc/sway/config.d"
+    printf 'output Virtual-1 disable\n' > "${mnt_path}/etc/sway/config.d/no-virtual-output"
+}
+
 # Audio: pipewire, pipewire-pulse and wireplumber run as user units inside
 # the session's user manager, which PAMName=login starts for the sway user.
 # Gentoo installs the units but does not enable them; enable them for every
@@ -4057,6 +4082,8 @@ provision() {
     sway_configure_background
     sway_configure_terminal
     rm -f "${mnt_path}/etc/sway/config.d/exec-payload"
+    write_sway_dropins "${mnt_path}"
+    write_mpv_config "${mnt_path}"
     enable_sway_session "${mnt_path}" "${user}"
 
     info "Enabling pipewire user units"
