@@ -2996,6 +2996,9 @@ linux_build_kernel() {
     target_arch="${3}"
     local kernel_version
     kernel_version="${4}"
+    # Branch or tag of kernel_src_url to build. Defaults to master
+    local kernel_ref
+    kernel_ref="${5:-${KERNEL_REF:-master}}"
 
     kernel_config_url="${kernel_config_url}/kernel-config-${kernel_flavour}"
     download "${kernel_config_url}"
@@ -3006,7 +3009,7 @@ linux_build_kernel() {
         kernel_version="latest"
     fi
 
-    info "$(printf "Building kernel version %s for %s with arch %s\n" "${kernel_version}" "${kernel_flavour}" "${target_arch}")"
+    info "$(printf "Building kernel version %s (ref %s) for %s with arch %s\n" "${kernel_version}" "${kernel_ref}" "${kernel_flavour}" "${target_arch}")"
 
     if [ 1 = "${build_use_container}" ]; then
         local platform
@@ -3025,7 +3028,7 @@ linux_build_kernel() {
         podman_install
 
         mkdir -p "${PWD}/output"
-        git clone --depth 1 "${kernel_src_url}" output/linux
+        git clone --depth 1 --branch "${kernel_ref}" "${kernel_src_url}" output/linux
 
         cd output/linux
 
@@ -3039,6 +3042,7 @@ linux_build_kernel() {
         podman buildx build --cap-add=SYS_PTRACE \
                             --platform="${platform}" \
                             --build-arg KERNEL_VERSION="${kernel_version}" \
+                            --build-arg KERNEL_REF="${kernel_ref}" \
                             --build-arg KERNEL_CONFIG="kernel-config-${kernel_flavour}" \
                             -v "${PWD}"/output:/output \
                             -t "ghcr.io/bbusse/linux-kernel-${kernel_flavour}:latest" \
@@ -3651,6 +3655,19 @@ gentoo_install_stage4_binpkgs() {
     cp gentoo-config/package.unmask/* "${mnt_path}/etc/portage/package.unmask/"
     cp gentoo-config/package.accept_keywords "${mnt_path}/etc/portage/package.accept_keywords/"
     cp -r gentoo-config/sets "${mnt_path}/etc/portage/sets"
+    cp -r gentoo-config/env "${mnt_path}/etc/portage/env"
+
+    # Cortex-A53 errata 843419/835769 linker workarounds, arm64 only: the
+    # boards these images boot on have r0p4 cores. Mirrors the arch case in
+    # gentoo-build/emerge.sh so the chroot merge below links the same way the
+    # stage4 did. Details in gentoo-config/env/cortex-a53-errata
+    case "${target_arch}" in
+    arm64 | aarch64)
+        mkdir -p "${mnt_path}/etc/portage/package.env"
+        cp gentoo-config/package.env.arm64 \
+           "${mnt_path}/etc/portage/package.env/cortex-a53-errata"
+        ;;
+    esac
 
     if [ -n "${GENTOO_OVERLAYS}" ]; then
         gentoo_add_overlays "${mnt_path}" "${GENTOO_OVERLAYS}"
