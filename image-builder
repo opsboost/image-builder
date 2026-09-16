@@ -395,24 +395,43 @@ download() {
     fi
 }
 
+# Create a user inside the image. The command is chosen by the image's OS,
+# read from its own os-release, not by the host's: the runner is Ubuntu and
+# a Gentoo chroot has useradd, not adduser, which is how images ended up
+# with no user at all. Idempotent, so the desktop user and ANSIBLE_USER may
+# be the same name
 create_user() {
     local user
     user="${1}"
     local path
     path="${2}"
-    local os
-    os="$(sys_os)"
 
-    case "$os" in
+    if grep -q "^${user}:" "${path}/etc/passwd" 2>/dev/null; then
+        debug "$(printf "create_user: %s exists\n" "${user}")"
+        return 0
+    fi
+
+    local os
+    os="$(grep '^ID=' "${path}/etc/os-release" 2>/dev/null | cut -d= -f2 | tr -d '"')"
+
+    local cmd
+    case "${os}" in
     freebsd)
-        cmd="pw user add ${user}"
+        cmd="pw user add -n ${user} -m -G wheel"
+        ;;
+    gentoo|arch|alpine)
+        cmd="useradd -m -G wheel -s /bin/bash ${user}"
         ;;
     debian|ubuntu|fedora)
         cmd="adduser -U ${user} ${user}"
         ;;
+    *)
+        error "$(printf "create_user: unknown image OS '%s', not creating %s\n" "${os}" "${user}")"
+        return 1
+        ;;
     esac
 
-    chroot "${mnt_path}" /bin/sh -c "${cmd}"
+    chroot "${path}" /bin/sh -c "${cmd}"
 }
 
 # Resolve a username to id in a chroot
@@ -468,53 +487,141 @@ sway_configure_background() {
     sed -i 's|^\(output \* bg .*\)|# \1|' "${config}"
 }
 
-# sway ships "set $term foot", but the sets install x11-terms/ghostty and not
-# foot, so $mod+Return launches nothing on a stock config. Point $term at what
-# is actually installed
+# sway ships "set $term foot" and the sets install both foot and ghostty.
+# foot is the one that runs everywhere: it renders with pixman and needs no
+# GL, while ghostty demands desktop OpenGL 3.3 and cannot start on the
+# pine64's Mali-400 (GLES 2.0 / GL 2.1 under lima). Pin $term explicitly so
+# an upstream config change cannot swap it
 sway_configure_terminal() {
     local config
     config="${mnt_path}/etc/sway/config"
 
     [ -f "${config}" ] || return 0
 
-    sed -i 's|^set \$term .*|set $term ghostty|' "${config}"
+    sed -i 's|^set \$term .*|set $term foot|' "${config}"
 }
 
-sway_configure_payload() {
-    local user
-    user="${1}"
-    local payload_file
-    payload_file="${mnt_path}/etc/sway/config.d/exec-payload"
-
-    mkdir -p "${mnt_path}/etc/sway/config.d"
-
-    # Start empty, then append only lines that have something to run. sway
-    # parses config.d at startup and reports a bare "exec" as a config error,
-    # so an unset PAYLOAD or an image with no unprivileged user must produce
-    # no line at all rather than an empty one
-    : > "${payload_file}"
-
-    if [ -n "${user}" ]; then
-        printf 'exec %s\n' \
-               "pip install --user -r /home/${user}/requirements.txt" \
-               >> "${payload_file}"
-    else
-        debug "$(printf "sway: no user, skipping requirements.txt payload\n")"
-    fi
-
-    if [ -n "${PAYLOAD:-}" ]; then
-        printf 'exec %s\n' "${PAYLOAD}" >> "${payload_file}"
-    fi
-}
-
-# sway needs a running seat manager to get DRM/tty access
-enable_seatd() {
+# Start sway on tty1 as the image user through a system unit. PAMName=login
+# registers a logind session on seat0, so wlroots gets DRM and input devices
+# from logind: no seatd daemon, no seat/video group, no environment tweaks,
+# and no root. Conflicts with the getty on the same VT. Restarting it is a
+# root operation (systemctl restart sway-tty1 over ssh); the image carries
+# neither sudo nor polkit by choice
+enable_sway_session() {
     local mnt_path
     mnt_path="${1}"
+    local user
+    user="${2}"
+    local path
+    path="${mnt_path}/etc/systemd/system"
 
-    mkdir -p "${mnt_path}/etc/systemd/system/multi-user.target.wants"
-    ln -s -f "/usr/lib/systemd/system/seatd.service" \
-        "${mnt_path}/etc/systemd/system/multi-user.target.wants/seatd.service"
+    if [ -z "${user}" ]; then
+        error "enable_sway_session: no user, sway will not be started"
+        return 1
+    fi
+
+cat <<EOF > "${path}/sway-tty1.service"
+[Unit]
+Description=sway on tty1 as ${user}
+After=systemd-user-sessions.service
+Conflicts=getty@tty1.service autovt@tty1.service
+
+[Service]
+User=${user}
+PAMName=login
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+Environment=XDG_SESSION_TYPE=wayland
+ExecStart=/usr/bin/sway
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical.target
+EOF
+
+    mkdir -p "${path}/graphical.target.wants"
+    ln -s -f "${path}/sway-tty1.service" \
+        "${path}/graphical.target.wants/sway-tty1.service"
+    ln -s -f "/usr/lib/systemd/system/graphical.target" \
+        "${path}/default.target"
+}
+
+# Audio: pipewire, pipewire-pulse and wireplumber run as user units inside
+# the session's user manager, which PAMName=login starts for the sway user.
+# Gentoo installs the units but does not enable them; enable them for every
+# user through /etc/systemd/user so no per-user step is needed. Device
+# access comes from logind's uaccess ACLs, no audio group required
+enable_pipewire_user_units() {
+    local mnt_path
+    mnt_path="${1}"
+    local path
+    path="${mnt_path}/etc/systemd/user"
+    local units
+    units="${mnt_path}/usr/lib/systemd/user"
+
+    if [ ! -f "${units}/pipewire.socket" ]; then
+        debug "enable_pipewire_user_units: pipewire not installed, skipping"
+        return 0
+    fi
+
+    mkdir -p "${path}/sockets.target.wants" "${path}/pipewire.service.wants"
+    ln -s -f /usr/lib/systemd/user/pipewire.socket \
+        "${path}/sockets.target.wants/pipewire.socket"
+    if [ -f "${units}/pipewire-pulse.socket" ]; then
+        ln -s -f /usr/lib/systemd/user/pipewire-pulse.socket \
+            "${path}/sockets.target.wants/pipewire-pulse.socket"
+    fi
+    if [ -f "${units}/wireplumber.service" ]; then
+        ln -s -f /usr/lib/systemd/user/wireplumber.service \
+            "${path}/pipewire.service.wants/wireplumber.service"
+    fi
+}
+
+# A swapfile on the root filesystem. 2 GB boards need it for anything that
+# links LLVM or compiles Rust. fallocate on xfs gives an unfragmented,
+# non-sparse file, which is what the kernel requires for swap. Size is a
+# fallocate argument such as 4G; 0 or empty disables. Activated by a
+# systemd swap unit, not fstab: the image carries no fstab entries, the
+# ESP is automounted at /boot by systemd-gpt-auto-generator and the root is
+# named on the kernel command line
+create_swapfile() {
+    local mnt_path
+    mnt_path="${1}"
+    local size
+    size="${2}"
+
+    if [ -z "${size}" ] || [ "0" = "${size}" ]; then
+        debug "create_swapfile: disabled"
+        return 0
+    fi
+
+    local swapfile
+    swapfile="${mnt_path}/swapfile"
+
+    rm -f "${swapfile}"
+    if ! fallocate -l "${size}" "${swapfile}"; then
+        error "$(printf "create_swapfile: fallocate %s failed\n" "${size}")"
+        return 1
+    fi
+    chmod 0600 "${swapfile}"
+    mkswap -q "${swapfile}"
+
+    local path
+    path="${mnt_path}/etc/systemd/system"
+cat <<EOF > "${path}/swapfile.swap"
+[Unit]
+Description=Swapfile on the root filesystem
+
+[Swap]
+What=/swapfile
+
+[Install]
+WantedBy=swap.target
+EOF
+    mkdir -p "${path}/swap.target.wants"
+    ln -s -f "${path}/swapfile.swap" "${path}/swap.target.wants/swapfile.swap"
 }
 
 wifi_enable() {
@@ -3902,8 +4009,13 @@ provision() {
 
     info "$(printf "Applying changes to partition %s\n" "${part_no}")"
 
-    if [ -n "${ansible_user}" ]; then
-        info "Creating user"
+    if [ -n "${user}" ]; then
+        info "$(printf "Creating user %s\n" "${user}")"
+        create_user "${user}" "${mnt_path}"
+    fi
+
+    if [ -n "${ansible_user}" ] && [ "${ansible_user}" != "${user}" ]; then
+        info "$(printf "Creating Ansible user %s\n" "${ansible_user}")"
         create_user "${ansible_user}" "${mnt_path}"
     fi
 
@@ -3944,11 +4056,21 @@ provision() {
     info "Configuring Sway"
     sway_configure_background
     sway_configure_terminal
-    sway_configure_payload "${user}"
-    enable_seatd "${mnt_path}"
+    rm -f "${mnt_path}/etc/sway/config.d/exec-payload"
+    enable_sway_session "${mnt_path}" "${user}"
+
+    info "Enabling pipewire user units"
+    enable_pipewire_user_units "${mnt_path}"
 
     info "Enabling sshd"
     service_enable "${mnt_path}" "sshd" "getty"
+
+    info "$(printf "Creating swapfile (%s)\n" "${swapfile_size:-0}")"
+    create_swapfile "${mnt_path}" "${swapfile_size}"
+
+    # Portage nags about unread news on every emerge; mark it read so the
+    # first interactive emerge on the board starts clean
+    chroot "${mnt_path}" eselect news read --quiet all >/dev/null 2>&1 || true
 
     info "Installing 9p automount"
     virtio_9p_automount "${mnt_path}"
@@ -4981,10 +5103,21 @@ main() {
     local net_mode
     net_mode="${NET_MODE:-"gokrazy-dhcp"}"
 
+    # The image's unprivileged desktop user. sway runs as this user via
+    # sway-tty1.service, and its home receives the payload files. Named
+    # IMAGE_USER rather than USER because USER is the shell's own login
+    # variable and reads root under the sudo this script re-execs with
+    local user
+    user="${IMAGE_USER:-moonshine}"
+
+    # Swapfile on the rootfs, a fallocate size; 0 disables
+    local swapfile_size
+    swapfile_size="${SWAPFILE_SIZE:-4G}"
+
     local ansible_user
     local ansible_roles
     local ansible_roles_path
-    ansible_user="${ANSIBLE_USER:-""}"
+    ansible_user="${ANSIBLE_USER:-${user}}"
 
     if [ -n "${ANSIBLE_ROLES}" ]; then
         ansible_roles="${ANSIBLE_ROLES}"
