@@ -154,6 +154,22 @@ linux_cmdline_default() {
            "$(linux_cmdline_console "${1}" "${2:-}")"
 }
 
+linux_cmdline_firstboot() {
+    local build_target
+    build_target="${1}"
+
+    local hostname
+    hostname="${IMAGE_HOSTNAME:-$(target_board "${build_target}")}"
+    hostname="${hostname:-${build_target}}"
+
+    printf 'systemd.firstboot=off'
+    printf ' systemd.set_credential=firstboot.hostname:%s' "${hostname}"
+    printf ' systemd.set_credential=firstboot.timezone:%s' "${IMAGE_TIMEZONE:-UTC}"
+    printf ' systemd.set_credential=firstboot.locale:%s' "${IMAGE_LOCALE:-C.UTF-8}"
+    printf ' systemd.set_credential=firstboot.keymap:%s' "${IMAGE_KEYMAP:-us}"
+    printf ' systemd.set_credential=firstboot.swapfile-size:%s' "${SWAPFILE_SIZE:-4G}"
+}
+
 # edk2
 # Upstream's own releases carry source only, so prebuilt firmware comes
 # from a nightly build of the same tree. Distributions package edk2 well
@@ -395,11 +411,8 @@ download() {
     fi
 }
 
-# Create a user inside the image. The command is chosen by the image's OS,
-# read from its own os-release, not by the host's: the runner is Ubuntu and
-# a Gentoo chroot has useradd, not adduser, which is how images ended up
-# with no user at all. Idempotent, so the desktop user and ANSIBLE_USER may
-# be the same name
+# Command chosen by the image's os-release, not the host's: the runner is
+# Ubuntu, a Gentoo chroot has useradd, not adduser. Idempotent
 create_user() {
     local user
     user="${1}"
@@ -419,10 +432,10 @@ create_user() {
     freebsd)
         cmd="pw user add -n ${user} -m -G wheel"
         ;;
-    gentoo|arch|alpine)
+    gentoo | arch | alpine)
         cmd="useradd -m -G wheel -s /bin/bash ${user}"
         ;;
-    debian|ubuntu|fedora)
+    debian | ubuntu | fedora)
         cmd="adduser -U ${user} ${user}"
         ;;
     *)
@@ -487,26 +500,20 @@ sway_configure_background() {
     sed -i 's|^\(output \* bg .*\)|# \1|' "${config}"
 }
 
-# sway ships "set $term foot" and the sets install both foot and ghostty.
-# foot is the one that runs everywhere: it renders with pixman and needs no
-# GL, while ghostty demands desktop OpenGL 3.3 and cannot start on the
-# pine64's Mali-400 (GLES 2.0 / GL 2.1 under lima). Pin $term explicitly so
-# an upstream config change cannot swap it
+# foot needs no GL. ghostty wants desktop GL 3.3
 sway_configure_terminal() {
     local config
     config="${mnt_path}/etc/sway/config"
 
     [ -f "${config}" ] || return 0
 
+    # shellcheck disable=SC2016
     sed -i 's|^set \$term .*|set $term foot|' "${config}"
 }
 
-# Start sway on tty1 as the image user through a system unit. PAMName=login
-# registers a logind session on seat0, so wlroots gets DRM and input devices
-# from logind: no seatd daemon, no seat/video group, no environment tweaks,
-# and no root. Conflicts with the getty on the same VT. Restarting it is a
-# root operation (systemctl restart sway-tty1 over ssh); the image carries
-# neither sudo nor polkit by choice
+# PAMName=login gives sway a seated logind session, so wlroots gets DRM and
+# input from logind without seatd, groups or root. Restart is root's job
+# over ssh, the image has neither sudo nor polkit by choice
 enable_sway_session() {
     local mnt_path
     mnt_path="${1}"
@@ -520,7 +527,13 @@ enable_sway_session() {
         return 1
     fi
 
-cat <<EOF > "${path}/sway-tty1.service"
+    # containeros and k3s share this provisioning and have no sway
+    if [ ! -x "${mnt_path}/usr/bin/sway" ]; then
+        debug "enable_sway_session: no sway in rootfs, skipping"
+        return 0
+    fi
+
+    cat <<EOF >"${path}/sway-tty1.service"
 [Unit]
 Description=sway on tty1 as ${user}
 After=systemd-user-sessions.service
@@ -548,36 +561,35 @@ EOF
         "${path}/default.target"
 }
 
+# v4l2request decodes on the kernel's stateless V4L2 decoder (Cedrus),
+# dmabuf-wayland hands the buffers to the compositor. The only path with
+# correct colours on lima: mpv's own vo=gpu imports NV12 as two planes and
+# lima renders the chroma pink, the -copy variant drops half the frames.
+# Boards without such a decoder fall back to software
 write_mpv_config() {
     local mnt_path
     mnt_path="${1}"
 
     mkdir -p "${mnt_path}/etc/mpv"
-cat <<'EOF' > "${mnt_path}/etc/mpv/mpv.conf"
-# Hardware decoding via the kernel's stateless V4L2 decoder, zero-copy to
-# the compositor. See image-builder write_mpv_config for the reasoning
+    cat <<'EOF' >"${mnt_path}/etc/mpv/mpv.conf"
+# See image-builder write_mpv_config
 hwdec=v4l2request
 vo=dmabuf-wayland
 EOF
 }
 
-# sway drop-in: the pine64 kernel still carries vkms, which shows up as a
-# second DRM device with a phantom "Virtual-1" output. Left enabled, sway
-# renders a whole second desktop into it every frame on a Mali-400.
-# Disable it; the drop-in becomes a no-op once vkms is out of the kernel
+# A kernel with vkms gives sway a phantom Virtual-1 output and a second
+# desktop to render every frame. No-op once vkms is out of the kernel
 write_sway_dropins() {
     local mnt_path
     mnt_path="${1}"
 
     mkdir -p "${mnt_path}/etc/sway/config.d"
-    printf 'output Virtual-1 disable\n' > "${mnt_path}/etc/sway/config.d/no-virtual-output"
+    printf 'output Virtual-1 disable\n' >"${mnt_path}/etc/sway/config.d/no-virtual-output"
 }
 
-# Audio: pipewire, pipewire-pulse and wireplumber run as user units inside
-# the session's user manager, which PAMName=login starts for the sway user.
-# Gentoo installs the units but does not enable them; enable them for every
-# user through /etc/systemd/user so no per-user step is needed. Device
-# access comes from logind's uaccess ACLs, no audio group required
+# Gentoo installs the pipewire user units but does not enable them. Enable
+# for every user, the sway session's user manager starts them
 enable_pipewire_user_units() {
     local mnt_path
     mnt_path="${1}"
@@ -604,40 +616,17 @@ enable_pipewire_user_units() {
     fi
 }
 
-# A swapfile on the root filesystem. 2 GB boards need it for anything that
-# links LLVM or compiles Rust. fallocate on xfs gives an unfragmented,
-# non-sparse file, which is what the kernel requires for swap. Size is a
-# fallocate argument such as 4G; 0 or empty disables. Activated by a
-# systemd swap unit, not fstab: the image carries no fstab entries, the
-# ESP is automounted at /boot by systemd-gpt-auto-generator and the root is
-# named on the kernel command line
-create_swapfile() {
+# The file is created on first boot, see provision_systemd_firstboot
+write_swapfile_unit() {
     local mnt_path
     mnt_path="${1}"
-    local size
-    size="${2}"
-
-    if [ -z "${size}" ] || [ "0" = "${size}" ]; then
-        debug "create_swapfile: disabled"
-        return 0
-    fi
-
-    local swapfile
-    swapfile="${mnt_path}/swapfile"
-
-    rm -f "${swapfile}"
-    if ! fallocate -l "${size}" "${swapfile}"; then
-        error "$(printf "create_swapfile: fallocate %s failed\n" "${size}")"
-        return 1
-    fi
-    chmod 0600 "${swapfile}"
-    mkswap -q "${swapfile}"
-
     local path
     path="${mnt_path}/etc/systemd/system"
-cat <<EOF > "${path}/swapfile.swap"
+
+    cat <<EOF >"${path}/swapfile.swap"
 [Unit]
 Description=Swapfile on the root filesystem
+ConditionPathExists=/swapfile
 
 [Swap]
 What=/swapfile
@@ -647,6 +636,92 @@ WantedBy=swap.target
 EOF
     mkdir -p "${path}/swap.target.wants"
     ln -s -f "${path}/swapfile.swap" "${path}/swap.target.wants/swapfile.swap"
+}
+
+# systemd only, OpenRC and BSD images never come here. Empty machine-id and
+# no hostname make systemd treat the next boot as first boot: firstboot
+# applies the firstboot.* credentials from the command line, PID 1 commits
+# a machine-id, ConditionFirstBoot units run once. Ours grows root to the
+# medium and creates the swapfile at the credential's size. To rerun on an
+# installed device add systemd.condition-first-boot=yes to the boot entry
+provision_systemd_firstboot() {
+    local mnt_path
+    mnt_path="${1}"
+    local path
+    path="${mnt_path}/etc/systemd/system"
+
+    : >"${mnt_path}/etc/machine-id"
+    rm -f "${mnt_path}/etc/hostname"
+
+    mkdir -p "${mnt_path}/usr/local/sbin"
+    cat <<'EOF' >"${mnt_path}/usr/local/sbin/firstboot-provision"
+#!/bin/sh
+# Runs once from firstboot-provision.service, credentials arrive in
+# $CREDENTIALS_DIRECTORY via ImportCredential=firstboot.*
+set -eu
+
+cred() {
+    if [ -n "${CREDENTIALS_DIRECTORY:-}" ] && [ -r "${CREDENTIALS_DIRECTORY}/${1}" ]; then
+        cat "${CREDENTIALS_DIRECTORY}/${1}"
+    else
+        printf '%s' "${2}"
+    fi
+}
+
+# Grow root to the end of the disk, only when it is the last partition
+root_src="$(findmnt -no SOURCE /)"
+root_part="${root_src##*/}"
+if [ -r "/sys/class/block/${root_part}/partition" ]; then
+    partno="$(cat "/sys/class/block/${root_part}/partition")"
+    disk="/dev/$(basename "$(readlink -f "/sys/class/block/${root_part}/..")")"
+    last="$(lsblk -nro PARTN "${disk}" | sort -n | tail -1)"
+    if [ "${partno}" = "${last}" ]; then
+        printf ', +
+' | sfdisk --no-reread --force -N "${partno}" "${disk}" >/dev/null 2>&1 || true
+        partx -u "${disk}" >/dev/null 2>&1 || true
+        case "$(findmnt -no FSTYPE /)" in
+        xfs)  xfs_growfs / >/dev/null 2>&1 || true ;;
+        ext4) resize2fs "${root_src}" >/dev/null 2>&1 || true ;;
+        esac
+    fi
+fi
+
+# 0 disables
+size="$(cred firstboot.swapfile-size 4G)"
+if [ "${size}" != "0" ] && [ ! -e /swapfile ]; then
+    if fallocate -l "${size}" /swapfile; then
+        chmod 0600 /swapfile
+        mkswap -q /swapfile
+        systemctl start swapfile.swap >/dev/null 2>&1 || true
+    else
+        rm -f /swapfile
+    fi
+fi
+EOF
+    chmod 0755 "${mnt_path}/usr/local/sbin/firstboot-provision"
+
+cat <<EOF > "${path}/firstboot-provision.service"
+[Unit]
+Description=First-boot provisioning: grow root, create swapfile
+ConditionFirstBoot=yes
+DefaultDependencies=no
+After=systemd-remount-fs.service
+Before=sysinit.target first-boot-complete.target
+Wants=first-boot-complete.target
+
+[Service]
+Type=oneshot
+ImportCredential=firstboot.*
+ExecStart=/usr/local/sbin/firstboot-provision
+
+[Install]
+WantedBy=sysinit.target
+EOF
+    mkdir -p "${path}/sysinit.target.wants"
+    ln -s -f "${path}/firstboot-provision.service" \
+        "${path}/sysinit.target.wants/firstboot-provision.service"
+
+    write_swapfile_unit "${mnt_path}"
 }
 
 wifi_enable() {
@@ -1557,7 +1632,7 @@ composition_load() {
                         "${kernel_file}" \
                         "" \
                         "" \
-                        "$(linux_cmdline_default "${target_arch}" "${build_target}")" \
+                        "$(linux_cmdline_default "${target_arch}" "${build_target}") $(linux_cmdline_firstboot "${build_target}")" \
                         "linux"
         ;;
     containeros-virt)
@@ -1581,7 +1656,7 @@ composition_load() {
                         "${kernel_file}" \
                         "" \
                         "" \
-                        "$(linux_cmdline_default "${target_arch}" "${build_target}")" \
+                        "$(linux_cmdline_default "${target_arch}" "${build_target}") $(linux_cmdline_firstboot "${build_target}")" \
                         "linux"
 
         composition_add "nomadbsd" \
@@ -3789,10 +3864,8 @@ gentoo_install_stage4_binpkgs() {
     cp -r gentoo-config/sets "${mnt_path}/etc/portage/sets"
     cp -r gentoo-config/env "${mnt_path}/etc/portage/env"
 
-    # Cortex-A53 errata 843419/835769 linker workarounds, arm64 only: the
-    # boards these images boot on have r0p4 cores. Mirrors the arch case in
-    # gentoo-build/emerge.sh so the chroot merge below links the same way the
-    # stage4 did. Details in gentoo-config/env/cortex-a53-errata
+    # Cortex-A53 errata linker workarounds, arm64 only, mirrors the arch
+    # case in gentoo-build/emerge.sh. See gentoo-config/env/cortex-a53-errata
     case "${target_arch}" in
     arm64 | aarch64)
         mkdir -p "${mnt_path}/etc/portage/package.env"
@@ -4092,11 +4165,16 @@ provision() {
     info "Enabling sshd"
     service_enable "${mnt_path}" "sshd" "getty"
 
-    info "$(printf "Creating swapfile (%s)\n" "${swapfile_size:-0}")"
-    create_swapfile "${mnt_path}" "${swapfile_size}"
+    # Anything without systemd keeps the provisioning above and gets no
+    # swapfile, activation would need init-specific plumbing
+    if [ -x "${mnt_path}/usr/lib/systemd/systemd" ]; then
+        info "systemd rootfs: installing first-boot provisioning"
+        provision_systemd_firstboot "${mnt_path}"
+    else
+        debug "no systemd in rootfs: skipping first-boot provisioning and swapfile"
+    fi
 
-    # Portage nags about unread news on every emerge; mark it read so the
-    # first interactive emerge on the board starts clean
+    # So the first emerge on the board does not nag about unread news
     chroot "${mnt_path}" eselect news read --quiet all >/dev/null 2>&1 || true
 
     info "Installing 9p automount"
@@ -4523,11 +4601,13 @@ qemu_accel_for_arch() {
     host_arch="$(sys_arch)"
 
     case "${target_arch}" in
-    x86_64)  target_arch="amd64" ;;
+    x86_64) target_arch="amd64" ;;
     aarch64) target_arch="arm64" ;;
     esac
 
-    if [ "${target_arch}" = "${host_arch}" ]; then
+    # GitHub runners have no usable /dev/kvm and qemu aborts rather than
+    # falling back, which failed every boot test in the 2026-09-13 run
+    if [ "${target_arch}" = "${host_arch}" ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
         echo "kvm"
     else
         echo "tcg"
@@ -5130,16 +5210,10 @@ main() {
     local net_mode
     net_mode="${NET_MODE:-"gokrazy-dhcp"}"
 
-    # The image's unprivileged desktop user. sway runs as this user via
-    # sway-tty1.service, and its home receives the payload files. Named
-    # IMAGE_USER rather than USER because USER is the shell's own login
-    # variable and reads root under the sudo this script re-execs with
+    # Not USER, that is the shell's login name and reads root under the
+    # sudo re-exec
     local user
     user="${IMAGE_USER:-moonshine}"
-
-    # Swapfile on the rootfs, a fallocate size; 0 disables
-    local swapfile_size
-    swapfile_size="${SWAPFILE_SIZE:-4G}"
 
     local ansible_user
     local ansible_roles
