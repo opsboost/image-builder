@@ -425,7 +425,7 @@ create_user() {
     fi
 
     local os
-    os="$(grep '^ID=' "${path}/etc/os-release" 2>/dev/null | cut -d= -f2 | tr -d '"')"
+    os="$(awk -F= '$1 == "ID" { gsub(/["\x27]/, "", $2); print $2 }' "${path}/etc/os-release" 2>/dev/null)"
 
     local cmd
     case "${os}" in
@@ -575,6 +575,13 @@ write_mpv_config() {
 # See image-builder write_mpv_config
 hwdec=v4l2request
 vo=dmabuf-wayland
+
+# On a VT: mpv --profile=vt <url>
+# Decoder buffers go straight to the display engine's video plane, no GPU
+[vt]
+vo=gpu
+gpu-context=drm
+gpu-hwdec-interop=v4l2request-overlay
 EOF
 }
 
