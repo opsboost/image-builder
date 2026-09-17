@@ -154,19 +154,23 @@ linux_cmdline_default() {
            "$(linux_cmdline_console "${1}" "${2:-}")"
 }
 
-linux_cmdline_firstboot() {
+# Board name, or the target when the target has no board, IMAGE_HOSTNAME
+# overrides. Written to /etc/hostname at build time, the firstboot.hostname
+# credential only exists from systemd 261
+image_hostname() {
     local build_target
     build_target="${1}"
 
     local hostname
     hostname="${IMAGE_HOSTNAME:-$(target_board "${build_target}")}"
-    hostname="${hostname:-${build_target}}"
+    printf '%s' "${hostname:-${build_target}}"
+}
 
+# Only the swapfile size travels as a credential, our own unit reads it.
+# systemd-firstboot leaves locale, keymap and timezone alone when the files
+# exist, and the stage4 ships all three, so those are written at build time
+linux_cmdline_firstboot() {
     printf 'systemd.firstboot=off'
-    printf ' systemd.set_credential=firstboot.hostname:%s' "${hostname}"
-    printf ' systemd.set_credential=firstboot.timezone:%s' "${IMAGE_TIMEZONE:-UTC}"
-    printf ' systemd.set_credential=firstboot.locale:%s' "${IMAGE_LOCALE:-C.UTF-8}"
-    printf ' systemd.set_credential=firstboot.keymap:%s' "${IMAGE_KEYMAP:-us}"
     printf ' systemd.set_credential=firstboot.swapfile-size:%s' "${SWAPFILE_SIZE:-4G}"
 }
 
@@ -326,6 +330,23 @@ add_files() {
     fi
 }
 
+chown_home() {
+    local mnt_path
+    mnt_path="${1}"
+    local user
+    user="${2}"
+
+    [ -n "${user}" ] || return 0
+    local home
+    home="${mnt_path}/home/${user}"
+    [ -d "${home}" ] || return 0
+
+    local uid
+    uid="$(chroot_user_id "${mnt_path}" "${user}")"
+    [ -n "${uid}" ] || return 0
+    chown -R "${uid}:${uid}" "${home}"
+}
+
 # Download if checksum differs
 # from the one supplied by URL
 download_miss() {
@@ -455,7 +476,7 @@ chroot_user_id() {
     user="${2}"
 
     local uid
-    uid="$(awk -F':' '{/'"${user}"'/ print $3 }' "${path}"/etc/passwd)"
+    uid="$(awk -F':' -v u="${user}" '$1 == u { print $3 }' "${path}"/etc/passwd)"
     echo "${uid}"
 }
 
@@ -623,6 +644,57 @@ enable_pipewire_user_units() {
     fi
 }
 
+# The wireplumber.conf Gentoo installs has hardware.audio and
+# hardware.bluetooth commented out in the main profile, so its ALSA and
+# bluez monitors never load and no sink appears - only the camera monitors
+# run. Upstream ships these required. Re-enable them with an /etc override,
+# which wireplumber merges over the shipped file
+enable_wireplumber_audio() {
+    local mnt_path
+    mnt_path="${1}"
+
+    [ -d "${mnt_path}/usr/share/wireplumber" ] || return 0
+
+    local dir
+    dir="${mnt_path}/etc/wireplumber/wireplumber.conf.d"
+    mkdir -p "${dir}"
+    cat <<'EOF' >"${dir}/50-enable-audio.conf"
+# Gentoo's shipped wireplumber.conf comments these out in the main profile
+wireplumber.profiles = {
+  main = {
+    hardware.audio = required
+    hardware.bluetooth = required
+  }
+}
+EOF
+}
+
+enable_airplay_sinks() {
+    local mnt_path
+    mnt_path="${1}"
+    local system
+    system="${mnt_path}/etc/systemd/system"
+
+    if [ -f "${mnt_path}/usr/lib/systemd/system/avahi-daemon.service" ]; then
+        mkdir -p "${system}/multi-user.target.wants" "${system}/sockets.target.wants"
+        ln -s -f /usr/lib/systemd/system/avahi-daemon.service \
+            "${system}/multi-user.target.wants/avahi-daemon.service"
+        ln -s -f /usr/lib/systemd/system/avahi-daemon.socket \
+            "${system}/sockets.target.wants/avahi-daemon.socket"
+    fi
+
+    if [ -f "${mnt_path}/usr/lib/systemd/user/pipewire.socket" ]; then
+        mkdir -p "${mnt_path}/etc/pipewire/pipewire.conf.d"
+        cat <<'RAOPEOF' >"${mnt_path}/etc/pipewire/pipewire.conf.d/raop-discover.conf"
+# AirPlay receivers found through avahi become sinks, needs pipewire built
+# with zeroconf and ssl
+context.modules = [
+    { name = libpipewire-module-raop-discover }
+]
+RAOPEOF
+    fi
+}
+
 # The file is created on first boot, see provision_systemd_firstboot
 write_swapfile_unit() {
     local mnt_path
@@ -645,20 +717,31 @@ EOF
     ln -s -f "${path}/swapfile.swap" "${path}/swap.target.wants/swapfile.swap"
 }
 
-# systemd only, OpenRC and BSD images never come here. Empty machine-id and
-# no hostname make systemd treat the next boot as first boot: firstboot
-# applies the firstboot.* credentials from the command line, PID 1 commits
-# a machine-id, ConditionFirstBoot units run once. Ours grows root to the
+# systemd only, OpenRC and BSD images never come here. A machine-id reading
+# uninitialized makes systemd treat the next boot as first boot, an empty
+# machine-id does not since systemd 247: firstboot applies the firstboot.*
+# credentials from the command line, PID 1 commits a machine-id,
+# ConditionFirstBoot units run once. Ours grows root to the
 # medium and creates the swapfile at the credential's size. To rerun on an
-# installed device add systemd.condition-first-boot=yes to the boot entry
+# installed device add systemd.condition_first_boot=yes to the boot entry
 provision_systemd_firstboot() {
     local mnt_path
     mnt_path="${1}"
     local path
     path="${mnt_path}/etc/systemd/system"
 
-    : >"${mnt_path}/etc/machine-id"
-    rm -f "${mnt_path}/etc/hostname"
+    printf 'uninitialized\n' >"${mnt_path}/etc/machine-id"
+    printf '%s\n' "$(image_hostname "${build_target}")" >"${mnt_path}/etc/hostname"
+    printf 'LANG=%s\n' "${IMAGE_LOCALE:-C.UTF-8}" >"${mnt_path}/etc/locale.conf"
+    printf 'KEYMAP=%s\n' "${IMAGE_KEYMAP:-us}" >"${mnt_path}/etc/vconsole.conf"
+
+    local timezone
+    timezone="${IMAGE_TIMEZONE:-UTC}"
+    if [ ! -e "${mnt_path}/usr/share/zoneinfo/${timezone}" ]; then
+        error "$(printf "provision_systemd_firstboot: unknown timezone %s\n" "${timezone}")"
+        exit 1
+    fi
+    ln -s -f "../usr/share/zoneinfo/${timezone}" "${mnt_path}/etc/localtime"
 
     mkdir -p "${mnt_path}/usr/local/sbin"
     cat <<'EOF' >"${mnt_path}/usr/local/sbin/firstboot-provision"
@@ -675,21 +758,20 @@ cred() {
     fi
 }
 
-# Grow root to the end of the disk, only when it is the last partition
+# Grow root to the end of the disk, only when it is the last partition.
+# sysfs only, udev has not necessarily settled this early
 root_src="$(findmnt -no SOURCE /)"
 root_part="${root_src##*/}"
 if [ -r "/sys/class/block/${root_part}/partition" ]; then
     partno="$(cat "/sys/class/block/${root_part}/partition")"
-    disk="/dev/$(basename "$(readlink -f "/sys/class/block/${root_part}/..")")"
-    last="$(lsblk -nro PARTN "${disk}" | sort -n | tail -1)"
+    disk_name="$(basename "$(readlink -f "/sys/class/block/${root_part}/..")")"
+    last="$(cat /sys/class/block/"${disk_name}"*/partition | sort -n | tail -1)"
     if [ "${partno}" = "${last}" ]; then
-        printf ', +
-' | sfdisk --no-reread --force -N "${partno}" "${disk}" >/dev/null 2>&1 || true
-        partx -u "${disk}" >/dev/null 2>&1 || true
-        case "$(findmnt -no FSTYPE /)" in
-        xfs)  xfs_growfs / >/dev/null 2>&1 || true ;;
-        ext4) resize2fs "${root_src}" >/dev/null 2>&1 || true ;;
-        esac
+        # sfdisk moves the backup GPT header to the end of the medium itself
+        printf ', +\n' | sfdisk --no-reread --force -N "${partno}" "/dev/${disk_name}" >/dev/null || true
+        partx -u "/dev/${disk_name}" || true
+        # Grows xfs, ext4 and btrfs through kernel ioctls, no fs tools needed
+        /usr/lib/systemd/systemd-growfs / || true
     fi
 fi
 
@@ -699,7 +781,7 @@ if [ "${size}" != "0" ] && [ ! -e /swapfile ]; then
     if fallocate -l "${size}" /swapfile; then
         chmod 0600 /swapfile
         mkswap -q /swapfile
-        systemctl start swapfile.swap >/dev/null 2>&1 || true
+        systemctl start swapfile.swap || true
     else
         rm -f /swapfile
     fi
@@ -1164,6 +1246,8 @@ create_boot_entry() {
     root_spec="${6}"
     local cmdline
     cmdline="${7}"
+    local dtb
+    dtb="${8:-}"
 
     local entry_dir
     entry_dir="$(dirname -- "${entry_file}")"
@@ -1186,6 +1270,9 @@ create_boot_entry() {
             printf "linux         /%s\n" "${kernel}"
             if [ -n "${initrd}" ]; then
                 printf "initrd        /%s\n" "${initrd}"
+            fi
+            if [ -n "${dtb}" ]; then
+                printf "devicetree    /%s\n" "${dtb}"
             fi
             ;;
         efi)
@@ -1471,6 +1558,8 @@ comp_size=()
 comp_part=()
 comp_kernel_src=()
 comp_kernel=()
+comp_dtb_src=()
+comp_dtb=()
 comp_initrd_src=()
 comp_initrd=()
 comp_cmdline=()
@@ -1495,6 +1584,8 @@ composition_reset() {
     comp_part=()
     comp_kernel_src=()
     comp_kernel=()
+    comp_dtb_src=()
+    comp_dtb=()
     comp_initrd_src=()
     comp_initrd=()
     comp_cmdline=()
@@ -1506,6 +1597,7 @@ composition_reset() {
 
 # composition_add NAME PROVIDER PROVIDER_ARG FS SIZE_MIB KERNEL_SRC \
 #                 KERNEL INITRD_SRC INITRD CMDLINE BOOT_TYPE
+# composition_set_dtb below adds a device tree to the slot added last
 #
 # FS 'none' gives the slot no partition, for a system that runs
 # entirely from its initramfs. SIZE_MIB 'rest' extends the partition to
@@ -1523,6 +1615,18 @@ composition_add() {
     comp_cmdline+=("${10}")
     comp_boot_type+=("${11}")
     comp_part+=(0)
+    comp_dtb_src+=("")
+    comp_dtb+=("")
+}
+
+# composition_set_dtb DTB_SRC DTB gives the slot added last a device tree
+# from the kernel release, installed on the ESP and named in the boot entry.
+# Boards only, the kernel's own dtb replaces the one U-Boot would pass
+composition_set_dtb() {
+    local i
+    i=$((${#comp_name[@]} - 1))
+    comp_dtb_src[i]="${1}"
+    comp_dtb[i]="${2}"
 }
 
 comp_count() {
@@ -1611,12 +1715,16 @@ composition_load() {
         # and each board needs its own DRM and display drivers. The rootfs
         # carries lima and panfrost together (see package.use.hwaccel), so one
         # sway rootfs serves both boards
+        local dtb_file
+        dtb_file=""
         case "${build_target}" in
         gentoo-sway-pine64)
             kernel_file="Image-pine64"
+            dtb_file="dtb-pine64"
             ;;
         gentoo-sway-rockpro64)
             kernel_file="Image-rockpro64"
+            dtb_file="dtb-rockpro64"
             ;;
         *)
             kernel_file="$(kernel_file_for_arch "${target_arch}")"
@@ -1639,8 +1747,11 @@ composition_load() {
                         "${kernel_file}" \
                         "" \
                         "" \
-                        "$(linux_cmdline_default "${target_arch}" "${build_target}") $(linux_cmdline_firstboot "${build_target}")" \
+                        "$(linux_cmdline_default "${target_arch}" "${build_target}") $(linux_cmdline_firstboot)" \
                         "linux"
+        if [ -n "${dtb_file}" ]; then
+            composition_set_dtb "${dtb_file}-latest" "${dtb_file}"
+        fi
         ;;
     containeros-virt)
         # One of its slots is NomadBSD, so the whole target is limited to
@@ -1663,7 +1774,7 @@ composition_load() {
                         "${kernel_file}" \
                         "" \
                         "" \
-                        "$(linux_cmdline_default "${target_arch}" "${build_target}") $(linux_cmdline_firstboot "${build_target}")" \
+                        "$(linux_cmdline_default "${target_arch}" "${build_target}") $(linux_cmdline_firstboot)" \
                         "linux"
 
         composition_add "nomadbsd" \
@@ -1750,6 +1861,13 @@ composition_fetch() {
                           "${kernel_repo_url}/${comp_kernel_src[$i]}" \
                           "${kernel_repo_url}/${comp_kernel_src[$i]}.sha384" \
                           "${comp_kernel_src[$i]}.sha384"
+            if [ -n "${comp_dtb_src[$i]}" ]; then
+                info "Fetching device tree"
+                download_miss "${download_path}" \
+                              "${kernel_repo_url}/${comp_dtb_src[$i]}" \
+                              "${kernel_repo_url}/${comp_dtb_src[$i]}.sha384" \
+                              "${comp_dtb_src[$i]}.sha384"
+            fi
 
             gentoo_fetch_stage3 "${target_arch}"
             gentoo_fetch_stage4 "${comp_provider_arg[$i]}" "${target_arch}" "latest"
@@ -2594,6 +2712,8 @@ install_kernels() {
                          "${mnt_path}" "${comp_kernel[$i]}"
         esp_install_file "${src_path}" "${comp_initrd_src[$i]}" \
                          "${mnt_path}" "${comp_initrd[$i]}"
+        esp_install_file "${src_path}" "${comp_dtb_src[$i]}" \
+                         "${mnt_path}" "${comp_dtb[$i]}"
     done
 
     printf "\n"
@@ -2655,7 +2775,8 @@ install_boot_entries() {
                           "${comp_kernel[$i]}" \
                           "${comp_initrd[$i]}" \
                           "${root_spec}" \
-                          "${comp_cmdline[$i]}"
+                          "${comp_cmdline[$i]}" \
+                          "${comp_dtb[$i]}"
 
         if [ -z "${default_entry}" ]; then
             default_entry="${entry_id}"
@@ -4158,6 +4279,9 @@ provision() {
     info "Installing fonts"
     install_fonts "${mnt_path}/home/${user}/.local/share/fonts"
 
+    info "Fixing home ownership"
+    chown_home "${mnt_path}" "${user}"
+
     info "Configuring Sway"
     sway_configure_background
     sway_configure_terminal
@@ -4168,6 +4292,8 @@ provision() {
 
     info "Enabling pipewire user units"
     enable_pipewire_user_units "${mnt_path}"
+    enable_wireplumber_audio "${mnt_path}"
+    enable_airplay_sinks "${mnt_path}"
 
     info "Enabling sshd"
     service_enable "${mnt_path}" "sshd" "getty"
