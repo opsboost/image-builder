@@ -115,15 +115,15 @@ linux_cmdline_console() {
     build_target="${2:-}"
 
     case "${build_target}" in
-    gentoo-sway-pine64|gentoo-sway-rockpro64)
+    gentoo-sway-pine64 | gentoo-sway-rockpro64)
         echo "console=tty0 console=ttyS0,115200n8"
         return
         ;;
     esac
 
     case "${arch}" in
-    arm64|aarch64) echo "console=tty0 console=ttyAMA0,115200n8" ;;
-    *)             echo "console=tty0 console=ttyS0,115200n8" ;;
+    arm64 | aarch64) echo "console=tty0 console=ttyAMA0,115200n8" ;;
+    *) echo "console=tty0 console=ttyS0,115200n8" ;;
     esac
 }
 
@@ -135,7 +135,7 @@ net_mode_for_target() {
     build_target="${2}"
 
     case "${build_target}" in
-    gentoo-sway-pine64|gentoo-sway-rockpro64)
+    gentoo-sway-pine64 | gentoo-sway-rockpro64)
         echo "systemd-networkd-dhcp"
         return
         ;;
@@ -151,7 +151,7 @@ net_mode_for_target() {
 # (ENODEV)
 linux_cmdline_default() {
     printf "rw rootwait init=/lib/systemd/systemd enforcing=1 %s" \
-           "$(linux_cmdline_console "${1}" "${2:-}")"
+        "$(linux_cmdline_console "${1}" "${2:-}")"
 }
 
 # Board name, or the target when the target has no board, IMAGE_HOSTNAME
@@ -264,7 +264,7 @@ compare_checksums() {
         csum_2=$(sha384sum "${2}")
         csum_2=${csum_2:0:64}
         ;;
-    Darwin|FreeBSD)
+    Darwin | FreeBSD)
         csum_2=$(sha384 "${2}")
         ;;
     esac
@@ -315,8 +315,8 @@ mount_disk_image_part_by_no() {
     else
         error "$(printf "Failed to mount %s (%s) at %s \
                          Aborting..\n" "${dev}" \
-                                       "${fs_type}" \
-                                       "${mnt_path}")"
+            "${fs_type}" \
+            "${mnt_path}")"
         # Remove disk
         loop_unmount ""
         exit 1
@@ -374,7 +374,7 @@ download_miss() {
     local ret
     if [ -f "${download_path}/${file_name}" ]; then
         ret=$(compare_checksums "${download_path}/${csum_file}" \
-                                "${download_path}/${file_name}")
+            "${download_path}/${file_name}")
 
         if [ "$ret" != "0" ]; then
             info "$(printf "Remote and local images differ\n")"
@@ -388,7 +388,7 @@ download_miss() {
         download "${file}" "${download_path}" "${DOWNLOAD_RETRIES}"
 
         ret=$(compare_checksums "${download_path}/${csum_file}" \
-                                "${download_path}/${file_name}")
+            "${download_path}/${file_name}")
         if [ "$ret" != "0" ]; then
             error "$(printf "Checksum mismatch after download: %s\n" "${file_name}")"
             exit 1
@@ -423,7 +423,7 @@ download() {
                 sleep 2
             fi
         fi
-        attempt=$((attempt+1))
+        attempt=$((attempt + 1))
     done
 
     if [ "${success}" -ne 1 ]; then
@@ -510,7 +510,7 @@ ssh_add_pubkey() {
     uid="${4}"
 
     mkdir -p "${path}"/.ssh/
-    printf "%s" "${key}" > "${path}/.ssh/authorized_keys"
+    printf "%s" "${key}" >"${path}/.ssh/authorized_keys"
     chmod 0700 "${path}"/.ssh
     chmod 0600 "${path}"/.ssh/authorized_keys
 
@@ -777,6 +777,8 @@ EOF
 provision_systemd_firstboot() {
     local mnt_path
     mnt_path="${1}"
+    local user
+    user="${2}"
     local path
     path="${mnt_path}/etc/systemd/system"
 
@@ -836,12 +838,31 @@ if [ "${size}" != "0" ] && [ ! -e /swapfile ]; then
         rm -f /swapfile
     fi
 fi
+
+# Per-device local root key: the image user gets passwordless ssh to
+# root@localhost. Generated here, not at build, so no key is shared across
+# devices. The authorized_keys entry is pinned to loopback, so even a leaked
+# private key cannot be used to reach root from another host
+user="${1:-}"
+if [ -n "${user}" ] && [ -d "/home/${user}" ]; then
+    key="/home/${user}/.ssh/id_local_root"
+    if [ ! -e "${key}" ]; then
+        install -d -m 0700 -o "${user}" -g "${user}" "/home/${user}/.ssh"
+        ssh-keygen -t ed25519 -N "" -C "local-root@${user}" -f "${key}" >/dev/null
+        chown "${user}:${user}" "${key}" "${key}.pub"
+        chmod 0600 "${key}"
+        install -d -m 0700 /root/.ssh
+        printf 'from="127.0.0.1,::1" %s\n' "$(cat "${key}.pub")" \
+            >>/root/.ssh/authorized_keys
+        chmod 0600 /root/.ssh/authorized_keys
+    fi
+fi
 EOF
     chmod 0755 "${mnt_path}/usr/local/sbin/firstboot-provision"
 
-cat <<EOF > "${path}/firstboot-provision.service"
+    cat <<EOF >"${path}/firstboot-provision.service"
 [Unit]
-Description=First-boot provisioning: grow root, create swapfile
+Description=First-boot provisioning: grow root, swapfile, local root key
 ConditionFirstBoot=yes
 DefaultDependencies=no
 After=systemd-remount-fs.service
@@ -851,7 +872,7 @@ Wants=first-boot-complete.target
 [Service]
 Type=oneshot
 ImportCredential=firstboot.*
-ExecStart=/usr/local/sbin/firstboot-provision
+ExecStart=/usr/local/sbin/firstboot-provision "${user}"
 
 [Install]
 WantedBy=sysinit.target
@@ -863,16 +884,99 @@ EOF
     write_swapfile_unit "${mnt_path}"
 }
 
+write_provision_key_fetch() {
+    local mnt_path
+    mnt_path="${1}"
+    local user
+    user="${2}"
+    local path
+    path="${mnt_path}/etc/systemd/system"
+
+    [ -n "${user}" ] || return 0
+
+    cat <<'EOF' >"${mnt_path}/usr/local/sbin/fetch-provision-keys"
+#!/bin/sh
+# Install this device's authorised ssh keys from the provisioning server (the
+# default gateway's uhttpd). Runs once on first boot after the network is up.
+# Reports every outcome to the journal and console. Skips quietly when not
+# applicable; exits non-zero (visibly failed unit) when it should have
+# provisioned but could not, without blocking boot
+warn() { echo "provision-keys: $*" >&2; }
+
+user="${1:-}"
+[ -n "${user}" ] && [ -d "/home/${user}" ] || {
+    warn "no image user home, nothing to provision"
+    exit 0
+}
+
+command -v curl >/dev/null 2>&1 || {
+    warn "curl not installed, cannot fetch keys"
+    exit 1
+}
+
+gw="$(ip route show default 2>/dev/null | awk '/^default/ {print $3; exit}')"
+[ -n "${gw}" ] || {
+    warn "no default gateway, cannot reach provisioning server"
+    exit 1
+}
+
+url="http://${gw}/cgi-bin/provision"
+tmp="$(mktemp)" || exit 1
+
+if ! curl -fsS --max-time 10 -o "${tmp}" "${url}"; then
+    warn "could not reach ${url}"
+    rm -f "${tmp}"
+    exit 1
+fi
+
+if [ ! -s "${tmp}" ]; then
+    warn "no keys returned by ${url}"
+    rm -f "${tmp}"
+    exit 1
+fi
+
+ssh_dir="/home/${user}/.ssh"
+ak="${ssh_dir}/authorized_keys"
+install -d -m 0700 -o "${user}" -g "${user}" "${ssh_dir}"
+cat "${tmp}" >>"${ak}"
+sort -u -o "${ak}" "${ak}"
+chown "${user}:${user}" "${ak}"
+chmod 0600 "${ak}"
+rm -f "${tmp}"
+echo "provision-keys: installed keys from ${url} for ${user}"
+exit 0
+EOF
+    chmod 0755 "${mnt_path}/usr/local/sbin/fetch-provision-keys"
+
+    cat <<EOF >"${path}/fetch-provision-keys.service"
+[Unit]
+Description=First-boot fetch of authorised ssh keys from the provisioning server
+ConditionFirstBoot=yes
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/fetch-provision-keys "${user}"
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    mkdir -p "${path}/multi-user.target.wants"
+    ln -s -f "${path}/fetch-provision-keys.service" \
+        "${path}/multi-user.target.wants/fetch-provision-keys.service"
+}
+
 wifi_enable() {
     # Remove symlink (Alpine)
     if [ -f "${mnt_path}/etc/network/interfaces" ]; then
         rm "${mnt_path}/etc/network/interfaces"
-        printf "\nauto wlan0\niface wlan0 inet dhcp" > "${mnt_path}/etc/network/interfaces"
+        printf "\nauto wlan0\niface wlan0 inet dhcp" >"${mnt_path}/etc/network/interfaces"
 
         # We need to fix service ordering, wpa_supplicant starts
         # before the device exists and exits otherwise (Alpine with OpenRC)
-        printf "\nrc_need=\"modules\"" >> "${mnt_path}/etc/conf.d/wpa_supplicant"
-        printf "\nrc_need=\"wpa_supplicant\"" >> "${mnt_path}/etc/conf.d/udhcpd"
+        printf "\nrc_need=\"modules\"" >>"${mnt_path}/etc/conf.d/wpa_supplicant"
+        printf "\nrc_need=\"wpa_supplicant\"" >>"${mnt_path}/etc/conf.d/udhcpd"
     fi
 }
 
@@ -884,7 +988,7 @@ write_booted_script() {
     local path
     path="${mnt_path}/usr/local/bin"
 
-cat <<EOF > "${path}/booted"
+    cat <<EOF >"${path}/booted"
 #!/usr/bin/env python
 
 import os
@@ -931,7 +1035,7 @@ write_booted_service() {
     local path
     path="${mnt_path}/etc/systemd/system"
 
-cat <<EOF > "${path}/booted.service"
+    cat <<EOF >"${path}/booted.service"
 [Unit]
 Description=Signal readiness to host
 After=net-config.service
@@ -994,7 +1098,7 @@ write_net_config() {
 
         mkdir -p "${path}"
 
-cat <<EOF > "${path}/20-dhcp.network"
+        cat <<EOF >"${path}/20-dhcp.network"
 [Match]
 Name=en*
 
@@ -1014,7 +1118,7 @@ EOF
 
         mkdir -p "${path}"
 
-cat <<EOF > "${path}/20-static.network"
+        cat <<EOF >"${path}/20-static.network"
 [Match]
 Name=en*
 
@@ -1036,7 +1140,7 @@ EOF
         local path
         path="${mnt_path}/etc/systemd/system"
 
-cat <<EOF > "${path}/net-interface.path"
+        cat <<EOF >"${path}/net-interface.path"
 [Unit]
 Description=Monitor network interface
 
@@ -1048,7 +1152,7 @@ Unit=net-config.service
 WantedBy=getty.target
 EOF
 
-cat <<EOF > "${path}/net-config.service"
+        cat <<EOF >"${path}/net-config.service"
 [Unit]
 Description=Static Network Configuration
 
@@ -1082,7 +1186,7 @@ add_network_debug_print() {
     local path
     path="${mnt_path}/etc/systemd/system"
 
-cat <<'EOF' > "${path}/network-debug.service"
+    cat <<'EOF' >"${path}/network-debug.service"
 [Unit]
 Description=Print network interface state to the console
 After=network.target
@@ -1125,7 +1229,7 @@ add_dhcp_client() {
     local path
     path="${mnt_path}/etc/systemd/system"
 
-cat <<'EOF' > "${mnt_path}/usr/local/sbin/net-dhcp"
+    cat <<'EOF' >"${mnt_path}/usr/local/sbin/net-dhcp"
 #!/bin/sh
 iface="$(ls /sys/class/net | grep -v '^lo$' | head -1)"
 ip link set dev "${iface}" up
@@ -1133,7 +1237,7 @@ exec /usr/local/sbin/dhcp -interface="${iface}"
 EOF
     chmod 755 "${mnt_path}/usr/local/sbin/net-dhcp"
 
-cat <<EOF > "${path}/net-dhcp.service"
+    cat <<EOF >"${path}/net-dhcp.service"
 [Unit]
 Description=gokrazy DHCP client
 
@@ -1166,7 +1270,7 @@ virtio_9p_automount() {
     local path
     path="${mnt_path}/etc/systemd/system"
 
-cat <<'EOF' > "${mnt_path}/usr/local/sbin/9p-automount"
+    cat <<'EOF' >"${mnt_path}/usr/local/sbin/9p-automount"
 #!/bin/sh
 #
 # Mount every virtio-9p share the host exported, at the path its mount tag
@@ -1221,7 +1325,7 @@ exit "${status}"
 EOF
     chmod 755 "${mnt_path}/usr/local/sbin/9p-automount"
 
-cat <<'EOF' > "${path}/9p-automount.service"
+    cat <<'EOF' >"${path}/9p-automount.service"
 [Unit]
 Description=Mount virtio-9p shares exported by the host
 After=local-fs.target
@@ -1246,7 +1350,7 @@ write_wpa_supplicant_config() {
     local mnt_path
     mnt_path="${1}"
 
-    if [ -f wpa_supplicant.conf  ]; then
+    if [ -f wpa_supplicant.conf ]; then
         info "$(printf "Found wifi config, copying..\n")"
         cp wpa_supplicant.conf "${mnt_path}"/etc/wpa_supplicant/
         return
@@ -1260,7 +1364,7 @@ write_wpa_supplicant_config() {
     path="${mnt_path}/etc/wpa_supplicant"
     mkdir -p "${path}"
 
-cat <<EOF > "${path}/wpa_supplicant.conf"
+    cat <<EOF >"${path}/wpa_supplicant.conf"
 ap_scan=1
 autoscan=periodic:10
 disable_scan_offload=1
@@ -1364,7 +1468,7 @@ create_boot_entry() {
         if [ -n "${options}" ]; then
             printf "options       %s\n" "${options}"
         fi
-    } > "${entry_file}"
+    } >"${entry_file}"
 }
 
 # Verify a file against a checksum file, accepting both the BSD style
@@ -1384,7 +1488,7 @@ checksum_verify() {
 
     local expected
     expected="$(sed -n 's/.*=[[:space:]]*\([0-9a-fA-F][0-9a-fA-F]*\)[[:space:]]*$/\1/p' \
-                    "${csum_file}" | head -1)"
+        "${csum_file}" | head -1)"
     if [ -z "${expected}" ]; then
         expected="$(awk '{ print $1; exit }' "${csum_file}")"
     fi
@@ -1397,7 +1501,7 @@ checksum_verify() {
     Linux)
         actual="$("${algo}sum" "${file}" | awk '{ print $1 }')"
         ;;
-    Darwin|FreeBSD)
+    Darwin | FreeBSD)
         actual="$("${algo}" -q "${file}")"
         ;;
     *)
@@ -1448,11 +1552,11 @@ image_partition_range() {
 
         if [ -n "${line}" ]; then
             local start
-            start="$(printf "%s" "${line}" | \
-                     sed -n 's/.*start=[[:space:]]*\([0-9][0-9]*\).*/\1/p')"
+            start="$(printf "%s" "${line}" |
+                sed -n 's/.*start=[[:space:]]*\([0-9][0-9]*\).*/\1/p')"
             local size
-            size="$(printf "%s" "${line}" | \
-                    sed -n 's/.*size=[[:space:]]*\([0-9][0-9]*\).*/\1/p')"
+            size="$(printf "%s" "${line}" |
+                sed -n 's/.*size=[[:space:]]*\([0-9][0-9]*\).*/\1/p')"
 
             if [ -n "${start}" ] && [ -n "${size}" ]; then
                 printf "%s %s" "${start}" "${size}"
@@ -1490,7 +1594,7 @@ bsd_label_ufs_range() {
 
     # The label lives in the slice's second sector
     local label
-    label=$(( (slice_start + 1) * 512 ))
+    label=$(((slice_start + 1) * 512))
 
     # 2186691927 is 0x82564557, the disklabel magic
     if [ "2186691927" != "$(read_uint_le "${img}" "${label}" 4)" ]; then
@@ -1544,7 +1648,7 @@ image_ufs_range() {
     local nested
     if nested="$(bsd_label_ufs_range "${img}" "${slice_start}")"; then
         info "$(printf "Found a BSD disklabel in the slice at sector %s: using its UFS partition\n" \
-                       "${slice_start}")"
+            "${slice_start}")"
         printf "%s" "${nested}"
         return 0
     fi
@@ -1556,16 +1660,16 @@ image_ufs_range() {
 parted_fs_hint() {
     case "${1}" in
     vfat) echo "fat32" ;;
-    *)    echo "${1}" ;;
+    *) echo "${1}" ;;
     esac
 }
 
 # sgdisk type codes: FreeBSD UFS, Microsoft basic data, Linux filesystem
 gpt_type_code() {
     case "${1}" in
-    ufs)  echo "A503" ;;
+    ufs) echo "A503" ;;
     vfat) echo "0700" ;;
-    *)    echo "8300" ;;
+    *) echo "8300" ;;
     esac
 }
 
@@ -1604,10 +1708,10 @@ create_disk_parts_gpt() {
         fi
 
         parted -s "${file_disk}" mkpart "${comp_name[$i]}" \
-                                        "$(parted_fs_hint "${comp_fs[$i]}")" \
-                                        "${start}MiB" "${end}"
+            "$(parted_fs_hint "${comp_fs[$i]}")" \
+            "${start}MiB" "${end}"
         sgdisk -t "${comp_part[$i]}:$(gpt_type_code "${comp_fs[$i]}")" \
-               "${file_disk}" >/dev/null
+            "${file_disk}" >/dev/null
 
         if [ "rest" != "${comp_size[$i]}" ]; then
             start=$((start + comp_size[i]))
@@ -1723,7 +1827,7 @@ composition_finalize() {
             comp_part[$i]=0
         else
             comp_part[$i]="${n}"
-            n=$((n+1))
+            n=$((n + 1))
         fi
     done
 }
@@ -1751,20 +1855,20 @@ composition_disk_size_mib() {
 
 composition_show() {
     info "$(printf "Image composition (%s MiB, %s MiB esp):\n" \
-                   "$(composition_disk_size_mib)" "${comp_esp_size}")"
+        "$(composition_disk_size_mib)" "${comp_esp_size}")"
 
     local i
     for i in "${!comp_name[@]}"; do
         info "$(printf "  slot %s  %-20s provider=%-9s fs=%-5s part=%-2s size=%-6s kernel=%-22s initrd=%-26s boot=%s\n" \
-                       "${i}" \
-                       "${comp_name[$i]}" \
-                       "${comp_provider[$i]}" \
-                       "${comp_fs[$i]}" \
-                       "${comp_part[$i]}" \
-                       "${comp_size[$i]}" \
-                       "${comp_kernel[$i]:--}" \
-                       "${comp_initrd[$i]:--}" \
-                       "${comp_boot_type[$i]}")"
+            "${i}" \
+            "${comp_name[$i]}" \
+            "${comp_provider[$i]}" \
+            "${comp_fs[$i]}" \
+            "${comp_part[$i]}" \
+            "${comp_size[$i]}" \
+            "${comp_kernel[$i]:--}" \
+            "${comp_initrd[$i]:--}" \
+            "${comp_boot_type[$i]}")"
     done
 }
 
@@ -1781,7 +1885,7 @@ composition_load() {
     local kernel_src
 
     case "$build_target" in
-    gentoo-containeros|gentoo-sway|gentoo-sway-virt|gentoo-sway-pine64|gentoo-sway-rockpro64|gentoo-k3s)
+    gentoo-containeros | gentoo-sway | gentoo-sway-virt | gentoo-sway-pine64 | gentoo-sway-rockpro64 | gentoo-k3s)
         local target_flavour
         target_flavour=${build_target#*gentoo-}
         target_flavour=${target_flavour%-pine64}
@@ -1816,16 +1920,16 @@ composition_load() {
         comp_disk_size=16384
 
         composition_add "gentoo-${target_flavour}" \
-                        "gentoo" \
-                        "${target_flavour}" \
-                        "xfs" \
-                        "rest" \
-                        "${kernel_file}-latest" \
-                        "${kernel_file}" \
-                        "" \
-                        "" \
-                        "$(linux_cmdline_default "${target_arch}" "${build_target}") $(linux_cmdline_firstboot)" \
-                        "linux"
+            "gentoo" \
+            "${target_flavour}" \
+            "xfs" \
+            "rest" \
+            "${kernel_file}-latest" \
+            "${kernel_file}" \
+            "" \
+            "" \
+            "$(linux_cmdline_default "${target_arch}" "${build_target}") $(linux_cmdline_firstboot)" \
+            "linux"
         if [ -n "${dtb_file}" ]; then
             composition_set_dtb "${dtb_file}-latest" "${dtb_file}"
         fi
@@ -1843,42 +1947,42 @@ composition_load() {
         comp_esp_size=512
 
         composition_add "gentoo-containeros" \
-                        "gentoo" \
-                        "containeros" \
-                        "xfs" \
-                        "10240" \
-                        "${kernel_src}" \
-                        "${kernel_file}" \
-                        "" \
-                        "" \
-                        "$(linux_cmdline_default "${target_arch}" "${build_target}") $(linux_cmdline_firstboot)" \
-                        "linux"
+            "gentoo" \
+            "containeros" \
+            "xfs" \
+            "10240" \
+            "${kernel_src}" \
+            "${kernel_file}" \
+            "" \
+            "" \
+            "$(linux_cmdline_default "${target_arch}" "${build_target}") $(linux_cmdline_firstboot)" \
+            "linux"
 
         composition_add "nomadbsd" \
-                        "nomadbsd" \
-                        "${target_arch}" \
-                        "ufs" \
-                        "6144" \
-                        "${nomadbsd_loader_file}" \
-                        "EFI/nomadbsd/loader.efi" \
-                        "" \
-                        "" \
-                        "" \
-                        "efi"
+            "nomadbsd" \
+            "${target_arch}" \
+            "ufs" \
+            "6144" \
+            "${nomadbsd_loader_file}" \
+            "EFI/nomadbsd/loader.efi" \
+            "" \
+            "" \
+            "" \
+            "efi"
 
         # u-root runs from its initramfs alone, so it gets no partition
         # and boots the kernel the Gentoo slot already put on the ESP
         composition_add "u-root" \
-                        "u-root" \
-                        "${target_arch}" \
-                        "none" \
-                        "0" \
-                        "${kernel_src}" \
-                        "${kernel_file}" \
-                        "initramfs-${target_arch}.cpio" \
-                        "initramfs-${target_arch}.cpio" \
-                        "$(linux_cmdline_console "${target_arch}" "${build_target}")" \
-                        "linux"
+            "u-root" \
+            "${target_arch}" \
+            "none" \
+            "0" \
+            "${kernel_src}" \
+            "${kernel_file}" \
+            "initramfs-${target_arch}.cpio" \
+            "initramfs-${target_arch}.cpio" \
+            "$(linux_cmdline_console "${target_arch}" "${build_target}")" \
+            "linux"
         ;;
     nomadbsd)
         nomadbsd_require_arch "${target_arch}" "nomadbsd"
@@ -1886,35 +1990,35 @@ composition_load() {
         comp_esp_size=64
 
         composition_add "nomadbsd" \
-                        "nomadbsd" \
-                        "${target_arch}" \
-                        "ufs" \
-                        "6144" \
-                        "${nomadbsd_loader_file}" \
-                        "EFI/nomadbsd/loader.efi" \
-                        "" \
-                        "" \
-                        "" \
-                        "efi"
+            "nomadbsd" \
+            "${target_arch}" \
+            "ufs" \
+            "6144" \
+            "${nomadbsd_loader_file}" \
+            "EFI/nomadbsd/loader.efi" \
+            "" \
+            "" \
+            "" \
+            "efi"
         ;;
     *)
         # Keeps targets that partition a disk without describing one -
         # alma - on the layout they had before compositions existed
         info "$(printf "composition_load: No composition for '%s', using a single xfs rootfs\n" \
-                       "${build_target}")"
+            "${build_target}")"
         comp_disk_size=16384
 
         composition_add "${build_target}" \
-                        "none" \
-                        "" \
-                        "xfs" \
-                        "rest" \
-                        "" \
-                        "" \
-                        "" \
-                        "" \
-                        "" \
-                        "none"
+            "none" \
+            "" \
+            "xfs" \
+            "rest" \
+            "" \
+            "" \
+            "" \
+            "" \
+            "" \
+            "none"
         ;;
     esac
 
@@ -1935,9 +2039,9 @@ composition_fetch() {
         gentoo)
             info "Fetching kernel"
             download_miss "${download_path}" \
-                          "${kernel_repo_url}/${comp_kernel_src[$i]}" \
-                          "${kernel_repo_url}/${comp_kernel_src[$i]}.sha384" \
-                          "${comp_kernel_src[$i]}.sha384"
+                "${kernel_repo_url}/${comp_kernel_src[$i]}" \
+                "${kernel_repo_url}/${comp_kernel_src[$i]}.sha384" \
+                "${comp_kernel_src[$i]}.sha384"
             if [ -n "${comp_dtb_src[$i]}" ]; then
                 info "Fetching device tree"
                 # Optional: the kernel release only carries a dtb once
@@ -1971,13 +2075,13 @@ composition_fetch() {
         # a local build produced, before the disk is touched
         local initrd_src
         initrd_src="${comp_initrd_src[$i]}"
-        if [ -n "${initrd_src}" ] && \
-           [ ! -f "${initrd_src}" ] && \
-           [ ! -f "${download_path}/${initrd_src}" ]; then
+        if [ -n "${initrd_src}" ] &&
+            [ ! -f "${initrd_src}" ] &&
+            [ ! -f "${download_path}/${initrd_src}" ]; then
             error "$(printf "Missing initramfs for slot '%s': %s\n" \
-                            "${comp_name[$i]}" "${initrd_src}")"
+                "${comp_name[$i]}" "${initrd_src}")"
             error "$(printf "Build it first:\n\n  # image-builder build u-root %s\n" \
-                            "${target_arch}")"
+                "${target_arch}")"
             exit 1
         fi
     done
@@ -2037,7 +2141,7 @@ install_rootfs_slots() {
         dev="$(part_dev "${comp_part[$i]}")"
 
         info "$(printf "Installing rootfs for slot %s (%s) to %s\n" \
-                       "${i}" "${comp_name[$i]}" "${dev}")"
+            "${i}" "${comp_name[$i]}" "${dev}")"
 
         case "${comp_provider[$i]}" in
         gentoo)
@@ -2045,16 +2149,16 @@ install_rootfs_slots() {
             ;;
         nomadbsd)
             nomadbsd_install_rootfs "${dev}" \
-                                    "${src_path}" \
-                                    "${comp_provider_arg[$i]}"
+                "${src_path}" \
+                "${comp_provider_arg[$i]}"
             ;;
-        none|u-root)
+        none | u-root)
             info "$(printf "Slot %s installs no rootfs, leaving %s empty\n" \
-                           "${comp_name[$i]}" "${dev}")"
+                "${comp_name[$i]}" "${dev}")"
             ;;
         *)
             error "$(printf "install_rootfs_slots: Unknown rootfs provider: %s\n" \
-                            "${comp_provider[$i]}")"
+                "${comp_provider[$i]}")"
             exit 1
             ;;
         esac
@@ -2069,10 +2173,10 @@ nomadbsd_arch() {
     target_arch="${1}"
 
     case "${target_arch}" in
-    amd64|x86_64) echo "amd64" ;;
-    i386|x86)     echo "i386" ;;
-    mac)          echo "mac" ;;
-    *)            echo "" ;;
+    amd64 | x86_64) echo "amd64" ;;
+    i386 | x86) echo "i386" ;;
+    mac) echo "mac" ;;
+    *) echo "" ;;
     esac
 }
 
@@ -2105,8 +2209,8 @@ nomadbsd_image_file() {
     nomad_arch="${1}"
 
     printf "nomadbsd-%s.%s.%s.img" "${nomadbsd_version}" \
-                                   "${nomad_arch}" \
-                                   "${nomadbsd_filesystem}"
+        "${nomad_arch}" \
+        "${nomadbsd_filesystem}"
 }
 
 # Where the image to compose from lives. NOMADBSD_IMAGE overrides the
@@ -2124,7 +2228,7 @@ nomadbsd_image_path() {
     fi
 
     printf "%s/%s" "${src_path}" \
-                   "$(nomadbsd_image_file "$(nomadbsd_arch "${target_arch}")")"
+        "$(nomadbsd_image_file "$(nomadbsd_arch "${target_arch}")")"
 }
 
 nomadbsd_fetch() {
@@ -2136,7 +2240,7 @@ nomadbsd_fetch() {
     if [ -n "${NOMADBSD_IMAGE}" ]; then
         if [ ! -f "${NOMADBSD_IMAGE}" ]; then
             error "$(printf "NomadBSD: NOMADBSD_IMAGE does not exist: %s\n" \
-                            "${NOMADBSD_IMAGE}")"
+                "${NOMADBSD_IMAGE}")"
             exit 1
         fi
         info "$(printf "NomadBSD: Using NOMADBSD_IMAGE: %s\n" "${NOMADBSD_IMAGE}")"
@@ -2165,11 +2269,11 @@ nomadbsd_fetch() {
     # nomadbsd.org carries amd64, i386 and mac; anything else needs
     # NOMADBSD_REPO_URL or NOMADBSD_IMAGE
     if [ ! -f "${download_path}/${compressed_file}" ]; then
-        if ! ( download "${nomadbsd_repo_url}/${compressed_file}" \
-                        "${download_path}" \
-                        "${DOWNLOAD_RETRIES}" ); then
+        if ! (download "${nomadbsd_repo_url}/${compressed_file}" \
+            "${download_path}" \
+            "${DOWNLOAD_RETRIES}"); then
             error "$(printf "NomadBSD: No %s image at %s\n" \
-                            "${nomad_arch}" "${nomadbsd_repo_url}")"
+                "${nomad_arch}" "${nomadbsd_repo_url}")"
             error "$(printf "Looked for %s\n" "${compressed_file}")"
             error "Set NOMADBSD_REPO_URL to a mirror carrying it, or"
             error "NOMADBSD_IMAGE to an already built image"
@@ -2178,13 +2282,13 @@ nomadbsd_fetch() {
     fi
 
     download "${nomadbsd_repo_url}/${compressed_file}.sha256" \
-             "${download_path}" \
-             "${DOWNLOAD_RETRIES}"
+        "${download_path}" \
+        "${DOWNLOAD_RETRIES}"
 
     info "NomadBSD: Verifying checksum"
     if ! checksum_verify "${download_path}/${compressed_file}.sha256" \
-                         "${download_path}/${compressed_file}" \
-                         "sha256"; then
+        "${download_path}/${compressed_file}" \
+        "sha256"; then
         error "$(printf "NomadBSD: Checksum mismatch: %s\n" "${compressed_file}")"
         exit 1
     fi
@@ -2234,12 +2338,12 @@ nomadbsd_stage_loader() {
     esp_mnt="${src_path}/nomadbsd-esp"
 
     info "$(printf "NomadBSD: Reading the image's ESP (%s MiB)\n" \
-                   "$((size_sectors / 2048))")"
+        "$((size_sectors / 2048))")"
 
     if ! dd if="${src_img}" of="${esp_img}" bs=4M \
-            iflag=skip_bytes,count_bytes \
-            skip="$((start_sector * 512))" \
-            count="$((size_sectors * 512))"; then
+        iflag=skip_bytes,count_bytes \
+        skip="$((start_sector * 512))" \
+        count="$((size_sectors * 512))"; then
         error "NomadBSD: Failed to read the image's ESP"
         rm -f "${esp_img}"
         exit 1
@@ -2271,8 +2375,8 @@ nomadbsd_stage_loader() {
     # vfat is case insensitive, so search for it rather than guess
     local loader
     loader="$(find "${esp_mnt}" \
-                   \( -iname 'boot*.efi' -o -iname 'loader.efi' \) \
-                   -type f | head -1)"
+        \( -iname 'boot*.efi' -o -iname 'loader.efi' \) \
+        -type f | head -1)"
 
     if [ -n "${loader}" ]; then
         info "$(printf "NomadBSD: Staging EFI loader %s\n" "${loader}")"
@@ -2331,19 +2435,19 @@ nomadbsd_install_rootfs() {
 
     if [ "${dest_bytes}" -lt "${src_bytes}" ]; then
         error "$(printf "NomadBSD: Slot %s holds %s bytes but the UFS filesystem needs %s\n" \
-                        "${dest_dev}" "${dest_bytes}" "${src_bytes}")"
+            "${dest_dev}" "${dest_bytes}" "${src_bytes}")"
         error "Raise the slot's size in composition_load"
         exit 1
     fi
 
     info "$(printf "NomadBSD: Copying UFS filesystem (%s MiB) to %s\n" \
-                   "$((src_bytes / 1048576))" "${dest_dev}")"
+        "$((src_bytes / 1048576))" "${dest_dev}")"
 
     if ! dd if="${src_img}" of="${dest_dev}" bs=4M \
-            iflag=skip_bytes,count_bytes \
-            skip="$((start_sector * 512))" \
-            count="${src_bytes}" \
-            status=progress conv=fsync; then
+        iflag=skip_bytes,count_bytes \
+        skip="$((start_sector * 512))" \
+        count="${src_bytes}" \
+        status=progress conv=fsync; then
         error "NomadBSD: Failed to copy the UFS filesystem"
         exit 1
     fi
@@ -2360,7 +2464,7 @@ nomadbsd_build() {
     os="$(sys_os)"
     if [ "freebsd" != "${os}" ]; then
         error "$(printf "NomadBSD: Its build system runs on FreeBSD only (host is %s)\n" \
-                        "${os}")"
+            "${os}")"
         exit 1
     fi
 
@@ -2368,12 +2472,12 @@ nomadbsd_build() {
     nomad_arch="$(nomadbsd_arch "${target_arch}")"
     if [ -z "${nomad_arch}" ]; then
         error "$(printf "NomadBSD: Can not build for %s: ARCH takes amd64, i386 or mac\n" \
-                        "${target_arch}")"
+            "${target_arch}")"
         exit 1
     fi
 
     info "$(printf "NomadBSD: Building a %s %s image\n" \
-                   "${nomad_arch}" "${nomadbsd_filesystem}")"
+        "${nomad_arch}" "${nomadbsd_filesystem}")"
 
     git clone --depth 1 "${nomadbsd_source_url}"
     cd NomadBSD
@@ -2396,7 +2500,7 @@ create_disk() {
     dd if=/dev/zero of="${file_disk}" bs=1M count="${disk_size_mib}" status=progress
 
     case "$os" in
-    ubuntu|fedora)
+    ubuntu | fedora)
         create_disk_parts_gpt "${file_disk}"
 
         if [ -n "${reduce_gpt_table}" ]; then
@@ -2409,7 +2513,7 @@ create_disk() {
             sgdisk --resize-table=8 "${file_disk}"
         fi
         ;;
-    freebsd|macos)
+    freebsd | macos)
         loop_mount_freebsd "${file_disk}"
         gpart create -s gpt /dev/md99
         gpart add -t efi -s "${comp_esp_size}m" -l efi0 /dev/md99
@@ -2439,7 +2543,7 @@ loop_device() {
     else
         read -r nloop_dev <<<"${loop_dev//[^0-9]/ }"
         local n
-        n=$((nloop_dev-1))
+        n=$((nloop_dev - 1))
         echo "/dev/loop${n}"
     fi
 }
@@ -2471,7 +2575,7 @@ loop_mount() {
     os=$(sys_os)
 
     case "$os" in
-    fedora|ubuntu)
+    fedora | ubuntu)
         loop_mount_linux "${disk_file}"
         ;;
     macos)
@@ -2519,7 +2623,7 @@ loop_mount_linux() {
     if [ -n "${existing}" ]; then
         if [ "/dev/loop0" != "${existing}" ]; then
             error "$(printf "loop_mount: %s is attached to %s, but this tool assumes /dev/loop0\n" \
-                            "${disk_file}" "${existing}")"
+                "${disk_file}" "${existing}")"
             losetup -l
             exit 1
         fi
@@ -2600,7 +2704,7 @@ loop_unmount() {
     os="$(sys_os)"
 
     case "$os" in
-    debian|ubuntu|fedora)
+    debian | ubuntu | fedora)
         loop_unmount_linux
         ;;
     freebsd)
@@ -2626,7 +2730,6 @@ loop_mounts() {
     mounts="$(mount | grep loop | awk '{print $1}')"
     echo "${mounts}"
 }
-
 
 install_bootloader_u_boot() {
     local img
@@ -2795,11 +2898,11 @@ install_kernels() {
     local i
     for i in "${!comp_name[@]}"; do
         esp_install_file "${src_path}" "${comp_kernel_src[$i]}" \
-                         "${mnt_path}" "${comp_kernel[$i]}"
+            "${mnt_path}" "${comp_kernel[$i]}"
         esp_install_file "${src_path}" "${comp_initrd_src[$i]}" \
-                         "${mnt_path}" "${comp_initrd[$i]}"
+            "${mnt_path}" "${comp_initrd[$i]}"
         esp_install_file "${src_path}" "${comp_dtb_src[$i]}" \
-                         "${mnt_path}" "${comp_dtb[$i]}"
+            "${mnt_path}" "${comp_dtb[$i]}"
     done
 
     printf "\n"
@@ -2848,7 +2951,7 @@ install_boot_entries() {
             partuuid="$(blkid -o value -s PARTUUID "${part}")"
             if [ -z "${partuuid}" ]; then
                 error "$(printf "install_boot_entries: Failed to read PARTUUID of %s\n" \
-                                "${part}")"
+                    "${part}")"
                 unmount_recursive "${mnt_path}"
                 exit 1
             fi
@@ -2856,13 +2959,13 @@ install_boot_entries() {
         fi
 
         create_boot_entry "${entry_file}" \
-                          "${entry_id}" \
-                          "${comp_boot_type[$i]}" \
-                          "${comp_kernel[$i]}" \
-                          "${comp_initrd[$i]}" \
-                          "${root_spec}" \
-                          "${comp_cmdline[$i]}" \
-                          "${comp_dtb[$i]}"
+            "${entry_id}" \
+            "${comp_boot_type[$i]}" \
+            "${comp_kernel[$i]}" \
+            "${comp_initrd[$i]}" \
+            "${root_spec}" \
+            "${comp_cmdline[$i]}" \
+            "${comp_dtb[$i]}"
 
         if [ -z "${default_entry}" ]; then
             default_entry="${entry_id}"
@@ -2876,7 +2979,7 @@ install_boot_entries() {
     if [ -z "${default_entry}" ]; then
         info "No bootable slots: not writing loader.conf"
     else
-        cat << EOF > "${mnt_path}/loader/loader.conf"
+        cat <<EOF >"${mnt_path}/loader/loader.conf"
 default ${default_entry}.conf
 timeout 5
 console-mode keep
@@ -2903,8 +3006,8 @@ sys_os() {
         os="freebsd"
         ;;
     Linux)
-        if ! grep '^ID=' /etc/os-release | awk -F'=' '{print $2}'\
-           > /dev/null; then
+        if ! grep '^ID=' /etc/os-release | awk -F'=' '{print $2}' \
+            >/dev/null; then
             echo 1
         else
             os="$(grep '^ID=' /etc/os-release | awk -F'=' '{print $2}')"
@@ -2926,25 +3029,25 @@ sys_arch() {
     freebsd)
         arch=$(uname -p)
         ;;
-    fedora|debian|ubuntu)
+    fedora | debian | ubuntu)
         arch=$(uname -m)
         ;;
     esac
 
     case "$arch" in
-        aarch64)
+    aarch64)
         arch="arm64"
         ;;
-        x86_64)
+    x86_64)
         arch="amd64"
         ;;
-        armv7l)
+    armv7l)
         arch="armv7"
         ;;
-        armv6l)
+    armv6l)
         arch="armhf"
         ;;
-        i686)
+    i686)
         arch="i386"
         ;;
     esac
@@ -2969,7 +3072,7 @@ podman_install() {
     os=$(sys_os)
 
     case "$os" in
-    debian|ubuntu)
+    debian | ubuntu)
         sudo apt update -y
         # Prepare for cross-builds with --platform if we are on amd64
         if [ "amd64" = "$(sys_arch)" ]; then
@@ -3012,12 +3115,12 @@ container_platform() {
 # pi1 - which is why it will not boot on a pi4
 board_arch() {
     case "${1}" in
-    rpi0|rpi0w|rpi1)       echo "armhf" ;;
-    rpi2)                  echo "armv7" ;;
-    rpi02w|rpi3|rpi4|rpi5) echo "arm64" ;;
-    pine64|rockpro64)      echo "arm64" ;;
-    x230)                  echo "amd64" ;;
-    *)                     echo "" ;;
+    rpi0 | rpi0w | rpi1) echo "armhf" ;;
+    rpi2) echo "armv7" ;;
+    rpi02w | rpi3 | rpi4 | rpi5) echo "arm64" ;;
+    pine64 | rockpro64) echo "arm64" ;;
+    x230) echo "amd64" ;;
+    *) echo "" ;;
     esac
 }
 
@@ -3030,7 +3133,7 @@ board_arch() {
 board_boot_method() {
     case "${1}" in
     rpi*) echo "rpi-firmware" ;;
-    *)    echo "uefi" ;;
+    *) echo "uefi" ;;
     esac
 }
 
@@ -3072,10 +3175,10 @@ target_flavour_of() {
 # Alpine names architectures differently from the rest of this script
 alpine_arch_for() {
     case "${1}" in
-    arm64|aarch64) echo "aarch64" ;;
-    armv7)         echo "armv7" ;;
-    armhf|armv6)   echo "armhf" ;;
-    *)             echo "" ;;
+    arm64 | aarch64) echo "aarch64" ;;
+    armv7) echo "armv7" ;;
+    armhf | armv6) echo "armhf" ;;
+    *) echo "" ;;
     esac
 }
 
@@ -3097,11 +3200,11 @@ require_uefi_board() {
     fi
 
     error "$(printf "%s: %s boots through its own firmware, not UEFI\n" \
-                    "${build_target}" "${board}")"
+        "${build_target}" "${board}")"
     error "An ESP with systemd-boot is not something it can start, so this"
     error "layout would produce an image that never boots"
     error "$(printf "Build it through the Alpine images instead:\n\n  # image-builder create alpine-containeros-%s\n" \
-                    "${board}")"
+        "${board}")"
     exit 1
 }
 
@@ -3111,10 +3214,10 @@ kernel_file_for_arch() {
     target_arch="${1}"
 
     case "${target_arch}" in
-    arm64|aarch64)
+    arm64 | aarch64)
         echo "Image-virt-arm64"
         ;;
-    amd64|x86_64)
+    amd64 | x86_64)
         echo "bzImage-virt-amd64"
         ;;
     *)
@@ -3202,7 +3305,7 @@ freebsd_customize_image() {
 
     echo "${password}" | pw -R "${mnt}" usermod root -h 0
     sed -i "" -e '/^tty[du]0/s/off/onifconsole/' "${mnt}/etc/ttys"
-    echo 'console="comconsole"' >> "${mnt}/boot/loader.conf"
+    echo 'console="comconsole"' >>"${mnt}/boot/loader.conf"
     # mini-memstick images unconditionally auto-launch bsdinstall via
     # /etc/rc.local; drop it so the image boots to a plain login
     # prompt instead, since here we're smoke-testing the built
@@ -3305,7 +3408,7 @@ build_freebsd_release() {
     cp freebsd-config/release.conf "$target_path/etc"
 
     # release.conf ships amd64 defaults; override for the requested arch
-    cat >> "$target_path/etc/release.conf" <<EOF
+    cat >>"$target_path/etc/release.conf" <<EOF
 TARGET="$(freebsd_target "${target_arch}")"
 TARGET_ARCH="$(freebsd_target_arch "${target_arch}")"
 EOF
@@ -3349,7 +3452,7 @@ build_nanobsd_world() {
     # both the build and install make.conf) to carry it too
     local nano_conf
     nano_conf="$(mktemp)"
-    cat > "${nano_conf}" <<EOF
+    cat >"${nano_conf}" <<EOF
 NANO_SRC=$(pwd)
 NANO_ARCH=$(freebsd_target_arch "${target_arch}")
 CONF_WORLD="\${CONF_WORLD}
@@ -3385,7 +3488,7 @@ linux_install_kernel_build_dependencies() {
     os=$(sys_os)
 
     case "$os" in
-    debian|ubuntu)
+    debian | ubuntu)
         apt update -y
         apt install -y linux-firmware libelf-dev
 
@@ -3397,8 +3500,8 @@ linux_install_kernel_build_dependencies() {
         ;;
     fedora)
         dnf install -y intel-gpu-firmware \
-                       iwl6000-firmware \
-                       linux-firmware
+            iwl6000-firmware \
+            linux-firmware
 
         if [ "arm64" = "${target_arch}" ]; then
             dnf install -y gcc-aarch64-linux-gnu
@@ -3461,13 +3564,13 @@ linux_build_kernel() {
 
         mv "kernel-config-${kernel_flavour}" output/linux/.config
         podman buildx build --cap-add=SYS_PTRACE \
-                            --platform="${platform}" \
-                            --build-arg KERNEL_VERSION="${kernel_version}" \
-                            --build-arg KERNEL_REF="${kernel_ref}" \
-                            --build-arg KERNEL_CONFIG="kernel-config-${kernel_flavour}" \
-                            -v "${PWD}"/output:/output \
-                            -t "ghcr.io/bbusse/linux-kernel-${kernel_flavour}:latest" \
-                            -f Containerfile .
+            --platform="${platform}" \
+            --build-arg KERNEL_VERSION="${kernel_version}" \
+            --build-arg KERNEL_REF="${kernel_ref}" \
+            --build-arg KERNEL_CONFIG="kernel-config-${kernel_flavour}" \
+            -v "${PWD}"/output:/output \
+            -t "ghcr.io/bbusse/linux-kernel-${kernel_flavour}:latest" \
+            -f Containerfile .
     else
         linux_install_kernel_build_dependencies "${target_arch}"
 
@@ -3490,9 +3593,9 @@ linux_build_kernel() {
         fi
 
         mv "arch/${kernel_arch_dir}/boot/${kernel_image_name}" \
-           "arch/${kernel_arch_dir}/boot/${kernel_image_name}-${kernel_version}"
+            "arch/${kernel_arch_dir}/boot/${kernel_image_name}-${kernel_version}"
         sha384sum "arch/${kernel_arch_dir}/boot/${kernel_image_name}-${kernel_version}" \
-            > "arch/${kernel_arch_dir}/boot/${kernel_image_name}-${kernel_version}.sha384"
+            >"arch/${kernel_arch_dir}/boot/${kernel_image_name}-${kernel_version}.sha384"
     fi
 }
 
@@ -3529,13 +3632,13 @@ alpine_build() {
     sudo docker run --privileged --rm multiarch/qemu-user-static --persistent yes
 
     docker run --rm \
-               --mount type=bind,source="${PWD}"/alpine-config/"$target_flavour"/input/image.sh,target=/input/image.sh \
-               --mount type=bind,source="${PWD}"/alpine-config/"$target_flavour"/input/modules,target=/input/modules \
-               -e ARCH="${arch}" \
-               -e DEFAULT_KERNEL_MODULES="*" \
-               -e SIZE_ROOT_FS=1024M \
-               -e SIZE_ROOT_PART=1024M \
-               -v "${PWD}"/output:/output ghcr.io/raspi-alpine/builder
+        --mount type=bind,source="${PWD}"/alpine-config/"$target_flavour"/input/image.sh,target=/input/image.sh \
+        --mount type=bind,source="${PWD}"/alpine-config/"$target_flavour"/input/modules,target=/input/modules \
+        -e ARCH="${arch}" \
+        -e DEFAULT_KERNEL_MODULES="*" \
+        -e SIZE_ROOT_FS=1024M \
+        -e SIZE_ROOT_PART=1024M \
+        -v "${PWD}"/output:/output ghcr.io/raspi-alpine/builder
 
     sudo mv output/sdcard.img.gz "$target_image_name".img.gz
     sudo gunzip "$target_image_name".img.gz
@@ -3569,7 +3672,7 @@ gentoo_fetch_stage4() {
     # publishes and which can therefore lag the build it belongs to
     if [ -f "${path:-.}/${gentoo_stage4_file}" ]; then
         info "$(printf "gentoo: Using locally staged stage4: %s\n" \
-                       "${gentoo_stage4_file}")"
+            "${gentoo_stage4_file}")"
         return 0
     fi
 
@@ -3601,7 +3704,7 @@ gentoo_fetch_stage3() {
 
     local gentoo_stage3_file
     gentoo_stage3_file=$(grep -o 'stage3-[^[:space:]]*\.tar\.xz' \
-                              "${path:-.}/${gentoo_stage3_manifest_file}" | head -1)
+        "${path:-.}/${gentoo_stage3_manifest_file}" | head -1)
     local gentoo_stage3_url
     gentoo_stage3_url="${gentoo_stage3_repo_url}/${gentoo_stage3_file}"
 
@@ -3642,13 +3745,13 @@ build_gentoo_stage4() {
     info "podman: Building ${target_flavour} for ${platform}"
 
     podman buildx build --cap-add=SYS_PTRACE \
-                        --platform="${platform}" \
-                        --build-arg TARGET_ARCH="$target_arch" \
-                        --build-arg TARGET_FLAVOUR="$target_flavour" \
-                        --build-arg GENTOO_OVERLAYS="${GENTOO_OVERLAYS}" \
-                        -v "${PWD}"/output:/output \
-                        -t gentoo-stage4-"$target_flavour-$target_arch" \
-                        -f Containerfile
+        --platform="${platform}" \
+        --build-arg TARGET_ARCH="$target_arch" \
+        --build-arg TARGET_FLAVOUR="$target_flavour" \
+        --build-arg GENTOO_OVERLAYS="${GENTOO_OVERLAYS}" \
+        -v "${PWD}"/output:/output \
+        -t gentoo-stage4-"$target_flavour-$target_arch" \
+        -f Containerfile
 }
 
 # Fetch a prebuilt u-root initramfs rather than building one. The
@@ -3664,7 +3767,7 @@ u_root_fetch() {
 
     if [ -f "${download_path}/${initramfs_file}" ]; then
         info "$(printf "u-root: Initramfs exists, not fetching again: %s\n" \
-                       "${initramfs_file}")"
+            "${initramfs_file}")"
         return 0
     fi
 
@@ -3672,13 +3775,13 @@ u_root_fetch() {
 
     # download exits on failure, so run it in a subshell to report which
     # architecture is missing rather than just that a fetch failed
-    if ! ( download "${u_root_repo_url}/${initramfs_file}" \
-                    "${download_path}" \
-                    "${DOWNLOAD_RETRIES}" ); then
+    if ! (download "${u_root_repo_url}/${initramfs_file}" \
+        "${download_path}" \
+        "${DOWNLOAD_RETRIES}"); then
         error "$(printf "u-root: No initramfs published for %s\n" "${target_arch}")"
         error "$(printf "See %s\n" "${u_root_release_url}")"
         error "$(printf "Or build one locally:\n\n  # image-builder build u-root %s\n" \
-                        "${target_arch}")"
+            "${target_arch}")"
         exit 1
     fi
 }
@@ -3700,9 +3803,9 @@ build_u_root() {
     podman_install
     mkdir -p output
     podman buildx build --platform="${platform}" \
-                        -v "${PWD}"/output:/output \
-                        -t "u-root" \
-                        -f Containerfile
+        -v "${PWD}"/output:/output \
+        -t "u-root" \
+        -f Containerfile
 
     local container_id
     container_id=$(podman create u-root)
@@ -3715,11 +3818,21 @@ openwrt_build() {
     local flavour
     flavour="$1"
 
-    info "$(printf "OpenWrt: Fetching config")"
-    git clone --depth 1 -b dev "${openwrt_source_url}"
+    # Source branch is per flavour: x86_64 stays on "dev", device ports
+    # (e.g. ap120c) live on their own branch of the fork.
+    local branch
+    branch="${OPENWRT_BRANCH:-dev}"
+
+    info "$(printf "OpenWrt: Fetching source (branch %s) and config" "${branch}")"
+    git clone --depth 1 -b "${branch}" "${openwrt_source_url}"
     cd openwrt
     git clone --depth 1 "${openwrt_config_url}"
     mv openwrt-config/openwrt-config-"$flavour" .config
+
+    # Expand the (possibly partial) config against this tree: fills in
+    # defaults and selects forced dependencies, so a config only needs
+    # to list what differs from the defaults.
+    make defconfig
 
     make V=s
 }
@@ -3885,11 +3998,11 @@ fs_check_cmd() {
     btrfs)
         fs_check_argv=(btrfs check --readonly "${dev}")
         ;;
-    ext2|ext3|ext4)
+    ext2 | ext3 | ext4)
         # -f checks even a filesystem already marked clean
         fs_check_argv=(e2fsck -f -n "${dev}")
         ;;
-    ufs|ufs2)
+    ufs | ufs2)
         # The BSDs call it fsck_ffs and util-linux ships no fsck.ufs
         fs_check_argv=(fsck_ffs -n "${dev}")
         ;;
@@ -3968,7 +4081,7 @@ verify_filesystem() {
 
     if ! command -v "${fs_check_argv[0]}" >/dev/null 2>&1; then
         info "$(printf "verify_filesystem: %s not installed, skipping check of %s (%s)\n" \
-                       "${fs_check_argv[0]}" "${dev}" "${fs_type}")"
+            "${fs_check_argv[0]}" "${dev}" "${fs_type}")"
         return 0
     fi
 
@@ -3976,7 +4089,7 @@ verify_filesystem() {
 
     if ! "${fs_check_argv[@]}"; then
         error "$(printf "Filesystem check failed on %s (%s)%s\n" \
-                        "${dev}" "${fs_type}" "${context:+ after: ${context}}")"
+            "${dev}" "${fs_type}" "${context:+ after: ${context}}")"
         info "$(printf "loop devices:\n")"
         losetup -l || true
         info "$(printf "kernel log (tail):\n")"
@@ -4032,7 +4145,7 @@ gentoo_add_overlays() {
         name="$(cat "${tmp_dir}/profiles/repo_name")"
         info "$(printf "Gentoo: Adding overlay %s (%s)\n" "${name}" "${url}")"
 
-        cat <<EOF > "${mnt_path}/etc/portage/repos.conf/${name}.conf"
+        cat <<EOF >"${mnt_path}/etc/portage/repos.conf/${name}.conf"
 [${name}]
 location = /var/db/repos/${name}
 sync-type = git
@@ -4084,7 +4197,7 @@ gentoo_install_stage4_binpkgs() {
     arm64 | aarch64)
         mkdir -p "${mnt_path}/etc/portage/package.env"
         cp gentoo-config/package.env.arm64 \
-           "${mnt_path}/etc/portage/package.env/cortex-a53-errata"
+            "${mnt_path}/etc/portage/package.env/cortex-a53-errata"
         ;;
     esac
 
@@ -4135,11 +4248,11 @@ gentoo_install_stage4_binpkgs() {
         case "${target_arch}" in
         arm64 | aarch64)
             cp gentoo-config/package.use.hwaccel \
-               "${mnt_path}/etc/portage/package.use/"
+                "${mnt_path}/etc/portage/package.use/"
             ;;
         amd64 | x86_64)
             cp gentoo-config/package.use.hwaccel-amd64 \
-               "${mnt_path}/etc/portage/package.use/"
+                "${mnt_path}/etc/portage/package.use/"
             ;;
         esac
     fi
@@ -4168,7 +4281,7 @@ gentoo_install_stage4_binpkgs() {
 set_default_root_pw() {
     local file
     file="${1}"
-    echo 'root:$6$I9Q9AyTL$Z76H7wD8mT9JAyrp/vaYyFwyA5wRVN0tze8pvM.MqScC7BBm2PU7pLL0h5nSxueqUpYAlZTox4Ag2Dp5vchjJ0:14698:0:::::' > ${file}
+    echo 'root:$6$I9Q9AyTL$Z76H7wD8mT9JAyrp/vaYyFwyA5wRVN0tze8pvM.MqScC7BBm2PU7pLL0h5nSxueqUpYAlZTox4Ag2Dp5vchjJ0:14698:0:::::' >${file}
 }
 
 install_fonts() {
@@ -4190,7 +4303,7 @@ install_fonts() {
         # download() aborts the build on failure, which a decorative font
         # fetched from a third-party host does not warrant; the subshell
         # contains that exit so the image still gets built without it
-        if ! ( download "${url}" "${path}" ); then
+        if ! (download "${url}" "${path}"); then
             info "$(printf "Optional font not fetched from %s, continuing without it\n" "${url}")"
         fi
     done
@@ -4204,7 +4317,7 @@ ansible_write_playbook() {
     local file
     file="$(mktemp)"
 
-cat <<EOF > "${file}"
+    cat <<EOF >"${file}"
 ---
 - hosts: all
   vars:
@@ -4214,10 +4327,10 @@ cat <<EOF > "${file}"
 EOF
 
     while IFS=',' read -ra roles; do
-      for i in "${roles[@]}"; do
-        printf "    - %s\n" "${i}" >> "${file}"
-      done
-    done <<< "$roles_str"
+        for i in "${roles[@]}"; do
+            printf "    - %s\n" "${i}" >>"${file}"
+        done
+    done <<<"$roles_str"
 
     echo "${file}"
 }
@@ -4239,8 +4352,8 @@ ansible_run_playbook() {
     chown "${user}" "${playbook}"
     # Do not ommit the comma
     su -l "${user}" -c ANSIBLE_ROLES_PATH="${ansible_roles_path}" \
-                       ANSIBLE_HOST_KEY_CHECKING=False \
-                       /usr/bin/ansible-playbook -v -i "${host}", "${playbook}"
+        ANSIBLE_HOST_KEY_CHECKING=False \
+        /usr/bin/ansible-playbook -v -i "${host}", "${playbook}"
 
     if ! ${cmd}; then
         error "Ansible: Failed during playbook execution"
@@ -4273,9 +4386,9 @@ ansible_provision() {
 
     info "$(printf "Ansible: Running %s\n" "${playbook}")"
     ansible_run_playbook "${ansible_user}" \
-                         "${playbook}" \
-                         "${net_address}" \
-                         "${ansible_roles_path}"
+        "${playbook}" \
+        "${net_address}" \
+        "${ansible_roles_path}"
 }
 
 # Do what's necessary for Ansible
@@ -4315,9 +4428,9 @@ provision() {
     info "$(printf "Detected filesystem: %s\n" "${fs_type}")"
 
     mount_disk_image_part_by_no "${disk_file}" \
-                                "${mnt_path}" \
-                                "${part_no}" \
-                                "xfs"
+        "${mnt_path}" \
+        "${part_no}" \
+        "xfs"
 
     info "$(printf "Applying changes to partition %s\n" "${part_no}")"
 
@@ -4337,15 +4450,15 @@ provision() {
         local uid
         uid="$(chroot_user_id "${mnt_path}" "${ansible_user}")"
         ssh_add_pubkey "${SSH_USER}" \
-                       "${SSH_PUBKEY}" \
-                       "${mnt_path}" \
-                       "${uid}"
+            "${SSH_PUBKEY}" \
+            "${mnt_path}" \
+            "${uid}"
     fi
 
     info "Writing network config"
     write_net_config "${mnt_path}" "${target_arch}" \
-                     "$(net_mode_for_target "${net_mode}" "${build_target}")" \
-                     "${net_device}" "${net_address}" "${net_gateway}"
+        "$(net_mode_for_target "${net_mode}" "${build_target}")" \
+        "${net_device}" "${net_address}" "${net_gateway}"
     add_network_debug_print "${mnt_path}"
 
     write_booted_script "${mnt_path}" "${net_host_readiness_port}"
@@ -4353,9 +4466,9 @@ provision() {
 
     info "Writing wpa config"
     write_wpa_supplicant_config "${mnt_path}" \
-                                "${WIFI_SECURITY}" \
-                                "${WIFI_ESSID}" \
-                                "${WIFI_PASSPHRASE}"
+        "${WIFI_SECURITY}" \
+        "${WIFI_ESSID}" \
+        "${WIFI_PASSPHRASE}"
 
     info "Enabling Wifi"
     wifi_enable
@@ -4385,12 +4498,14 @@ provision() {
 
     info "Enabling sshd"
     service_enable "${mnt_path}" "sshd" "getty"
+    harden_sshd "${mnt_path}" "${user}"
 
     # Anything without systemd keeps the provisioning above and gets no
     # swapfile, activation would need init-specific plumbing
     if [ -x "${mnt_path}/usr/lib/systemd/systemd" ]; then
         info "systemd rootfs: installing first-boot provisioning"
-        provision_systemd_firstboot "${mnt_path}"
+        provision_systemd_firstboot "${mnt_path}" "${user}"
+        write_provision_key_fetch "${mnt_path}" "${user}"
     else
         debug "no systemd in rootfs: skipping first-boot provisioning and swapfile"
     fi
@@ -4404,9 +4519,9 @@ provision() {
     if [ -n "${ansible_roles}" ]; then
         info "$(printf "Gentoo: Provisioning image with Ansible\n")"
         ansible_provision "${ansible_user}" \
-                          "${ansible_roles_path}" \
-                          "${ansible_roles}" \
-                          "${disk_file}"
+            "${ansible_roles_path}" \
+            "${ansible_roles}" \
+            "${disk_file}"
     fi
 
     info "$(printf "Unmounting %s\n" "${mnt_path}")"
@@ -4461,10 +4576,10 @@ part_types() {
     disk_file="${1}"
 
     local parts
-    IFS=$'\n' read -r -a parts <<< "$(fdisk -l "${disk_file}" | \
-                                      grep "${disk_file}" | \
-                                      grep -v Disk | \
-                                      awk '{ print $6 }')"
+    IFS=$'\n' read -r -a parts <<<"$(fdisk -l "${disk_file}" |
+        grep "${disk_file}" |
+        grep -v Disk |
+        awk '{ print $6 }')"
     echo "${parts[@]}"
 }
 
@@ -4504,14 +4619,14 @@ alpine_fetch_image() {
     cd "${path}" || exit 1
     info "Alpine: Fetching pre-built image"
     download_miss "${path}" \
-                  "${img_url}" \
-                  "${csum_url}" \
-                  "${csum_file}"
+        "${img_url}" \
+        "${csum_url}" \
+        "${csum_file}"
 
     if [ -f "${file}" ]; then
         info "Uncompressed disk image exists: Not overwriting existing one"
     else
-        if [ ! -e "${compressed_file}" ];  then
+        if [ ! -e "${compressed_file}" ]; then
             error "$(printf "Failed to decompress: File does not exist. Aborting..\n")"
             exit 1
         else
@@ -4553,7 +4668,7 @@ gentoo_create_disk() {
     create_disk "${disk_file}" "${reduce_gpt_table}"
 
     case "$os" in
-    ubuntu|fedora)
+    ubuntu | fedora)
         loop_mount_linux "${disk_file}"
         ;;
     freebsd)
@@ -4563,7 +4678,7 @@ gentoo_create_disk() {
 
     # Create filesystems: the ESP, then one per slot
     case "$os" in
-    ubuntu|fedora)
+    ubuntu | fedora)
         info "Creating file systems"
         if ! mkfs.vfat "${esp_dev}"; then
             error "$(printf "Error: Failed to create filesystem on %s\n" "${esp_dev}")"
@@ -4623,10 +4738,10 @@ edk2_firmware_spec() {
     target_arch="${1}"
 
     case "${target_arch}" in
-    amd64|x86_64)
+    amd64 | x86_64)
         echo "${edk2_build}X64_OVMF_CODE.fd ${edk2_build}X64_OVMF_VARS.fd 0"
         ;;
-    arm64|aarch64)
+    arm64 | aarch64)
         echo "${edk2_build}AARCH64_QEMU_EFI.fd ${edk2_build}AARCH64_QEMU_VARS.fd 64"
         ;;
     *)
@@ -4645,7 +4760,7 @@ edk2_pad() {
     local want
     want=$((size_mib * 1048576))
     local have
-    have="$(wc -c < "${file}" | tr -d ' ')"
+    have="$(wc -c <"${file}" | tr -d ' ')"
 
     if [ "${have}" -eq "${want}" ]; then
         return 0
@@ -4653,7 +4768,7 @@ edk2_pad() {
 
     if [ "${have}" -gt "${want}" ]; then
         error "$(printf "edk2: %s is %s bytes, larger than the %s byte pflash\n" \
-                        "${file}" "${have}" "${want}")"
+            "${file}" "${have}" "${want}")"
         return 1
     fi
 
@@ -4683,7 +4798,7 @@ edk2_fetch() {
     local code_file
     local vars_file
     local pflash_mib
-    read -r code_file vars_file pflash_mib <<< "${spec}"
+    read -r code_file vars_file pflash_mib <<<"${spec}"
 
     local fw_dir
     fw_dir="${download_path}/firmware"
@@ -4697,7 +4812,7 @@ edk2_fetch() {
 
         # download exits on failure, so run it in a subshell to report
         # what could not be fetched
-        if ! ( download "${edk2_repo_url}/${f}" "${fw_dir}" "${DOWNLOAD_RETRIES}" ); then
+        if ! (download "${edk2_repo_url}/${f}" "${fw_dir}" "${DOWNLOAD_RETRIES}"); then
             error "$(printf "edk2: Failed to fetch %s from %s\n" "${f}" "${edk2_repo_url}")"
             return 1
         fi
@@ -4718,14 +4833,14 @@ firmware_paths_distro() {
 
     local candidates
     case "${target_arch}" in
-    amd64|x86_64)
+    amd64 | x86_64)
         candidates="/usr/share/OVMF/OVMF_CODE_4M.fd:/usr/share/OVMF/OVMF_VARS_4M.fd
 /usr/share/OVMF/OVMF_CODE.fd:/usr/share/OVMF/OVMF_VARS.fd
 /usr/share/edk2/ovmf/OVMF_CODE.fd:/usr/share/edk2/ovmf/OVMF_VARS.fd
 /usr/share/qemu/ovmf-x86_64-code.bin:/usr/share/qemu/ovmf-x86_64-vars.bin
 /usr/local/share/uefi-firmware/OVMF_CODE.fd:/usr/local/share/uefi-firmware/OVMF_VARS.fd"
         ;;
-    arm64|aarch64)
+    arm64 | aarch64)
         candidates="/usr/share/AAVMF/AAVMF_CODE.fd:/usr/share/AAVMF/AAVMF_VARS.fd
 /usr/share/edk2/aarch64/QEMU_EFI-silent-pflash.raw:/usr/share/edk2/aarch64/vars-template-pflash.raw
 /usr/share/edk2/aarch64/QEMU_EFI-pflash.raw:/usr/share/edk2/aarch64/vars-template-pflash.raw
@@ -4773,7 +4888,7 @@ firmware_paths() {
         local code_file
         local vars_file
         local pflash_mib
-        read -r code_file vars_file pflash_mib <<< "${spec}"
+        read -r code_file vars_file pflash_mib <<<"${spec}"
 
         if [ -f "${EDK2_DIR}/${code_file}" ] && [ -f "${EDK2_DIR}/${vars_file}" ]; then
             printf "%s %s" "${EDK2_DIR}/${code_file}" "${EDK2_DIR}/${vars_file}"
@@ -4799,16 +4914,16 @@ firmware_paths() {
 
 qemu_bin_for_arch() {
     case "${1}" in
-    amd64|x86_64)  echo "qemu-system-x86_64" ;;
-    arm64|aarch64) echo "qemu-system-aarch64" ;;
-    *)             echo "" ;;
+    amd64 | x86_64) echo "qemu-system-x86_64" ;;
+    arm64 | aarch64) echo "qemu-system-aarch64" ;;
+    *) echo "" ;;
     esac
 }
 
 qemu_machine_for_arch() {
     case "${1}" in
-    arm64|aarch64) echo "virt,gic-version=max" ;;
-    *)             echo "q35" ;;
+    arm64 | aarch64) echo "virt,gic-version=max" ;;
+    *) echo "q35" ;;
     esac
 }
 
@@ -4894,7 +5009,7 @@ net_create_dev() {
     bridge)
         dev_name="br-${suffix}"
         r="$(net_dev_exists "${dev_name}")"
-        if [ 0 == "$r" ] ; then
+        if [ 0 == "$r" ]; then
             return
         fi
         info "$(printf "Creating network device %s\n" "${dev_name}")"
@@ -4903,11 +5018,12 @@ net_create_dev() {
     tap)
         dev_name="tap-${suffix}"
         r="$(net_dev_exists "${dev_name}")"
-        if [ 0 == "$r" ] ; then
+        if [ 0 == "$r" ]; then
             return
         fi
         info "$(printf "Creating network device %s\n" "${dev_name}")"
         ip tuntap add mode tap "${dev_name}"
+        ;;
     esac
 
     ip link set dev "${dev_name}" up
@@ -4929,6 +5045,38 @@ disk_show_storage_devices() {
     esac
 }
 
+# Root login only from loopback, no second sshd. The moonshine -> root@localhost
+# key connects from 127.0.0.1, everything else is denied. No password root
+harden_sshd() {
+    local mnt_path
+    mnt_path="${1}"
+    local user
+    user="${2}"
+    local cfg
+    cfg="${mnt_path}/etc/ssh/sshd_config"
+
+    [ -f "${cfg}" ] || return 0
+
+    if ! grep -qE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/' "${cfg}"; then
+        printf 'Include /etc/ssh/sshd_config.d/*.conf\n' | cat - "${cfg}" >"${cfg}.new"
+        mv "${cfg}.new" "${cfg}"
+    fi
+
+    local dir
+    dir="${mnt_path}/etc/ssh/sshd_config.d"
+    mkdir -p "${dir}"
+    cat <<SSHDEOF >"${dir}/50-root-local.conf"
+# Only the image user may log in over ssh, from anywhere. root is allowed
+# only from loopback (the ${user} -> root@localhost key), never remotely and
+# never with a password
+AllowUsers ${user} root@127.0.0.1 root@::1
+PermitRootLogin no
+
+Match Address 127.0.0.1,::1
+    PermitRootLogin prohibit-password
+SSHDEOF
+}
+
 service_enable() {
     local path
     path="${1}/etc/systemd/system"
@@ -4937,7 +5085,7 @@ service_enable() {
     local target
     target="${3}"
 
-cat <<EOF > "${path}/${service}.service"
+    cat <<EOF >"${path}/${service}.service"
 [Unit]
 Description=OpenSSH server daemon
 After=net-config.service
@@ -4946,8 +5094,8 @@ After=net-config.service
 ExecStartPre=mount -o remount,rw /
 ExecStartPre=sleep 2
 ExecStartPre=/usr/bin/ssh-keygen -A
-# Fix: Do not allow root login
-ExecStart=/usr/sbin/sshd -D -e -o PermitRootLogin=yes
+# Honour sshd_config, which limits root login to loopback (see harden_sshd)
+ExecStart=/usr/sbin/sshd -D -e
 ExecReload=/bin/kill -HUP $MAINPID
 KillMode=process
 EOF
@@ -5086,7 +5234,7 @@ boot_test_select_entry() {
 
     # timeout 0 boots straight into the entry rather than waiting for a
     # keypress that automation is never going to send
-    cat << EOF > "${mnt_path}/loader/loader.conf"
+    cat <<EOF >"${mnt_path}/loader/loader.conf"
 default ${entry_id}.conf
 timeout 0
 console-mode keep
@@ -5114,7 +5262,7 @@ boot_test_restore_loader() {
 
     loop_mount "${disk_file}"
     esp_mount "$(esp)" "${mnt_path}"
-    printf "%s\n" "${previous}" > "${mnt_path}/loader/loader.conf"
+    printf "%s\n" "${previous}" >"${mnt_path}/loader/loader.conf"
     unmount_recursive "${mnt_path}"
     loop_unmount ""
 
@@ -5148,7 +5296,7 @@ boot_test_run() {
 
     local fw_code
     local fw_vars
-    read -r fw_code fw_vars <<< "${fw}"
+    read -r fw_code fw_vars <<<"${fw}"
 
     local work
     work="${disk_file%.raw}-boot-test"
@@ -5156,7 +5304,7 @@ boot_test_run() {
 
     local log
     log="${work}/serial.log"
-    : > "${log}"
+    : >"${log}"
 
     # qemu writes to the variable store, so give each run a fresh copy
     cp "${fw_vars}" "${work}/efi-vars.fd"
@@ -5165,22 +5313,22 @@ boot_test_run() {
     accel="$(qemu_accel_for_arch "${target_arch}")"
 
     info "$(printf "boot-test: Booting %s (%s, %s) for up to %ss\n" \
-                   "$(basename "${disk_file}")" "${target_arch}" "${accel}" "${timeout_s}")"
+        "$(basename "${disk_file}")" "${target_arch}" "${accel}" "${timeout_s}")"
     info "$(printf "boot-test: Waiting for /%s/\n" "${pattern}")"
 
     # -nic none: without it a guest that fails to boot falls through to
     # a PXE attempt and burns the rest of the timeout
 
     "${qemu_bin}" -m "${QEMU_MEMORY:-2048}" \
-                  -machine "type=$(qemu_machine_for_arch "${target_arch}"),accel=${accel}" \
-                  -cpu "$(qemu_cpu_for_arch "${target_arch}" "${accel}")" \
-                  -display none \
-                  -serial "file:${log}" \
-                  -no-reboot \
-                  -nic none \
-                  -drive "if=pflash,format=raw,unit=0,file=${fw_code},readonly=on" \
-                  -drive "if=pflash,format=raw,unit=1,file=${work}/efi-vars.fd" \
-                  -drive "format=raw,file=${disk_file}" &
+        -machine "type=$(qemu_machine_for_arch "${target_arch}"),accel=${accel}" \
+        -cpu "$(qemu_cpu_for_arch "${target_arch}" "${accel}")" \
+        -display none \
+        -serial "file:${log}" \
+        -no-reboot \
+        -nic none \
+        -drive "if=pflash,format=raw,unit=0,file=${fw_code},readonly=on" \
+        -drive "if=pflash,format=raw,unit=1,file=${work}/efi-vars.fd" \
+        -drive "format=raw,file=${disk_file}" &
 
     local qemu_pid
     qemu_pid=$!
@@ -5263,7 +5411,7 @@ run_virt_linux() {
 
     local fw_code
     local fw_vars
-    read -r fw_code fw_vars <<< "${fw}"
+    read -r fw_code fw_vars <<<"${fw}"
 
     # qemu writes to the variable store, so boot from a copy and leave
     # the fetched firmware as it is
@@ -5448,7 +5596,7 @@ main() {
             exit 1
         elif [ ! -d "${ANSIBLE_ROLES_PATH}" ]; then
             error "$(printf "Ansible: The supplied roles path does not exist: %s\n" \
-                   "${ANSIBLE_ROLES_PATH}")"
+                "${ANSIBLE_ROLES_PATH}")"
             exit 1
         else
             ansible_roles_path="${ANSIBLE_ROLES_PATH}"
@@ -5484,7 +5632,7 @@ main() {
         fi
 
         case "$build_target" in
-        alpine-sway|alpine-containeros|alpine-sway-*|alpine-containeros-*)
+        alpine-sway | alpine-containeros | alpine-sway-* | alpine-containeros-*)
             local target_flavour
             target_flavour="$(target_flavour_of "${build_target}" "alpine-")"
 
@@ -5551,7 +5699,7 @@ main() {
             build_gentoo_stage4 "$target_flavour" "$target_arch"
             return
             ;;
-        gentoo-sway-pine64|gentoo-sway-rockpro64)
+        gentoo-sway-pine64 | gentoo-sway-rockpro64)
             local target_flavour
             target_flavour="$(target_flavour_of "${build_target}" "gentoo-")"
             # The board is hardware, not an architecture choice
@@ -5586,30 +5734,31 @@ main() {
 
             if [ -z "${target_arch}" ]; then
                 case "$kernel_flavour" in
-                    pine64)
+                pine64)
                     target_arch="arm64"
                     ;;
-                    rockpro64)
+                rockpro64)
                     target_arch="arm64"
                     ;;
-                    virt-arm64)
+                virt-arm64)
                     target_arch="arm64"
                     ;;
-                    x230)
+                x230)
                     target_arch="amd64"
                     ;;
-                    virt-amd64)
+                virt-amd64)
                     target_arch="amd64"
                     ;;
-                    *)
+                *)
                     error "Please specify a target architecture\nAborting.."
                     exit 1
+                    ;;
                 esac
             fi
 
             linux_build_kernel "${kernel_flavour}" \
-                               "${build_use_container}" \
-                               "${target_arch}"
+                "${build_use_container}" \
+                "${target_arch}"
             exit 0
             ;;
         nomadbsd)
@@ -5674,7 +5823,7 @@ main() {
             local csum_file
             csum_file="${img_path}/${alma_img_file}.sha256"
             csum=$(awk "/SHA256/ && /${alma_img_file}/" "${img_path}/${alma_csum_file}")
-            echo "${csum}" > "${csum_file}"
+            echo "${csum}" >"${csum_file}"
 
             if [ -f "${img_path}/${alma_img_file}" ]; then
                 info "$(printf "Alma: Checking checksum..\n")"
@@ -5687,9 +5836,9 @@ main() {
 
             info "$(printf "The image was downloaded successfully\n")"
 
-            gentoo_create_disk  "${img_path}" \
-                                "${target_img_file}" \
-                                "${mnt_path}"
+            gentoo_create_disk "${img_path}" \
+                "${target_img_file}" \
+                "${mnt_path}"
 
             printf "\n"
             disk_show_storage_devices
@@ -5698,7 +5847,7 @@ main() {
             info "$(printf " # image-builder write %s [DEVICE]" "${build_target}")"
             exit 0
             ;;
-        alpine-sway|alpine-containeros|alpine-sway-*|alpine-containeros-*)
+        alpine-sway | alpine-containeros | alpine-sway-* | alpine-containeros-*)
             # We need root privileges
             reexec_privileged "$@"
 
@@ -5713,14 +5862,14 @@ main() {
             fi
 
             alpine_create_disk "build" \
-                               "${img_path}" \
-                               "${img_file}" \
-                               "${alpine_img_url}" \
-                               "${alpine_csum_url}" \
-                               "${alpine_csum_file}" \
-                               "${service_user}" \
-                               "${target_flavour}" \
-                               "${target_arch}"
+                "${img_path}" \
+                "${img_file}" \
+                "${alpine_img_url}" \
+                "${alpine_csum_url}" \
+                "${alpine_csum_file}" \
+                "${service_user}" \
+                "${target_flavour}" \
+                "${target_arch}"
 
             info "$(printf "Alpine: Provisioning image\n")"
 
@@ -5746,7 +5895,7 @@ main() {
             #                "${ansible_roles}"
             exit 0
             ;;
-        gentoo-containeros|gentoo-sway|gentoo-sway-virt|gentoo-sway-pine64|gentoo-sway-rockpro64|gentoo-k3s|containeros-virt|nomadbsd)
+        gentoo-containeros | gentoo-sway | gentoo-sway-virt | gentoo-sway-pine64 | gentoo-sway-rockpro64 | gentoo-k3s | containeros-virt | nomadbsd)
             # download_miss/gentoo_fetch_stage3 (called below) expect a
             # "path" in scope to fetch into
             local path
@@ -5774,11 +5923,11 @@ main() {
             # touched, so a failed download leaves no half-built image
             composition_fetch "${path}" "${target_arch}"
 
-            gentoo_create_disk  "${img_path}" \
-                                "${img_file}" \
-                                "${mnt_path}" \
-                                "" \
-                                "${reduce_gpt_table}"
+            gentoo_create_disk "${img_path}" \
+                "${img_file}" \
+                "${mnt_path}" \
+                "" \
+                "${reduce_gpt_table}"
 
             local esp_dev
             esp_dev=$(esp)
@@ -5799,9 +5948,9 @@ main() {
                 slot_dev="$(part_dev "${comp_part[$i]}")"
 
                 gentoo_install_stage4_binpkgs "${comp_provider_arg[$i]}" \
-                                              "${target_arch}" \
-                                              "${slot_dev}" \
-                                              "${mnt_path}"
+                    "${target_arch}" \
+                    "${slot_dev}" \
+                    "${mnt_path}"
                 verify_filesystem "${slot_dev}" "stage4 binpkgs"
 
                 info "$(printf "Gentoo: Provisioning %s\n" "${comp_name[$i]}")"
@@ -5809,17 +5958,17 @@ main() {
                 # We need to apply changes to both partitions: A/B
                 # But we do not have partition B yet (not implemented for Gentoo)
                 provision "${img_path}/${img_file}" \
-                          "${mnt_path}" \
-                          "${user}" \
-                          "${comp_part[$i]}" \
-                          "${net_dev}" \
-                          "${net_address}" \
-                          "${net_gateway}" \
-                          "${ansible_user}" \
-                          "${ansible_roles_path}" \
-                          "${ansible_roles}" \
-                          "${net_mode}" \
-                          "${build_target}"
+                    "${mnt_path}" \
+                    "${user}" \
+                    "${comp_part[$i]}" \
+                    "${net_dev}" \
+                    "${net_address}" \
+                    "${net_gateway}" \
+                    "${ansible_user}" \
+                    "${ansible_roles_path}" \
+                    "${ansible_roles}" \
+                    "${net_mode}" \
+                    "${build_target}"
 
                 verify_filesystem "${slot_dev}" "provision"
             done
@@ -5845,17 +5994,18 @@ main() {
             printf "  One of: alma, alpine-containeros, alpine-sway,\n"
             printf "          containeros-virt, freebsd, gentoo-containeros,\n"
             printf "          gentoo-k3s, gentoo-sway, gentoo-sway-pine64,\n"
-    printf "          gentoo-sway-rockpro64,\n"
+            printf "          gentoo-sway-rockpro64,\n"
             printf "          gentoo-sway-virt, nomadbsd\n"
             show_usage
             exit 1
+            ;;
         esac
     fi
 
     # Install image-builder
     if [ "install" == "${1}" ]; then
         install_builder "${SCRIPT_PATH}/${SCRIPT_NAME}" \
-                        "/usr/local/bin"
+            "/usr/local/bin"
         exit 0
     fi
 
@@ -5882,9 +6032,9 @@ main() {
         fs_type="$(echo -n "$fs_type")"
 
         mount_disk_image_part_by_no "${img}" \
-                                    "${mnt_path}" \
-                                    "${part_no}" \
-                                    "${fs_type}"
+            "${mnt_path}" \
+            "${part_no}" \
+            "${fs_type}"
 
         if [ "chroot" == "${1}" ]; then
             chroot "${mnt_path}" "/bin/sh"
@@ -5896,7 +6046,7 @@ main() {
         exit 0
     fi
 
-    if [ "show" == "${1}" ] ; then
+    if [ "show" == "${1}" ]; then
         local object
         object="${2}"
         if [ -z "${object}" ]; then
@@ -5936,8 +6086,8 @@ main() {
             # alpine_build leaves the disk image xz-compressed
             # (alpine.img.xz); decompress it here so 'write' can
             # operate on the same output 'create'/'build' produced
-            if ! [ -f "${img_path}/${img_file}" ] && \
-               [ -f "${img_path}/${img_file}.xz" ]; then
+            if ! [ -f "${img_path}/${img_file}" ] &&
+                [ -f "${img_path}/${img_file}.xz" ]; then
                 info "$(printf "Alpine: Decompressing %s\n" "${img_file}.xz")"
                 xz -d -k "${img_path}/${img_file}.xz"
             fi
@@ -6014,17 +6164,17 @@ main() {
         info "$(printf "Gentoo: Provisioning image\n")"
 
         provision "${img_path}/${img_file}" \
-                  "${mnt_path}" \
-                  "${user}" \
-                  3 \
-                  "${net_dev}" \
-                  "${net_address}" \
-                  "${net_gateway}" \
-                  "${ansible_user}" \
-                  "${ansible_roles_path}" \
-                  "${ansible_roles}" \
-                  "${net_mode}" \
-                  "${build_target}"
+            "${mnt_path}" \
+            "${user}" \
+            3 \
+            "${net_dev}" \
+            "${net_address}" \
+            "${net_gateway}" \
+            "${ansible_user}" \
+            "${ansible_roles_path}" \
+            "${ansible_roles}" \
+            "${net_mode}" \
+            "${build_target}"
 
         exit 0
     fi
@@ -6062,7 +6212,7 @@ main() {
         if [ ! -e "${img}" ]; then
             error "$(printf "Can not find disk image: %s\n" "${img}")"
             info "$(printf "Create it first:\n\n  # image-builder create %s %s\n" \
-                           "${build_target}" "${target_arch}")"
+                "${build_target}" "${target_arch}")"
             exit 1
         fi
 
@@ -6111,9 +6261,9 @@ main() {
             tested=$((tested + 1))
 
             if boot_test_run "${img}" \
-                             "${target_arch}" \
-                             "$(boot_test_pattern "${comp_provider[$i]}")" \
-                             "${timeout_s}"; then
+                "${target_arch}" \
+                "$(boot_test_pattern "${comp_provider[$i]}")" \
+                "${timeout_s}"; then
                 summary="${summary}\n  PASS  ${entry_id}"
             else
                 failed=$((failed + 1))
@@ -6130,7 +6280,7 @@ main() {
 
         printf "\n"
         info "$(printf "boot-test: %s of %s slots booted%b\n" \
-                       "$((tested - failed))" "${tested}" "${summary}")"
+            "$((tested - failed))" "${tested}" "${summary}")"
         printf "\n"
 
         if [ 0 != "${failed}" ]; then
@@ -6166,13 +6316,13 @@ main() {
         if [ ! -e "${img}" ]; then
             error "$(printf "Can not find disk image: %s\n" "${img}")"
             info "$(printf "Create it first:\n\n  # image-builder create %s %s\n" \
-                           "${build_target}" "${target_arch}")"
+                "${build_target}" "${target_arch}")"
             exit 1
         fi
 
         # The BSD targets boot under bhyve; everything else under qemu
         case "$build_target" in
-        freebsd|nanobsd)
+        freebsd | nanobsd)
             run_virt_freebsd "${img}"
             ;;
         *)
