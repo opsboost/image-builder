@@ -618,6 +618,28 @@ write_sway_dropins() {
 
 # Gentoo installs the pipewire user units but does not enable them. Enable
 # for every user, the sway session's user manager starts them
+# Console audio with no desktop: pipewire needs the user's own manager
+# running without a login (linger) and access to /dev/snd without a seat
+enable_headless_audio() {
+    local mnt_path
+    mnt_path="${1}"
+    local user
+    user="${2}"
+
+    [ -n "${user}" ] || return 0
+    grep -q "^${user}:" "${mnt_path}/etc/passwd" 2>/dev/null || return 0
+    [ -x "${mnt_path}/usr/lib/systemd/systemd" ] || return 0
+
+    # seatless /dev/snd access
+    chroot "${mnt_path}" usermod -aG audio "${user}" || true
+
+    # start the user manager (and pipewire) at boot with no login. systemd
+    # reads this marker directory, so touch it directly rather than run
+    # loginctl against a logind that is not up in the build chroot
+    mkdir -p "${mnt_path}/var/lib/systemd/linger"
+    : >"${mnt_path}/var/lib/systemd/linger/${user}"
+}
+
 enable_pipewire_user_units() {
     local mnt_path
     mnt_path="${1}"
@@ -675,6 +697,16 @@ enable_airplay_sinks() {
     local system
     system="${mnt_path}/etc/systemd/system"
 
+    # Only wire up AirPlay when pipewire actually carries the raop module,
+    # which needs the ssl and zeroconf USE flags. A pipewire without it
+    # aborts on a mandatory module load and takes all audio down with it, so
+    # this stays a no-op until a stage4 built with those flags ships the
+    # module, then it turns on by itself
+    if ! ls "${mnt_path}"/usr/lib*/pipewire-*/libpipewire-module-raop-discover.so >/dev/null 2>&1; then
+        debug "enable_airplay_sinks: no raop module in rootfs, skipping"
+        return 0
+    fi
+
     if [ -f "${mnt_path}/usr/lib/systemd/system/avahi-daemon.service" ]; then
         mkdir -p "${system}/multi-user.target.wants" "${system}/sockets.target.wants"
         ln -s -f /usr/lib/systemd/system/avahi-daemon.service \
@@ -689,7 +721,8 @@ enable_airplay_sinks() {
 # AirPlay receivers found through avahi become sinks, needs pipewire built
 # with zeroconf and ssl
 context.modules = [
-    { name = libpipewire-module-raop-discover }
+    # ifexists so a pipewire without the module skips it instead of aborting
+    { name = libpipewire-module-raop-discover flags = [ ifexists ] }
 ]
 RAOPEOF
     fi
@@ -900,6 +933,23 @@ EOF
     ln -s -f "${path}/booted.service" "${path}/getty.target.wants/booted.service"
 }
 
+# systemd-resolved manages resolv.conf via its 127.0.0.53 stub, which only
+# answers when the service runs. The stage4 build leaves a copy of the build
+# host's resolv.conf here (its nameserver and search domain leak into the
+# image), so enable resolved and repoint resolv.conf at the live stub.
+# networkd hands it the DHCP DNS servers
+enable_systemd_resolved() {
+    local mnt_path
+    mnt_path="${1}"
+
+    [ -f "${mnt_path}/usr/lib/systemd/system/systemd-resolved.service" ] || return 0
+
+    mkdir -p "${mnt_path}/etc/systemd/system/multi-user.target.wants"
+    ln -s -f /usr/lib/systemd/system/systemd-resolved.service \
+        "${mnt_path}/etc/systemd/system/multi-user.target.wants/systemd-resolved.service"
+    ln -s -f /run/systemd/resolve/stub-resolv.conf "${mnt_path}/etc/resolv.conf"
+}
+
 write_net_config() {
     local mnt_path
     mnt_path="${1}"
@@ -932,6 +982,7 @@ EOF
         mkdir -p "${mnt_path}/etc/systemd/system/multi-user.target.wants"
         ln -s -f "/usr/lib/systemd/system/systemd-networkd.service" \
             "${mnt_path}/etc/systemd/system/multi-user.target.wants/systemd-networkd.service"
+        enable_systemd_resolved "${mnt_path}"
         ;;
     systemd-networkd-static)
         local path
@@ -951,6 +1002,7 @@ EOF
         mkdir -p "${mnt_path}/etc/systemd/system/multi-user.target.wants"
         ln -s -f "/usr/lib/systemd/system/systemd-networkd.service" \
             "${mnt_path}/etc/systemd/system/multi-user.target.wants/systemd-networkd.service"
+        enable_systemd_resolved "${mnt_path}"
         ;;
     gokrazy-dhcp)
         add_dhcp_client "${mnt_path}" "${target_arch}"
@@ -1863,10 +1915,19 @@ composition_fetch() {
                           "${comp_kernel_src[$i]}.sha384"
             if [ -n "${comp_dtb_src[$i]}" ]; then
                 info "Fetching device tree"
-                download_miss "${download_path}" \
-                              "${kernel_repo_url}/${comp_dtb_src[$i]}" \
-                              "${kernel_repo_url}/${comp_dtb_src[$i]}.sha384" \
-                              "${comp_dtb_src[$i]}.sha384"
+                # Optional: the kernel release only carries a dtb once
+                # linux-kernel-build emits one. Until then boot on U-Boot's
+                # own device tree. The subshell contains download_miss's exit
+                if ! (
+                    download_miss "${download_path}" \
+                        "${kernel_repo_url}/${comp_dtb_src[$i]}" \
+                        "${kernel_repo_url}/${comp_dtb_src[$i]}.sha384" \
+                        "${comp_dtb_src[$i]}.sha384"
+                ); then
+                    info "$(printf "Device tree %s not published, booting on U-Boot's own\n" "${comp_dtb_src[$i]}")"
+                    comp_dtb_src[i]=""
+                    comp_dtb[i]=""
+                fi
             fi
 
             gentoo_fetch_stage3 "${target_arch}"
@@ -4293,6 +4354,7 @@ provision() {
     info "Enabling pipewire user units"
     enable_pipewire_user_units "${mnt_path}"
     enable_wireplumber_audio "${mnt_path}"
+    enable_headless_audio "${mnt_path}" "${user}"
     enable_airplay_sinks "${mnt_path}"
 
     info "Enabling sshd"
