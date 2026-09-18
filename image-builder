@@ -468,6 +468,23 @@ create_user() {
     chroot "${path}" /bin/sh -c "${cmd}"
 }
 
+set_login_shell() {
+    local mnt_path
+    mnt_path="${1}"
+    local user
+    user="${2}"
+    local shell
+    shell="/usr/bin/brush"
+
+    [ -n "${user}" ] || return 0
+    [ -x "${mnt_path}${shell}" ] || return 0
+
+    if ! grep -qx "${shell}" "${mnt_path}/etc/shells" 2>/dev/null; then
+        printf '%s\n' "${shell}" >>"${mnt_path}/etc/shells"
+    fi
+    chroot "${mnt_path}" usermod -s "${shell}" "${user}" || true
+}
+
 # Resolve a username to id in a chroot
 chroot_user_id() {
     local path
@@ -933,11 +950,6 @@ EOF
     ln -s -f "${path}/booted.service" "${path}/getty.target.wants/booted.service"
 }
 
-# systemd-resolved manages resolv.conf via its 127.0.0.53 stub, which only
-# answers when the service runs. The stage4 build leaves a copy of the build
-# host's resolv.conf here (its nameserver and search domain leak into the
-# image), so enable resolved and repoint resolv.conf at the live stub.
-# networkd hands it the DHCP DNS servers
 enable_systemd_resolved() {
     local mnt_path
     mnt_path="${1}"
@@ -948,6 +960,17 @@ enable_systemd_resolved() {
     ln -s -f /usr/lib/systemd/system/systemd-resolved.service \
         "${mnt_path}/etc/systemd/system/multi-user.target.wants/systemd-resolved.service"
     ln -s -f /run/systemd/resolve/stub-resolv.conf "${mnt_path}/etc/resolv.conf"
+}
+
+enable_systemd_timesyncd() {
+    local mnt_path
+    mnt_path="${1}"
+
+    [ -f "${mnt_path}/usr/lib/systemd/system/systemd-timesyncd.service" ] || return 0
+
+    mkdir -p "${mnt_path}/etc/systemd/system/sysinit.target.wants"
+    ln -s -f /usr/lib/systemd/system/systemd-timesyncd.service \
+        "${mnt_path}/etc/systemd/system/sysinit.target.wants/systemd-timesyncd.service"
 }
 
 write_net_config() {
@@ -983,6 +1006,7 @@ EOF
         ln -s -f "/usr/lib/systemd/system/systemd-networkd.service" \
             "${mnt_path}/etc/systemd/system/multi-user.target.wants/systemd-networkd.service"
         enable_systemd_resolved "${mnt_path}"
+        enable_systemd_timesyncd "${mnt_path}"
         ;;
     systemd-networkd-static)
         local path
@@ -1003,6 +1027,7 @@ EOF
         ln -s -f "/usr/lib/systemd/system/systemd-networkd.service" \
             "${mnt_path}/etc/systemd/system/multi-user.target.wants/systemd-networkd.service"
         enable_systemd_resolved "${mnt_path}"
+        enable_systemd_timesyncd "${mnt_path}"
         ;;
     gokrazy-dhcp)
         add_dhcp_client "${mnt_path}" "${target_arch}"
@@ -4299,6 +4324,7 @@ provision() {
     if [ -n "${user}" ]; then
         info "$(printf "Creating user %s\n" "${user}")"
         create_user "${user}" "${mnt_path}"
+        set_login_shell "${mnt_path}" "${user}"
     fi
 
     if [ -n "${ansible_user}" ] && [ "${ansible_user}" != "${user}" ]; then
