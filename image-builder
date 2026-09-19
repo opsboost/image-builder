@@ -736,10 +736,26 @@ enable_airplay_sinks() {
         mkdir -p "${mnt_path}/etc/pipewire/pipewire.conf.d"
         cat <<'RAOPEOF' >"${mnt_path}/etc/pipewire/pipewire.conf.d/raop-discover.conf"
 # AirPlay receivers found through avahi become sinks, needs pipewire built
-# with zeroconf and ssl
+# with zeroconf and ssl. max-volume caps the sinks, which otherwise appear at
+# full volume, far louder than the local cards. It is a ceiling not a default,
+# raise it here if the speakers need more headroom
 context.modules = [
     # ifexists so a pipewire without the module skips it instead of aborting
-    { name = libpipewire-module-raop-discover flags = [ ifexists ] }
+    { name = libpipewire-module-raop-discover
+        flags = [ ifexists ]
+        args = {
+            stream.rules = [
+                {
+                    matches = [ { raop.ip = "~.*" } ]
+                    actions = {
+                        create-stream = {
+                            stream.props = { channelmix.max-volume = 0.5 }
+                        }
+                    }
+                }
+            ]
+        }
+    }
 ]
 RAOPEOF
     fi
