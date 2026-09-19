@@ -87,6 +87,10 @@ freebsd_config_url="https://github.com/bbusse/freebsd-config"
 # Root password baked into built images so CI can boot-test them under
 # qemu; these images are throwaway CI artifacts, not production systems
 freebsd_ci_root_password="freebsd-ci"
+# Initial password hash shared by root and the image user for first login. A
+# known default, not a secret, change it per fleet
+# shellcheck disable=SC2016 # literal crypt hash, must not expand
+default_password_hash='$6$I9Q9AyTL$Z76H7wD8mT9JAyrp/vaYyFwyA5wRVN0tze8pvM.MqScC7BBm2PU7pLL0h5nSxueqUpYAlZTox4Ag2Dp5vchjJ0'
 freebsd_use_release_script="${FREEBSD_USE_RELEASE_SCRIPT:-true}"
 
 # NomadBSD
@@ -466,6 +470,14 @@ create_user() {
     esac
 
     chroot "${path}" /bin/sh -c "${cmd}"
+
+    # Same initial password hash as root, so the user can log in on the console
+    case "${os}" in
+    freebsd) ;;
+    *)
+        chroot "${path}" usermod -p "${default_password_hash}" "${user}" || true
+        ;;
+    esac
 }
 
 set_login_shell() {
@@ -633,10 +645,6 @@ write_sway_dropins() {
     printf 'output Virtual-1 disable\n' >"${mnt_path}/etc/sway/config.d/no-virtual-output"
 }
 
-# Gentoo installs the pipewire user units but does not enable them. Enable
-# for every user, the sway session's user manager starts them
-# Console audio with no desktop: pipewire needs the user's own manager
-# running without a login (linger) and access to /dev/snd without a seat
 enable_headless_audio() {
     local mnt_path
     mnt_path="${1}"
@@ -655,6 +663,104 @@ enable_headless_audio() {
     # loginctl against a logind that is not up in the build chroot
     mkdir -p "${mnt_path}/var/lib/systemd/linger"
     : >"${mnt_path}/var/lib/systemd/linger/${user}"
+}
+
+set_hdmi_volume() {
+    local mnt_path
+    mnt_path="${1}"
+    local units
+    units="${mnt_path}/usr/lib/systemd/user"
+
+    [ -f "${units}/pipewire.socket" ] || return 0
+
+    mkdir -p "${mnt_path}/usr/local/bin"
+    cat <<'EOF' >"${mnt_path}/usr/local/bin/set-hdmi-volume"
+#!/bin/sh
+# Set the HDMI sink to 50%, retrying until the sink has appeared
+i=0
+while [ "${i}" -lt 10 ]; do
+    s="$(pactl list short sinks | awk '/hdmi/ { print $2; exit }')"
+    if [ -n "${s}" ]; then
+        pactl set-sink-volume "${s}" 50%
+        break
+    fi
+    i=$((i + 1))
+    sleep 1
+done
+EOF
+    chmod 0755 "${mnt_path}/usr/local/bin/set-hdmi-volume"
+
+    mkdir -p "${mnt_path}/etc/systemd/user/default.target.wants"
+    cat <<'EOF' >"${mnt_path}/etc/systemd/user/set-hdmi-volume.service"
+[Unit]
+Description=Set the HDMI sink to 50%
+After=pipewire-pulse.service wireplumber.service
+Wants=wireplumber.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/set-hdmi-volume
+
+[Install]
+WantedBy=default.target
+EOF
+    ln -s -f /etc/systemd/user/set-hdmi-volume.service \
+        "${mnt_path}/etc/systemd/user/default.target.wants/set-hdmi-volume.service"
+}
+
+# raop sinks arrive from discovery at full volume, far louder than the local
+# cards, and pipewire cannot set their initial volume. A fresh device has no
+# saved wireplumber state, so the first stream blasts. Watch for sinks and cap
+# any raop one that comes up above 40%, on every boot for every speaker
+set_raop_volume() {
+    local mnt_path
+    mnt_path="${1}"
+    local units
+    units="${mnt_path}/usr/lib/systemd/user"
+
+    [ -f "${units}/pipewire.socket" ] || return 0
+
+    mkdir -p "${mnt_path}/usr/local/bin"
+    cat <<'EOF' >"${mnt_path}/usr/local/bin/set-raop-volume"
+#!/bin/sh
+# Cap every raop sink at 40%, lowering only those that come up higher so a
+# quieter manual level still sticks
+max=40
+cap() {
+    pactl list short sinks | awk '/raop/ { print $2 }' | while read -r s; do
+        v="$(pactl get-sink-volume "${s}" 2>/dev/null |
+            awk -F/ 'NR == 1 { gsub(/[ %]/, "", $2); print $2 + 0; exit }')"
+        if [ -n "${v}" ] && [ "${v}" -gt "${max}" ]; then
+            pactl set-sink-volume "${s}" "${max}%"
+        fi
+    done
+}
+cap
+pactl subscribe 2>/dev/null | while read -r ev; do
+    case "${ev}" in
+    *"on sink"*) cap ;;
+    esac
+done
+EOF
+    chmod 0755 "${mnt_path}/usr/local/bin/set-raop-volume"
+
+    mkdir -p "${mnt_path}/etc/systemd/user/default.target.wants"
+    cat <<'EOF' >"${mnt_path}/etc/systemd/user/set-raop-volume.service"
+[Unit]
+Description=Cap AirPlay (raop) sinks at 40%
+After=pipewire-pulse.service wireplumber.service
+Wants=wireplumber.service
+
+[Service]
+ExecStart=/usr/local/bin/set-raop-volume
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target
+EOF
+    ln -s -f /etc/systemd/user/set-raop-volume.service \
+        "${mnt_path}/etc/systemd/user/default.target.wants/set-raop-volume.service"
 }
 
 enable_pipewire_user_units() {
@@ -736,25 +842,12 @@ enable_airplay_sinks() {
         mkdir -p "${mnt_path}/etc/pipewire/pipewire.conf.d"
         cat <<'RAOPEOF' >"${mnt_path}/etc/pipewire/pipewire.conf.d/raop-discover.conf"
 # AirPlay receivers found through avahi become sinks, needs pipewire built
-# with zeroconf and ssl. max-volume caps the sinks, which otherwise appear at
-# full volume, far louder than the local cards. It is a ceiling not a default,
-# raise it here if the speakers need more headroom
+# with zeroconf and ssl. Their volume is capped by the set-raop-volume user
+# service, channelmix.max-volume on the stream does not clamp these sinks
 context.modules = [
     # ifexists so a pipewire without the module skips it instead of aborting
     { name = libpipewire-module-raop-discover
         flags = [ ifexists ]
-        args = {
-            stream.rules = [
-                {
-                    matches = [ { raop.ip = "~.*" } ]
-                    actions = {
-                        create-stream = {
-                            stream.props = { channelmix.max-volume = 0.5 }
-                        }
-                    }
-                }
-            ]
-        }
     }
 ]
 RAOPEOF
@@ -900,7 +993,7 @@ EOF
     write_swapfile_unit "${mnt_path}"
 }
 
-write_provision_key_fetch() {
+write_provision_fetch() {
     local mnt_path
     mnt_path="${1}"
     local user
@@ -910,77 +1003,87 @@ write_provision_key_fetch() {
 
     [ -n "${user}" ] || return 0
 
-    cat <<'EOF' >"${mnt_path}/usr/local/sbin/fetch-provision-keys"
+    cat <<'EOF' >"${mnt_path}/usr/local/sbin/fetch-provision"
 #!/bin/sh
-# Install this device's authorised ssh keys from the provisioning server (the
-# default gateway's uhttpd). Runs once on first boot after the network is up.
-# Reports every outcome to the journal and console. Skips quietly when not
-# applicable; exits non-zero (visibly failed unit) when it should have
-# provisioned but could not, without blocking boot
-warn() { echo "provision-keys: $*" >&2; }
+# Fetch this device's provisioning from the default gateway on first boot: the
+# image user's authorised ssh keys, and a WireGuard config for
+# systemd-networkd if the server has one. Runs after the network is up,
+# reports outcomes to the journal and console, never blocks boot. Exits
+# non-zero (visibly failed unit) only when it could not reach the server
+warn() { echo "provision: $*" >&2; }
 
 user="${1:-}"
 [ -n "${user}" ] && [ -d "/home/${user}" ] || {
     warn "no image user home, nothing to provision"
     exit 0
 }
-
 command -v curl >/dev/null 2>&1 || {
-    warn "curl not installed, cannot fetch keys"
+    warn "curl not installed, cannot provision"
     exit 1
 }
-
 gw="$(ip route show default 2>/dev/null | awk '/^default/ {print $3; exit}')"
 [ -n "${gw}" ] || {
     warn "no default gateway, cannot reach provisioning server"
     exit 1
 }
+base="http://${gw}/cgi-bin/provision"
+rc=0
 
-url="http://${gw}/cgi-bin/provision"
 tmp="$(mktemp)" || exit 1
-
-if ! curl -fsS --max-time 10 -o "${tmp}" "${url}"; then
-    warn "could not reach ${url}"
-    rm -f "${tmp}"
-    exit 1
+if curl -fsS --max-time 10 -o "${tmp}" "${base}"; then
+    if [ -s "${tmp}" ]; then
+        ssh_dir="/home/${user}/.ssh"
+        ak="${ssh_dir}/authorized_keys"
+        install -d -m 0700 -o "${user}" -g "${user}" "${ssh_dir}"
+        cat "${tmp}" >>"${ak}"
+        sort -u -o "${ak}" "${ak}"
+        chown "${user}:${user}" "${ak}"
+        chmod 0600 "${ak}"
+        echo "provision: installed ssh keys for ${user}"
+    fi
+else
+    warn "could not fetch ssh keys from ${base}"
+    rc=1
 fi
-
-if [ ! -s "${tmp}" ]; then
-    warn "no keys returned by ${url}"
-    rm -f "${tmp}"
-    exit 1
-fi
-
-ssh_dir="/home/${user}/.ssh"
-ak="${ssh_dir}/authorized_keys"
-install -d -m 0700 -o "${user}" -g "${user}" "${ssh_dir}"
-cat "${tmp}" >>"${ak}"
-sort -u -o "${ak}" "${ak}"
-chown "${user}:${user}" "${ak}"
-chmod 0600 "${ak}"
 rm -f "${tmp}"
-echo "provision-keys: installed keys from ${url} for ${user}"
-exit 0
-EOF
-    chmod 0755 "${mnt_path}/usr/local/sbin/fetch-provision-keys"
 
-    cat <<EOF >"${path}/fetch-provision-keys.service"
+# WireGuard for systemd-networkd, only if the server has a config for this
+# device. wg0.netdev carries the private key, so it is root:systemd-network 0640
+wg=0
+for f in wg0.netdev wg0.network; do
+    tmp="$(mktemp)" || continue
+    if curl -fsS --max-time 10 -o "${tmp}" "${base}?f=${f}" && [ -s "${tmp}" ]; then
+        install -m 0640 -o root -g systemd-network "${tmp}" "/etc/systemd/network/${f}"
+        wg=1
+    fi
+    rm -f "${tmp}"
+done
+if [ "${wg}" = 1 ]; then
+    networkctl reload 2>/dev/null || systemctl reload systemd-networkd 2>/dev/null || true
+    echo "provision: installed WireGuard config"
+fi
+
+exit "${rc}"
+EOF
+    chmod 0755 "${mnt_path}/usr/local/sbin/fetch-provision"
+
+    cat <<EOF >"${path}/fetch-provision.service"
 [Unit]
-Description=First-boot fetch of authorised ssh keys from the provisioning server
+Description=First-boot fetch of provisioning from the gateway (ssh keys, WireGuard)
 ConditionFirstBoot=yes
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/fetch-provision-keys "${user}"
+ExecStart=/usr/local/sbin/fetch-provision "${user}"
 
 [Install]
 WantedBy=multi-user.target
 EOF
     mkdir -p "${path}/multi-user.target.wants"
-    ln -s -f "${path}/fetch-provision-keys.service" \
-        "${path}/multi-user.target.wants/fetch-provision-keys.service"
+    ln -s -f "${path}/fetch-provision.service" \
+        "${path}/multi-user.target.wants/fetch-provision.service"
 }
 
 wifi_enable() {
@@ -4297,7 +4400,7 @@ gentoo_install_stage4_binpkgs() {
 set_default_root_pw() {
     local file
     file="${1}"
-    echo 'root:$6$I9Q9AyTL$Z76H7wD8mT9JAyrp/vaYyFwyA5wRVN0tze8pvM.MqScC7BBm2PU7pLL0h5nSxueqUpYAlZTox4Ag2Dp5vchjJ0:14698:0:::::' >${file}
+    echo "root:${default_password_hash}:14698:0:::::" >"${file}"
 }
 
 install_fonts() {
@@ -4511,6 +4614,8 @@ provision() {
     enable_wireplumber_audio "${mnt_path}"
     enable_headless_audio "${mnt_path}" "${user}"
     enable_airplay_sinks "${mnt_path}"
+    set_hdmi_volume "${mnt_path}"
+    set_raop_volume "${mnt_path}"
 
     info "Enabling sshd"
     service_enable "${mnt_path}" "sshd" "getty"
@@ -4521,7 +4626,7 @@ provision() {
     if [ -x "${mnt_path}/usr/lib/systemd/systemd" ]; then
         info "systemd rootfs: installing first-boot provisioning"
         provision_systemd_firstboot "${mnt_path}" "${user}"
-        write_provision_key_fetch "${mnt_path}" "${user}"
+        write_provision_fetch "${mnt_path}" "${user}"
     else
         debug "no systemd in rootfs: skipping first-boot provisioning and swapfile"
     fi
