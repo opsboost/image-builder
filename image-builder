@@ -964,6 +964,16 @@ if [ -n "${user}" ] && [ -d "/home/${user}" ]; then
         printf 'from="127.0.0.1,::1" %s\n' "$(cat "${key}.pub")" \
             >>/root/.ssh/authorized_keys
         chmod 0600 /root/.ssh/authorized_keys
+        cfg="/home/${user}/.ssh/config"
+        if [ ! -e "${cfg}" ]; then
+            cat >"${cfg}" <<'SSHCFG'
+Match host localhost,127.0.0.1,::1 user root
+    IdentityFile ~/.ssh/id_local_root
+    IdentitiesOnly yes
+SSHCFG
+            chown "${user}:${user}" "${cfg}"
+            chmod 0600 "${cfg}"
+        fi
     fi
 fi
 EOF
@@ -3948,6 +3958,17 @@ openwrt_build() {
     git clone --depth 1 "${openwrt_config_url}"
     mv openwrt-config/openwrt-config-"$flavour" .config
 
+    # Package feeds
+    ./scripts/feeds update -a
+    ./scripts/feeds install -a
+
+    # Signing
+    if [ -n "${OPENWRT_APK_PRIVATE_KEY:-}" ]; then
+        info "$(printf "OpenWrt: Using provided apk signing key")"
+        (umask 077 && printf '%s\n' "${OPENWRT_APK_PRIVATE_KEY}" >private-key.pem)
+        openssl ec -in private-key.pem -pubout -out public-key.pem
+    fi
+
     # Expand the (possibly partial) config against this tree: fills in
     # defaults and selects forced dependencies, so a config only needs
     # to list what differs from the defaults.
@@ -4619,7 +4640,7 @@ provision() {
 
     info "Enabling sshd"
     service_enable "${mnt_path}" "sshd" "getty"
-    harden_sshd "${mnt_path}" "${user}"
+    configure_sshd "${mnt_path}" "${user}"
 
     # Anything without systemd keeps the provisioning above and gets no
     # swapfile, activation would need init-specific plumbing
@@ -5168,7 +5189,7 @@ disk_show_storage_devices() {
 
 # Root login only from loopback, no second sshd. The moonshine -> root@localhost
 # key connects from 127.0.0.1, everything else is denied. No password root
-harden_sshd() {
+configure_sshd() {
     local mnt_path
     mnt_path="${1}"
     local user
@@ -5215,7 +5236,7 @@ After=net-config.service
 ExecStartPre=mount -o remount,rw /
 ExecStartPre=sleep 2
 ExecStartPre=/usr/bin/ssh-keygen -A
-# Honour sshd_config, which limits root login to loopback (see harden_sshd)
+# Honour sshd_config, which limits root login to loopback (see configure_sshd)
 ExecStart=/usr/sbin/sshd -D -e
 ExecReload=/bin/kill -HUP $MAINPID
 KillMode=process
