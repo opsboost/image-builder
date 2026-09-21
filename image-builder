@@ -458,7 +458,7 @@ create_user() {
         cmd="pw user add -n ${user} -m -G wheel"
         ;;
     gentoo | arch | alpine)
-        cmd="useradd -m -G wheel -s /bin/bash ${user}"
+        cmd="useradd -m -G wheel,video,tty -s /bin/bash ${user}"
         ;;
     debian | ubuntu | fedora)
         cmd="adduser -U ${user} ${user}"
@@ -665,7 +665,7 @@ enable_headless_audio() {
     : >"${mnt_path}/var/lib/systemd/linger/${user}"
 }
 
-set_hdmi_volume() {
+set_hdmi_audio() {
     local mnt_path
     mnt_path="${1}"
     local units
@@ -674,13 +674,14 @@ set_hdmi_volume() {
     [ -f "${units}/pipewire.socket" ] || return 0
 
     mkdir -p "${mnt_path}/usr/local/bin"
-    cat <<'EOF' >"${mnt_path}/usr/local/bin/set-hdmi-volume"
+    cat <<'EOF' >"${mnt_path}/usr/local/bin/set-hdmi-audio"
 #!/bin/sh
-# Set the HDMI sink to 50%, retrying until the sink has appeared
+# Make HDMI the default sink and set it to 50%, retrying until it appears
 i=0
 while [ "${i}" -lt 10 ]; do
     s="$(pactl list short sinks | awk '/hdmi/ { print $2; exit }')"
     if [ -n "${s}" ]; then
+        pactl set-default-sink "${s}"
         pactl set-sink-volume "${s}" 50%
         break
     fi
@@ -688,24 +689,24 @@ while [ "${i}" -lt 10 ]; do
     sleep 1
 done
 EOF
-    chmod 0755 "${mnt_path}/usr/local/bin/set-hdmi-volume"
+    chmod 0755 "${mnt_path}/usr/local/bin/set-hdmi-audio"
 
     mkdir -p "${mnt_path}/etc/systemd/user/default.target.wants"
-    cat <<'EOF' >"${mnt_path}/etc/systemd/user/set-hdmi-volume.service"
+    cat <<'EOF' >"${mnt_path}/etc/systemd/user/set-hdmi-audio.service"
 [Unit]
-Description=Set the HDMI sink to 50%
+Description=Default audio to HDMI at 50%
 After=pipewire-pulse.service wireplumber.service
 Wants=wireplumber.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/set-hdmi-volume
+ExecStart=/usr/local/bin/set-hdmi-audio
 
 [Install]
 WantedBy=default.target
 EOF
-    ln -s -f /etc/systemd/user/set-hdmi-volume.service \
-        "${mnt_path}/etc/systemd/user/default.target.wants/set-hdmi-volume.service"
+    ln -s -f /etc/systemd/user/set-hdmi-audio.service \
+        "${mnt_path}/etc/systemd/user/default.target.wants/set-hdmi-audio.service"
 }
 
 # raop sinks arrive from discovery at full volume, far louder than the local
@@ -787,6 +788,22 @@ enable_pipewire_user_units() {
         ln -s -f /usr/lib/systemd/user/wireplumber.service \
             "${path}/pipewire.service.wants/wireplumber.service"
     fi
+}
+
+set_audio_rtprio() {
+    local mnt_path
+    mnt_path="${1}"
+
+    [ -f "${mnt_path}/usr/lib/systemd/user/pipewire.socket" ] || return 0
+
+    local dir
+    dir="${mnt_path}/etc/systemd/system.conf.d"
+    mkdir -p "${dir}"
+    cat <<'EOF' >"${dir}/10-rtprio.conf"
+[Manager]
+DefaultLimitRTPRIO=95
+DefaultLimitRTTIME=200ms
+EOF
 }
 
 # The wireplumber.conf Gentoo installs has hardware.audio and
@@ -3121,6 +3138,64 @@ EOF
     sleep 1
 }
 
+# Chainload rEFInd from systemd-boot
+install_refind_chainload() {
+    local esp_dev
+    esp_dev="${1}"
+    local mnt_path
+    mnt_path="${2}"
+    local rootfs_dev
+    rootfs_dev="${3}"
+    local fs_type
+    fs_type="${4}"
+    local src_path
+    src_path="${5}"
+    local target_arch
+    target_arch="${6}"
+
+    reexec_privileged
+
+    local efiarch
+    case "${target_arch}" in
+    amd64 | x86_64) efiarch="x64" ;;
+    arm64 | aarch64) efiarch="aa64" ;;
+    *)
+        info "$(printf "rEFInd: no EFI binary for arch %s, skipping\n" "${target_arch}")"
+        return 0
+        ;;
+    esac
+
+    local refind
+    refind="refind_${efiarch}.efi"
+
+    # Take the binary out of the freshly provisioned rootfs into staging
+    mkdir -p "${mnt_path}"
+    mount -t "${fs_type}" -o ro "${rootfs_dev}" "${mnt_path}"
+    if [ ! -f "${mnt_path}/usr/share/refind/${refind}" ]; then
+        info "$(printf "rEFInd: %s not in rootfs, skipping chainload entry\n" "${refind}")"
+        umount "${mnt_path}"
+        return 0
+    fi
+    cp "${mnt_path}/usr/share/refind/${refind}" "${src_path}/${refind}"
+    umount "${mnt_path}"
+
+    # Install it on the ESP and add a non-default chainload entry beside the
+    # kernel entries, leaving loader.conf's default untouched
+    esp_mount "${esp_dev}" "${mnt_path}"
+    esp_install_file "${src_path}" "${refind}" \
+        "${mnt_path}" "EFI/refind/${refind}"
+    create_boot_entry "${mnt_path}/loader/entries/refind.conf" \
+        "rEFInd boot menu" \
+        "efi" \
+        "EFI/refind/${refind}" \
+        "" "" "" ""
+    info "$(printf "rEFInd chainload entry:\n")"
+    cat "${mnt_path}/loader/entries/refind.conf"
+    printf "\n"
+    unmount_recursive "${mnt_path}"
+    sleep 1
+}
+
 sys_os() {
     local uname
     local os
@@ -4632,10 +4707,11 @@ provision() {
 
     info "Enabling pipewire user units"
     enable_pipewire_user_units "${mnt_path}"
+    set_audio_rtprio "${mnt_path}"
     enable_wireplumber_audio "${mnt_path}"
     enable_headless_audio "${mnt_path}" "${user}"
     enable_airplay_sinks "${mnt_path}"
-    set_hdmi_volume "${mnt_path}"
+    set_hdmi_audio "${mnt_path}"
     set_raop_volume "${mnt_path}"
 
     info "Enabling sshd"
@@ -6113,6 +6189,13 @@ main() {
                     "${build_target}"
 
                 verify_filesystem "${slot_dev}" "provision"
+
+                install_refind_chainload "${esp_dev}" \
+                    "${mnt_path}" \
+                    "${slot_dev}" \
+                    "${comp_fs[$i]}" \
+                    "${path}" \
+                    "${target_arch}"
             done
 
             verify_filesystem "${esp_dev}" "provision"
