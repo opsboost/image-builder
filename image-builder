@@ -106,12 +106,6 @@ nomadbsd_source_url="https://github.com/NomadBSD/NomadBSD"
 nomadbsd_filesystem="${NOMADBSD_FILESYSTEM:-ufs}"
 nomadbsd_loader_file="nomadbsd-loader.efi"
 
-# Kernel command lines shared by the Linux slots of a composition
-# The serial console differs by architecture: qemu's arm64 virt machine
-# gives a pl011 at ttyAMA0, where x86 has an 8250 at ttyS0. That arm64
-# default is wrong on real Allwinner (pine64) and Rockchip (rockpro64)
-# hardware, neither of which has PL011 - both expose their UART through the
-# 8250 driver as ttyS0, same as x86
 linux_cmdline_console() {
     local arch
     arch="${1}"
@@ -119,8 +113,12 @@ linux_cmdline_console() {
     build_target="${2:-}"
 
     case "${build_target}" in
-    gentoo-sway-pine64 | gentoo-sway-rockpro64)
+    gentoo-sway-pine64)
         echo "console=tty0 console=ttyS0,115200n8"
+        return
+        ;;
+    gentoo-sway-rockpro64)
+        echo "console=tty0 console=ttyS2,115200n8"
         return
         ;;
     esac
