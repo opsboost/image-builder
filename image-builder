@@ -4896,7 +4896,7 @@ gentoo_create_disk() {
     case "$os" in
     ubuntu | fedora)
         info "Creating file systems"
-        if ! mkfs.vfat "${esp_dev}"; then
+        if ! mkfs.vfat -F 32 "${esp_dev}"; then
             error "$(printf "Error: Failed to create filesystem on %s\n" "${esp_dev}")"
             exit 1
         fi
