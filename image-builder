@@ -639,6 +639,18 @@ gpu-hwdec-interop=v4l2request-overlay
 EOF
 }
 
+# ffmpeg's v4l2request decoder takes its frame buffers from a dma-buf heap.
+# Gentoo's ffmpeg ships a rule for the heap named linux,cma only, current
+# kernels call it reserved or default_cma_region, so cover all three
+write_dma_heap_udev_rule() {
+    local mnt_path
+    mnt_path="${1}"
+
+    mkdir -p "${mnt_path}/etc/udev/rules.d"
+    printf 'SUBSYSTEM=="dma_heap", KERNEL=="linux,cma|reserved|default_cma_region", GROUP="video", MODE="0660"\n' \
+        >"${mnt_path}/etc/udev/rules.d/60-dma-heap.rules"
+}
+
 # A kernel with vkms gives sway a phantom Virtual-1 output and a second
 # desktop to render every frame. No-op once vkms is out of the kernel
 write_sway_dropins() {
@@ -4707,6 +4719,7 @@ provision() {
     rm -f "${mnt_path}/etc/sway/config.d/exec-payload"
     write_sway_dropins "${mnt_path}"
     write_mpv_config "${mnt_path}"
+    write_dma_heap_udev_rule "${mnt_path}"
     enable_sway_session "${mnt_path}" "${user}"
 
     info "Enabling pipewire user units"
