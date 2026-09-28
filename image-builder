@@ -469,6 +469,12 @@ create_user() {
 
     chroot "${path}" /bin/sh -c "${cmd}"
 
+    # DDC/CI monitor brightness (ddcutil) needs the i2c group, which only the
+    # sets that carry it create
+    if grep -q "^i2c:" "${path}/etc/group"; then
+        chroot "${path}" usermod -aG i2c "${user}"
+    fi
+
     # Same initial password hash as root, so the user can log in on the console
     case "${os}" in
     freebsd) ;;
