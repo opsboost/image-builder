@@ -615,11 +615,14 @@ EOF
         "${path}/default.target"
 }
 
-# v4l2request decodes on the kernel's stateless V4L2 decoder (Cedrus),
-# dmabuf-wayland hands the buffers to the compositor. The only path with
-# correct colours on lima: mpv's own vo=gpu imports NV12 as two planes and
-# lima renders the chroma pink, the -copy variant drops half the frames.
-# Boards without such a decoder fall back to software
+# v4l2request decodes on the kernel's stateless V4L2 decoder (Cedrus on
+# the pine64, Hantro and rkvdec on the rockpro64), dmabuf-wayland hands the
+# buffers to the compositor. The only path with correct colours on lima:
+# mpv's own vo=gpu imports NV12 as two planes and lima renders the chroma
+# pink, the -copy variant drops half the frames. There is no automatic
+# software fallback on that VO, dmabuf-wayland takes DRM PRIME frames only,
+# so a stream the decoder rejects ends in "Video: no video"; the sw profile
+# is the way out, software decode rendered by the GPU
 write_mpv_config() {
     local mnt_path
     mnt_path="${1}"
@@ -629,6 +632,12 @@ write_mpv_config() {
 # See image-builder write_mpv_config
 hwdec=v4l2request
 vo=dmabuf-wayland
+
+# When the decoder rejects a stream: mpv --profile=sw <url>
+# Software decode, GPU rendering, works for anything up to about 720p
+[sw]
+hwdec=no
+vo=gpu
 
 # On a VT: mpv --profile=vt <url>
 # Decoder buffers go straight to the display engine's video plane, no GPU
@@ -659,6 +668,29 @@ write_sway_dropins() {
 
     mkdir -p "${mnt_path}/etc/sway/config.d"
     printf 'output Virtual-1 disable\n' >"${mnt_path}/etc/sway/config.d/no-virtual-output"
+
+    # Hand the session to systemd: user services get WAYLAND_DISPLAY from the
+    # running compositor, and units wanted by sway-session.target start once
+    # sway is up and stop with graphical-session.target when it exits
+    printf 'exec systemctl --user import-environment WAYLAND_DISPLAY SWAYSOCK && systemctl --user start sway-session.target\n' \
+        >"${mnt_path}/etc/sway/config.d/systemd-session"
+    mkdir -p "${mnt_path}/etc/systemd/user"
+    cat <<'EOF' >"${mnt_path}/etc/systemd/user/sway-session.target"
+[Unit]
+Description=sway session
+BindsTo=graphical-session.target
+Wants=graphical-session-pre.target
+After=graphical-session-pre.target
+EOF
+
+    # Login shells outside the compositor, ssh and console, ask the user
+    # manager for the same variables, so swaymsg and mpv work from there
+    mkdir -p "${mnt_path}/etc/profile.d"
+    cat <<'EOF' >"${mnt_path}/etc/profile.d/sway-session.sh"
+if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
+    eval "$(systemctl --user show-environment 2>/dev/null | awk -F= '$1 == "WAYLAND_DISPLAY" || $1 == "SWAYSOCK" { print "export " $0 }')"
+fi
+EOF
 }
 
 enable_headless_audio() {
@@ -729,6 +761,48 @@ EOF
 # cards, and pipewire cannot set their initial volume. A fresh device has no
 # saved wireplumber state, so the first stream blasts. Watch for sinks and cap
 # any raop one that comes up above 40%, on every boot for every speaker
+# Spotify Connect: the ebuild installs upstream's user unit but does not
+# enable it. Only needs pipewire-pulse, so default.target like the audio units
+enable_spotifyd() {
+    local mnt_path
+    mnt_path="${1}"
+
+    [ -f "${mnt_path}/usr/lib/systemd/user/spotifyd.service" ] || return 0
+
+    mkdir -p "${mnt_path}/etc/systemd/user/default.target.wants"
+    ln -s -f /usr/lib/systemd/user/spotifyd.service \
+        "${mnt_path}/etc/systemd/user/default.target.wants/spotifyd.service"
+}
+
+# AirPlay receiver, mirroring and audio, as a user service in the sway
+# session, uxplay ships no usable unit. Wanted by sway-session.target, so it
+# starts with the compositor's WAYLAND_DISPLAY imported and stops when sway
+# exits. shairport-sync stays installed but unstarted, uxplay covers audio
+enable_uxplay() {
+    local mnt_path
+    mnt_path="${1}"
+
+    [ -x "${mnt_path}/usr/bin/uxplay" ] || return 0
+
+    mkdir -p "${mnt_path}/etc/systemd/user/sway-session.target.wants"
+    cat <<'EOF' >"${mnt_path}/etc/systemd/user/uxplay.service"
+[Unit]
+Description=AirPlay screen mirroring receiver
+PartOf=graphical-session.target
+After=graphical-session.target pipewire.service
+
+[Service]
+ExecStart=/usr/bin/uxplay -fs -n %H -nh
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=sway-session.target
+EOF
+    ln -s -f /etc/systemd/user/uxplay.service \
+        "${mnt_path}/etc/systemd/user/sway-session.target.wants/uxplay.service"
+}
+
 set_raop_volume() {
     local mnt_path
     mnt_path="${1}"
@@ -953,10 +1027,25 @@ cred() {
 }
 
 # Grow root to the end of the disk, only when it is the last partition.
-# sysfs only, udev has not necessarily settled this early
+# sysfs and blkid only, udev has not necessarily settled this early
 root_src="$(findmnt -no SOURCE /)"
 root_part="${root_src##*/}"
-if [ -r "/sys/class/block/${root_part}/partition" ]; then
+# Two copies of one image are indistinguishable by PARTUUID, so the kernel
+# may have mounted the copy that was not booted. Growing that one leaves a
+# filesystem larger than its partition on the other medium
+twin=""
+root_uuid="$(blkid -o value -s PARTUUID "${root_src}" || true)"
+for p in /sys/class/block/*/partition; do
+    name="$(basename "$(dirname "${p}")")"
+    [ "${name}" = "${root_part}" ] && continue
+    if [ -n "${root_uuid}" ] && [ "$(blkid -o value -s PARTUUID "/dev/${name}" || true)" = "${root_uuid}" ]; then
+        twin="/dev/${name}"
+        break
+    fi
+done
+if [ -n "${twin}" ]; then
+    echo "firstboot-provision: not growing ${root_src}, ${twin} carries the same PARTUUID" >&2
+elif [ -r "/sys/class/block/${root_part}/partition" ]; then
     partno="$(cat "/sys/class/block/${root_part}/partition")"
     disk_name="$(basename "$(readlink -f "/sys/class/block/${root_part}/..")")"
     last="$(cat /sys/class/block/"${disk_name}"*/partition | sort -n | tail -1)"
@@ -4730,10 +4819,12 @@ provision() {
     enable_airplay_sinks "${mnt_path}"
     set_hdmi_audio "${mnt_path}"
     set_raop_volume "${mnt_path}"
+    enable_spotifyd "${mnt_path}"
+    enable_uxplay "${mnt_path}"
 
     info "Enabling sshd"
     service_enable "${mnt_path}" "sshd" "getty"
-    configure_sshd "${mnt_path}" "${user}"
+    configure_sshd "${mnt_path}"
 
     # Anything without systemd keeps the provisioning above and gets no
     # swapfile, activation would need init-specific plumbing
@@ -5285,8 +5376,6 @@ disk_show_storage_devices() {
 configure_sshd() {
     local mnt_path
     mnt_path="${1}"
-    local user
-    user="${2}"
     local cfg
     cfg="${mnt_path}/etc/ssh/sshd_config"
 
@@ -5300,11 +5389,12 @@ configure_sshd() {
     local dir
     dir="${mnt_path}/etc/ssh/sshd_config.d"
     mkdir -p "${dir}"
-    cat <<SSHDEOF >"${dir}/50-root-local.conf"
-# Only the image user may log in over ssh, from anywhere. root is allowed
-# only from loopback (the ${user} -> root@localhost key), never remotely and
-# never with a password
-AllowUsers ${user} root@127.0.0.1 root@::1
+    cat <<'SSHDEOF' >"${dir}/50-root-local.conf"
+# Only wheel members may log in over ssh, the same group su requires, so a
+# user renamed or created by provisioning stays in as long as it is in wheel.
+# root is in wheel but allowed only from loopback (the image user's
+# root@localhost key), never remotely and never with a password
+AllowGroups wheel
 PermitRootLogin no
 
 Match Address 127.0.0.1,::1
