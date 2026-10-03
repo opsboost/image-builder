@@ -757,12 +757,6 @@ EOF
         "${mnt_path}/etc/systemd/user/default.target.wants/set-hdmi-audio.service"
 }
 
-# raop sinks arrive from discovery at full volume, far louder than the local
-# cards, and pipewire cannot set their initial volume. A fresh device has no
-# saved wireplumber state, so the first stream blasts. Watch for sinks and cap
-# any raop one that comes up above 40%, on every boot for every speaker
-# Spotify Connect: the ebuild installs upstream's user unit but does not
-# enable it. Only needs pipewire-pulse, so default.target like the audio units
 enable_spotifyd() {
     local mnt_path
     mnt_path="${1}"
@@ -948,9 +942,6 @@ enable_airplay_sinks() {
     if [ -f "${mnt_path}/usr/lib/systemd/user/pipewire.socket" ]; then
         mkdir -p "${mnt_path}/etc/pipewire/pipewire.conf.d"
         cat <<'RAOPEOF' >"${mnt_path}/etc/pipewire/pipewire.conf.d/raop-discover.conf"
-# AirPlay receivers found through avahi become sinks, needs pipewire built
-# with zeroconf and ssl. Their volume is capped by the set-raop-volume user
-# service, channelmix.max-volume on the stream does not clamp these sinks
 context.modules = [
     # ifexists so a pipewire without the module skips it instead of aborting
     { name = libpipewire-module-raop-discover
@@ -959,6 +950,93 @@ context.modules = [
 ]
 RAOPEOF
     fi
+}
+
+enable_bluetooth_sink() {
+    local mnt_path
+    mnt_path="${1}"
+    local system
+    system="${mnt_path}/etc/systemd/system"
+
+    if [ ! -f "${mnt_path}/usr/lib/systemd/system/bluetooth.service" ]; then
+        debug "enable_bluetooth_sink: bluez not installed, skipping"
+        return 0
+    fi
+
+    mkdir -p "${mnt_path}/etc/bluetooth"
+    cat <<'EOF' >"${mnt_path}/etc/bluetooth/main.conf"
+[General]
+# Audio/Video major class, loudspeaker minor, phones show a speaker icon
+Class = 0x240414
+# never drop out of discoverable or pairable once turned on
+DiscoverableTimeout = 0
+PairableTimeout = 0
+AlwaysPairable = true
+# a phone that forgot the pairing may pair again without manual cleanup
+JustWorksRepairing = always
+
+[Policy]
+AutoEnable = true
+EOF
+
+    mkdir -p "${system}/bluetooth.target.wants"
+    ln -s -f /usr/lib/systemd/system/bluetooth.service \
+        "${system}/bluetooth.target.wants/bluetooth.service"
+    ln -s -f /usr/lib/systemd/system/bluetooth.service \
+        "${system}/dbus-org.bluez.service"
+
+    if [ -x "${mnt_path}/usr/bin/bt-agent" ]; then
+        cat <<'EOF' >"${system}/bt-agent.service"
+[Unit]
+Description=Accept Bluetooth pairings without a display
+Requires=bluetooth.service
+After=bluetooth.service
+
+[Service]
+ExecStart=/usr/bin/bt-agent -c NoInputNoOutput
+Restart=on-failure
+
+[Install]
+WantedBy=bluetooth.target
+EOF
+        ln -s -f "${system}/bt-agent.service" \
+            "${system}/bluetooth.target.wants/bt-agent.service"
+    fi
+
+    mkdir -p "${mnt_path}/usr/local/bin"
+    cat <<'EOF' >"${mnt_path}/usr/local/bin/set-bt-discoverable"
+#!/bin/sh
+# Turn the adapter discoverable and pairable once it is powered, the
+# timeouts in main.conf keep it that way
+i=0
+while [ "${i}" -lt 20 ]; do
+    if bluetoothctl show | awk '/Powered: yes/ { found = 1 } END { exit !found }'; then
+        bluetoothctl discoverable on
+        bluetoothctl pairable on
+        exit 0
+    fi
+    i=$((i + 1))
+    sleep 1
+done
+echo "set-bt-discoverable: no powered adapter" >&2
+exit 1
+EOF
+    chmod 0755 "${mnt_path}/usr/local/bin/set-bt-discoverable"
+    cat <<'EOF' >"${system}/set-bt-discoverable.service"
+[Unit]
+Description=Keep the Bluetooth adapter discoverable and pairable
+Requires=bluetooth.service
+After=bluetooth.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/set-bt-discoverable
+
+[Install]
+WantedBy=bluetooth.target
+EOF
+    ln -s -f "${system}/set-bt-discoverable.service" \
+        "${system}/bluetooth.target.wants/set-bt-discoverable.service"
 }
 
 # The file is created on first boot, see provision_systemd_firstboot
@@ -4817,6 +4895,7 @@ provision() {
     enable_wireplumber_audio "${mnt_path}"
     enable_headless_audio "${mnt_path}" "${user}"
     enable_airplay_sinks "${mnt_path}"
+    enable_bluetooth_sink "${mnt_path}"
     set_hdmi_audio "${mnt_path}"
     set_raop_volume "${mnt_path}"
     enable_spotifyd "${mnt_path}"
