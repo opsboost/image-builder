@@ -4215,6 +4215,11 @@ openwrt_build() {
     cd openwrt
     git clone --depth 1 "${openwrt_config_url}"
     mv openwrt-config/openwrt-config-"$flavour" .config
+    # Files the image carries on top of its packages, per flavour, e.g.
+    # first boot uci-defaults. The build copies files/ into the rootfs
+    if [ -d openwrt-config/files-"$flavour" ]; then
+        cp -R openwrt-config/files-"$flavour" files
+    fi
 
     # Package feeds
     ./scripts/feeds update -a
