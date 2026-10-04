@@ -3950,6 +3950,12 @@ linux_build_kernel() {
         cd ../../
 
         mv "kernel-config-${kernel_flavour}" output/linux/.config
+        # 32 bit ARM configs cross compile in their own Containerfile
+        local containerfile
+        containerfile="Containerfile"
+        if awk '/^CONFIG_ARM=y$/ { f = 1 } END { exit !f }' output/linux/.config; then
+            containerfile="Containerfile-armhf"
+        fi
         podman buildx build --cap-add=SYS_PTRACE \
             --platform="${platform}" \
             --build-arg KERNEL_VERSION="${kernel_version}" \
@@ -3957,7 +3963,7 @@ linux_build_kernel() {
             --build-arg KERNEL_CONFIG="kernel-config-${kernel_flavour}" \
             -v "${PWD}"/output:/output \
             -t "ghcr.io/bbusse/linux-kernel-${kernel_flavour}:latest" \
-            -f Containerfile .
+            -f "${containerfile}" .
     else
         linux_install_kernel_build_dependencies "${target_arch}"
 
@@ -6153,6 +6159,10 @@ main() {
                     target_arch="arm64"
                     ;;
                 virt-arm64)
+                    target_arch="arm64"
+                    ;;
+                beaglebone-black)
+                    # 32 bit ARM, cross built on an arm64 host
                     target_arch="arm64"
                     ;;
                 x230)
