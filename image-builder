@@ -4539,6 +4539,9 @@ gentoo_add_overlays() {
     # shellcheck disable=SC2086 # $overlays is an intentional word-split URL list
     for url in ${overlays}; do
         tmp_dir="$(mktemp -d)"
+        # mktemp makes the directory 0700 and it becomes the repository as
+        # is, which portage then cannot enter once it drops to the portage user for a fetch
+        chmod 0755 "${tmp_dir}"
         git clone --depth 1 "${url}" "${tmp_dir}"
         name="$(cat "${tmp_dir}/profiles/repo_name")"
         info "$(printf "Gentoo: Adding overlay %s (%s)\n" "${name}" "${url}")"
