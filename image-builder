@@ -106,6 +106,9 @@ nomadbsd_source_url="https://github.com/NomadBSD/NomadBSD"
 nomadbsd_filesystem="${NOMADBSD_FILESYSTEM:-ufs}"
 nomadbsd_loader_file="nomadbsd-loader.efi"
 
+refind_version="${REFIND_VERSION:-0.14.2}"
+refind_sha512="${REFIND_SHA512:-0d70cf0c61de376e2f564d0e0b89d12f04f0ec267f180b5887b64f6f5b6d34202383ffe73bf620b02d4d9c25619e5ed9be014cb8516c461090c1aca599b8f789}"
+
 linux_cmdline_console() {
     local arch
     arch="${1}"
@@ -499,6 +502,15 @@ set_login_shell() {
         printf '%s\n' "${shell}" >>"${mnt_path}/etc/shells"
     fi
     chroot "${mnt_path}" usermod -s "${shell}" "${user}" || true
+
+    mkdir -p "${mnt_path}/etc/profile.d"
+    cat <<'EOF' >"${mnt_path}/etc/profile.d/local-bin.sh"
+case ":${PATH}:" in
+*":${HOME}/.local/bin:"*) ;;
+*) PATH="${HOME}/.local/bin:${PATH}" ;;
+esac
+EOF
+    printf '. /etc/profile.d/local-bin.sh\n' >"${mnt_path}/etc/bash.bashrc"
 }
 
 # Resolve a username to id in a chroot
@@ -581,20 +593,20 @@ enable_sway_session() {
         return 1
     fi
 
-    # containeros and k3s share this provisioning and have no sway
+    # containeros shares this provisioning and has no sway
     if [ ! -x "${mnt_path}/usr/bin/sway" ]; then
         debug "enable_sway_session: no sway in rootfs, skipping"
         return 0
     fi
 
-    cat <<EOF >"${path}/sway-tty1.service"
+    cat <<'EOF' >"${path}/sway-tty1@.service"
 [Unit]
-Description=sway on tty1 as ${user}
+Description=sway on tty1 as %i
 After=systemd-user-sessions.service
 Conflicts=getty@tty1.service autovt@tty1.service
 
 [Service]
-User=${user}
+User=%i
 PAMName=login
 TTYPath=/dev/tty1
 TTYReset=yes
@@ -609,8 +621,8 @@ WantedBy=graphical.target
 EOF
 
     mkdir -p "${path}/graphical.target.wants"
-    ln -s -f "${path}/sway-tty1.service" \
-        "${path}/graphical.target.wants/sway-tty1.service"
+    ln -s -f /etc/systemd/system/sway-tty1@.service \
+        "${path}/graphical.target.wants/sway-tty1@${user}.service"
     ln -s -f "/usr/lib/systemd/system/graphical.target" \
         "${path}/default.target"
 }
@@ -713,7 +725,7 @@ enable_headless_audio() {
     : >"${mnt_path}/var/lib/systemd/linger/${user}"
 }
 
-set_hdmi_audio() {
+set_default_audio() {
     local mnt_path
     mnt_path="${1}"
     local units
@@ -722,12 +734,14 @@ set_hdmi_audio() {
     [ -f "${units}/pipewire.socket" ] || return 0
 
     mkdir -p "${mnt_path}/usr/local/bin"
-    cat <<'EOF' >"${mnt_path}/usr/local/bin/set-hdmi-audio"
+    cat <<'EOF' >"${mnt_path}/usr/local/bin/set-default-audio"
 #!/bin/sh
-# Make HDMI the default sink and set it to 50%, retrying until it appears
+# Make the DAC POT board the default sink at 50%, retrying until it appears
+want=hdmi
+[ -e /proc/asound/pine64dacpot ] && want=sound-dac
 i=0
 while [ "${i}" -lt 10 ]; do
-    s="$(pactl list short sinks | awk '/hdmi/ { print $2; exit }')"
+    s="$(pactl list short sinks | awk -v w="${want}" 'index($2, w) { print $2; exit }')"
     if [ -n "${s}" ]; then
         pactl set-default-sink "${s}"
         pactl set-sink-volume "${s}" 50%
@@ -737,24 +751,24 @@ while [ "${i}" -lt 10 ]; do
     sleep 1
 done
 EOF
-    chmod 0755 "${mnt_path}/usr/local/bin/set-hdmi-audio"
+    chmod 0755 "${mnt_path}/usr/local/bin/set-default-audio"
 
     mkdir -p "${mnt_path}/etc/systemd/user/default.target.wants"
-    cat <<'EOF' >"${mnt_path}/etc/systemd/user/set-hdmi-audio.service"
+    cat <<'EOF' >"${mnt_path}/etc/systemd/user/set-default-audio.service"
 [Unit]
-Description=Default audio to HDMI at 50%
+Description=Default audio to the DAC POT board or HDMI at 50%
 After=pipewire-pulse.service wireplumber.service
 Wants=wireplumber.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/set-hdmi-audio
+ExecStart=/usr/local/bin/set-default-audio
 
 [Install]
 WantedBy=default.target
 EOF
-    ln -s -f /etc/systemd/user/set-hdmi-audio.service \
-        "${mnt_path}/etc/systemd/user/default.target.wants/set-hdmi-audio.service"
+    ln -s -f /etc/systemd/user/set-default-audio.service \
+        "${mnt_path}/etc/systemd/user/default.target.wants/set-default-audio.service"
 }
 
 enable_spotifyd() {
@@ -786,7 +800,7 @@ PartOf=graphical-session.target
 After=graphical-session.target pipewire.service
 
 [Service]
-ExecStart=/usr/bin/uxplay -fs -n %H -nh
+ExecStart=/usr/bin/uxplay -fs -n %H -nh -vs waylandsink -as "pipewiresink stream-properties=props,node.rate=(string)1/44100,node.latency=(string)4096/44100"
 Restart=on-failure
 RestartSec=5s
 
@@ -795,6 +809,40 @@ WantedBy=sway-session.target
 EOF
     ln -s -f /etc/systemd/user/uxplay.service \
         "${mnt_path}/etc/systemd/user/sway-session.target.wants/uxplay.service"
+
+    local avahi
+    avahi="${mnt_path}/etc/avahi/avahi-daemon.conf"
+    if [ -f "${avahi}" ]; then
+        awk '/^#?use-ipv6=/ { print "use-ipv6=no"; next }
+            /^#?publish-aaaa-on-ipv4=/ { print "publish-aaaa-on-ipv4=no"; next }
+            { print }' "${avahi}" >"${avahi}.new" && mv "${avahi}.new" "${avahi}"
+    fi
+}
+
+enable_mpv_tv() {
+    local mnt_path
+    mnt_path="${1}"
+
+    [ -x "${mnt_path}/usr/bin/mpv" ] || return 0
+
+    mkdir -p "${mnt_path}/etc/systemd/user/sway-session.target.wants"
+    cat <<'EOF' >"${mnt_path}/etc/systemd/user/mpv-tv.service"
+[Unit]
+Description=mpv playing the TV playlist
+PartOf=graphical-session.target
+After=graphical-session.target pipewire.service
+
+[Service]
+Environment=URL_TV=https://raw.githubusercontent.com/jnk22/kodinerds-iptv/master/iptv/clean/clean_tv.m3u
+ExecStart=/usr/bin/mpv --fs --input-ipc-server=%t/mpv-tv.sock ${URL_TV}
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=sway-session.target
+EOF
+    ln -s -f /etc/systemd/user/mpv-tv.service \
+        "${mnt_path}/etc/systemd/user/sway-session.target.wants/mpv-tv.service"
 }
 
 set_raop_volume() {
@@ -874,6 +922,22 @@ enable_pipewire_user_units() {
     fi
 }
 
+set_pipewire_rates() {
+    local mnt_path
+    mnt_path="${1}"
+
+    [ -f "${mnt_path}/usr/lib/systemd/user/pipewire.socket" ] || return 0
+
+    local dir
+    dir="${mnt_path}/etc/pipewire/pipewire.conf.d"
+    mkdir -p "${dir}"
+    cat <<'EOF' >"${dir}/10-rates.conf"
+context.properties = {
+  default.clock.allowed-rates = [ 44100 48000 ]
+}
+EOF
+}
+
 set_audio_rtprio() {
     local mnt_path
     mnt_path="${1}"
@@ -886,7 +950,7 @@ set_audio_rtprio() {
     cat <<'EOF' >"${dir}/10-rtprio.conf"
 [Manager]
 DefaultLimitRTPRIO=95
-DefaultLimitRTTIME=200ms
+DefaultLimitNICE=-11
 EOF
 }
 
@@ -912,6 +976,40 @@ wireplumber.profiles = {
     hardware.bluetooth = required
   }
 }
+EOF
+    cat <<'EOF' >"${dir}/51-alsa.conf"
+monitor.alsa.rules = [
+  {
+    matches = [ { device.name = "alsa_card.platform-sound" } ]
+    actions = { update-props = { device.description = "Headphone jack" } }
+  }
+  {
+    matches = [ { device.name = "alsa_card.platform-sound-hdmi" } ]
+    actions = { update-props = { device.description = "HDMI" } }
+  }
+  {
+    matches = [ { device.name = "alsa_card.platform-sound-dac" } ]
+    actions = { update-props = { device.description = "DAC POT", api.acp.disable-pro-audio = true } }
+  }
+  {
+    matches = [ { device.name = "alsa_card.platform-sound-spdif" } ]
+    actions = { update-props = { device.description = "S/PDIF", api.acp.disable-pro-audio = true } }
+  }
+  {
+    matches = [ { node.name = "~alsa_output.platform-sound-dac.*" } ]
+    actions = {
+      update-props = {
+        api.alsa.period-size = 1024
+        api.alsa.headroom = 2048
+        session.suspend-timeout-seconds = 0
+      }
+    }
+  }
+  {
+    matches = [ { node.name = "~alsa_input.platform-sound[.].*", alsa.card_name = "sun50i-a64-audio" } ]
+    actions = { update-props = { node.disabled = true } }
+  }
+]
 EOF
 }
 
@@ -2102,6 +2200,7 @@ composition_reset() {
     comp_boot_type=()
     comp_disk_size=""
     comp_esp_size=256
+    comp_default=""
     esp_installed=""
 }
 
@@ -2141,6 +2240,137 @@ composition_set_dtb() {
 
 comp_count() {
     echo "${#comp_name[@]}"
+}
+
+composition_has() {
+    local i
+    for i in "${!comp_name[@]}"; do
+        if [ "${1}" = "${comp_name[$i]}" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+composition_keep() {
+    local -n slots="${1}"
+    shift
+    local kept=()
+    local i
+    for i in "$@"; do
+        kept+=("${slots[$i]}")
+    done
+    slots=("${kept[@]}")
+}
+
+composition_exclude() {
+    local excluded
+    read -r -a excluded <<<"${EXCLUDE_IMAGES:-}"
+    [ "${#excluded[@]}" -gt 0 ] || return 0
+
+    local x
+    for x in "${excluded[@]}"; do
+        if ! composition_has "${x}"; then
+            error "$(printf "EXCLUDE_IMAGES: %s is not in this image, it has: %s\n" \
+                "${x}" "${comp_name[*]}")"
+            exit 1
+        fi
+    done
+
+    local keep=()
+    local freed
+    freed=0
+    local i
+    for i in "${!comp_name[@]}"; do
+        case " ${excluded[*]} " in
+        *" ${comp_name[$i]} "*)
+            if [ "none" != "${comp_fs[$i]}" ] && [ "rest" != "${comp_size[$i]}" ]; then
+                freed=$((freed + comp_size[i]))
+            fi
+            ;;
+        *) keep+=("${i}") ;;
+        esac
+    done
+
+    if [ "${#keep[@]}" -eq 0 ]; then
+        error "EXCLUDE_IMAGES leaves nothing to build"
+        exit 1
+    fi
+
+    local a
+    for a in comp_name comp_provider comp_provider_arg comp_fs comp_size \
+        comp_kernel_src comp_kernel comp_initrd_src comp_initrd comp_cmdline \
+        comp_boot_type comp_part comp_dtb_src comp_dtb; do
+        composition_keep "${a}" "${keep[@]}"
+    done
+
+    if ! composition_has "${comp_default}"; then
+        comp_default=""
+    fi
+
+    local rest
+    rest=""
+    for i in "${!comp_size[@]}"; do
+        if [ "rest" = "${comp_size[$i]}" ]; then
+            rest="1"
+        fi
+    done
+    if [ -z "${rest}" ]; then
+        comp_disk_size=""
+    elif [ -n "${comp_disk_size}" ]; then
+        comp_disk_size=$((comp_disk_size - freed))
+    fi
+}
+
+refind_efiarch() {
+    case "${1}" in
+    amd64 | x86_64) echo "x64" ;;
+    arm64 | aarch64) echo "aa64" ;;
+    *) echo "" ;;
+    esac
+}
+
+composition_add_refind() {
+    local efiarch
+    efiarch="$(refind_efiarch "${1}")"
+    [ -n "${efiarch}" ] || return 0
+    local efi
+    efi="refind_${efiarch}.efi"
+    composition_add "refind" "refind" "${1}" "none" "0" \
+        "${efi}" "EFI/refind/${efi}" "" "" "" "efi"
+}
+
+refind_fetch() {
+    local download_path
+    download_path="${1}"
+    local efi
+    efi="refind_$(refind_efiarch "${2}").efi"
+
+    if [ -f "${download_path}/${efi}" ]; then
+        info "$(printf "rEFInd: %s exists, not fetching again\n" "${efi}")"
+        return 0
+    fi
+
+    local zip
+    zip="refind-bin-${refind_version}.zip"
+    if [ ! -f "${download_path}/${zip}" ]; then
+        download "https://downloads.sourceforge.net/project/refind/${refind_version}/${zip}" \
+            "${download_path}" \
+            "${DOWNLOAD_RETRIES}"
+    fi
+
+    printf "%s  %s\n" "${refind_sha512}" "${zip}" >"${download_path}/${zip}.sha512"
+    if ! checksum_verify "${download_path}/${zip}.sha512" "${download_path}/${zip}" "sha512"; then
+        error "$(printf "rEFInd: Checksum mismatch: %s\n" "${zip}")"
+        exit 1
+    fi
+
+    if ! unzip -p "${download_path}/${zip}" "refind-bin-${refind_version}/refind/${efi}" \
+        >"${download_path}/${efi}"; then
+        error "$(printf "rEFInd: %s not in %s\n" "${efi}" "${zip}")"
+        rm -f "${download_path}/${efi}"
+        exit 1
+    fi
 }
 
 # Assign partition numbers. p1 is reserved and p2 is the ESP, so slots
@@ -2214,7 +2444,7 @@ composition_load() {
     local kernel_src
 
     case "$build_target" in
-    gentoo-containeros | gentoo-sway | gentoo-sway-virt | gentoo-sway-pine64 | gentoo-sway-rockpro64 | gentoo-k3s)
+    gentoo-containeros | gentoo-sway | gentoo-sway-virt | gentoo-sway-pine64 | gentoo-sway-rockpro64)
         local target_flavour
         target_flavour=${build_target#*gentoo-}
         target_flavour=${target_flavour%-pine64}
@@ -2241,12 +2471,24 @@ composition_load() {
             ;;
         esac
 
-        # A fixed 16GiB disk with a single partition filling it, as
-        # this target had before it was described as a composition.
-        # Partition boundaries now land on MiB rather than the MB that
-        # unitless parted arguments meant, which suits the 4096-byte
-        # sector size the xfs below is created with
+        # A fixed 16GiB disk
         comp_disk_size=16384
+        comp_default="gentoo-${target_flavour}"
+
+        if [ -n "$(nomadbsd_arch "${target_arch}")" ]; then
+            comp_disk_size=$((comp_disk_size + 6144))
+            composition_add "nomadbsd" \
+                "nomadbsd" \
+                "${target_arch}" \
+                "ufs" \
+                "6144" \
+                "${nomadbsd_loader_file}" \
+                "EFI/nomadbsd/loader.efi" \
+                "" \
+                "" \
+                "" \
+                "efi"
+        fi
 
         composition_add "gentoo-${target_flavour}" \
             "gentoo" \
@@ -2262,6 +2504,7 @@ composition_load() {
         if [ -n "${dtb_file}" ]; then
             composition_set_dtb "${dtb_file}-latest" "${dtb_file}"
         fi
+        composition_add_refind "${target_arch}"
         ;;
     containeros-virt)
         # One of its slots is NomadBSD, so the whole target is limited to
@@ -2312,6 +2555,7 @@ composition_load() {
             "initramfs-${target_arch}.cpio" \
             "$(linux_cmdline_console "${target_arch}" "${build_target}")" \
             "linux"
+        composition_add_refind "${target_arch}"
         ;;
     nomadbsd)
         nomadbsd_require_arch "${target_arch}" "nomadbsd"
@@ -2351,6 +2595,7 @@ composition_load() {
         ;;
     esac
 
+    composition_exclude
     composition_finalize
 }
 
@@ -2397,6 +2642,9 @@ composition_fetch() {
             ;;
         u-root)
             u_root_fetch "${download_path}" "${comp_provider_arg[$i]}"
+            ;;
+        refind)
+            refind_fetch "${download_path}" "${comp_provider_arg[$i]}"
             ;;
         esac
 
@@ -3305,6 +3553,10 @@ install_boot_entries() {
         printf "\n"
     done
 
+    if [ -n "${comp_default}" ]; then
+        default_entry="${comp_default}"
+    fi
+
     if [ -z "${default_entry}" ]; then
         info "No bootable slots: not writing loader.conf"
     else
@@ -3317,64 +3569,6 @@ EOF
         info "$(printf "Default boot entry: %s\n" "${default_entry}")"
     fi
 
-    unmount_recursive "${mnt_path}"
-    sleep 1
-}
-
-# Chainload rEFInd from systemd-boot
-install_refind_chainload() {
-    local esp_dev
-    esp_dev="${1}"
-    local mnt_path
-    mnt_path="${2}"
-    local rootfs_dev
-    rootfs_dev="${3}"
-    local fs_type
-    fs_type="${4}"
-    local src_path
-    src_path="${5}"
-    local target_arch
-    target_arch="${6}"
-
-    reexec_privileged
-
-    local efiarch
-    case "${target_arch}" in
-    amd64 | x86_64) efiarch="x64" ;;
-    arm64 | aarch64) efiarch="aa64" ;;
-    *)
-        info "$(printf "rEFInd: no EFI binary for arch %s, skipping\n" "${target_arch}")"
-        return 0
-        ;;
-    esac
-
-    local refind
-    refind="refind_${efiarch}.efi"
-
-    # Take the binary out of the freshly provisioned rootfs into staging
-    mkdir -p "${mnt_path}"
-    mount -t "${fs_type}" -o ro "${rootfs_dev}" "${mnt_path}"
-    if [ ! -f "${mnt_path}/usr/share/refind/${refind}" ]; then
-        info "$(printf "rEFInd: %s not in rootfs, skipping chainload entry\n" "${refind}")"
-        umount "${mnt_path}"
-        return 0
-    fi
-    cp "${mnt_path}/usr/share/refind/${refind}" "${src_path}/${refind}"
-    umount "${mnt_path}"
-
-    # Install it on the ESP and add a non-default chainload entry beside the
-    # kernel entries, leaving loader.conf's default untouched
-    esp_mount "${esp_dev}" "${mnt_path}"
-    esp_install_file "${src_path}" "${refind}" \
-        "${mnt_path}" "EFI/refind/${refind}"
-    create_boot_entry "${mnt_path}/loader/entries/refind.conf" \
-        "rEFInd boot menu" \
-        "efi" \
-        "EFI/refind/${refind}" \
-        "" "" "" ""
-    info "$(printf "rEFInd chainload entry:\n")"
-    cat "${mnt_path}/loader/entries/refind.conf"
-    printf "\n"
     unmount_recursive "${mnt_path}"
     sleep 1
 }
@@ -4632,16 +4826,13 @@ gentoo_install_stage4_binpkgs() {
     local sets
     case "${target_flavour}" in
     containeros)
-        sets="@container-podman @essentials @net"
+        sets="@containers @essentials @net"
         ;;
     sway)
         sets="@dev @dev-lang @sway @essentials @virt @net"
         ;;
     sway-virt)
         sets="@dev @dev-lang @sway-virt @essentials @virt @net"
-        ;;
-    k3s)
-        sets="@k8s @essentials @net"
         ;;
     esac
 
@@ -4906,14 +5097,16 @@ provision() {
     info "Enabling pipewire user units"
     enable_pipewire_user_units "${mnt_path}"
     set_audio_rtprio "${mnt_path}"
+    set_pipewire_rates "${mnt_path}"
     enable_wireplumber_audio "${mnt_path}"
     enable_headless_audio "${mnt_path}" "${user}"
     enable_airplay_sinks "${mnt_path}"
     enable_bluetooth_sink "${mnt_path}"
-    set_hdmi_audio "${mnt_path}"
+    set_default_audio "${mnt_path}"
     set_raop_volume "${mnt_path}"
     enable_spotifyd "${mnt_path}"
     enable_uxplay "${mnt_path}"
+    enable_mpv_tv "${mnt_path}"
 
     info "Enabling sshd"
     service_enable "${mnt_path}" "sshd" "getty"
@@ -5603,6 +5796,9 @@ boot_test_pattern() {
         # FreeBSD's loader has handed over to its kernel
         echo "FreeBSD"
         ;;
+    refind)
+        echo "rEFInd - Main Menu"
+        ;;
     *)
         echo "login:"
         ;;
@@ -5920,7 +6116,7 @@ show_usage() {
     printf "\n"
     printf "  build TARGET      alpine-containeros[-BOARD] | alpine-sway[-BOARD] |\n"
     printf "                    freebsd |\n"
-    printf "                    gentoo-containeros | gentoo-k3s | gentoo-sway |\n"
+    printf "                    gentoo-containeros | gentoo-sway |\n"
     printf "                    gentoo-sway-pine64 | gentoo-sway-rockpro64 |\n"
     printf "                    gentoo-sway-virt |\n"
     printf "                    gentoo-stage3 | linux-kernel | nanobsd |\n"
@@ -5929,7 +6125,7 @@ show_usage() {
     printf "  create TARGET     alma | alpine-containeros[-BOARD] |\n"
     printf "                    alpine-sway[-BOARD] |\n"
     printf "                    containeros-virt | freebsd |\n"
-    printf "                    gentoo-containeros | gentoo-k3s | gentoo-sway |\n"
+    printf "                    gentoo-containeros | gentoo-sway |\n"
     printf "                    gentoo-sway-pine64 | gentoo-sway-rockpro64 |\n"
     printf "                    gentoo-sway-virt | nomadbsd\n"
     printf "\n"
@@ -5944,6 +6140,12 @@ show_usage() {
     printf "  containeros-virt is a multi-boot image: it composes a Gentoo\n"
     printf "  containeros rootfs, a NomadBSD rootfs and a u-root initramfs\n"
     printf "  onto one disk, each with its own boot entry\n"
+    printf "\n"
+    printf "  The Gentoo images also carry NomadBSD on amd64 and rEFInd where\n"
+    printf "  it has an EFI binary. EXCLUDE_IMAGES, a space separated list of\n"
+    printf "  slot names, leaves those slots out, the image's own included, as\n"
+    printf "  long as one remains, e.g. EXCLUDE_IMAGES=\"gentoo-sway refind\"\n"
+    printf "  leaves NomadBSD alone\n"
     printf "\n"
 }
 
@@ -6122,13 +6324,6 @@ main() {
             target_flavour="$(target_flavour_of "${build_target}" "gentoo-")"
             # The board is hardware, not an architecture choice
             target_arch="$(board_arch "$(target_board "${build_target}")")"
-
-            build_gentoo_stage4 "$target_flavour" "$target_arch"
-            return
-            ;;
-        gentoo-k3s)
-            local target_flavour
-            target_flavour="k3s"
 
             build_gentoo_stage4 "$target_flavour" "$target_arch"
             return
@@ -6317,7 +6512,7 @@ main() {
             #                "${ansible_roles}"
             exit 0
             ;;
-        gentoo-containeros | gentoo-sway | gentoo-sway-virt | gentoo-sway-pine64 | gentoo-sway-rockpro64 | gentoo-k3s | containeros-virt | nomadbsd)
+        gentoo-containeros | gentoo-sway | gentoo-sway-virt | gentoo-sway-pine64 | gentoo-sway-rockpro64 | containeros-virt | nomadbsd)
             # download_miss/gentoo_fetch_stage3 (called below) expect a
             # "path" in scope to fetch into
             local path
@@ -6393,13 +6588,6 @@ main() {
                     "${build_target}"
 
                 verify_filesystem "${slot_dev}" "provision"
-
-                install_refind_chainload "${esp_dev}" \
-                    "${mnt_path}" \
-                    "${slot_dev}" \
-                    "${comp_fs[$i]}" \
-                    "${path}" \
-                    "${target_arch}"
             done
 
             verify_filesystem "${esp_dev}" "provision"
@@ -6422,7 +6610,7 @@ main() {
             printf "You need to specify a valid target system OS\n"
             printf "  One of: alma, alpine-containeros, alpine-sway,\n"
             printf "          containeros-virt, freebsd, gentoo-containeros,\n"
-            printf "          gentoo-k3s, gentoo-sway, gentoo-sway-pine64,\n"
+            printf "          gentoo-sway, gentoo-sway-pine64,\n"
             printf "          gentoo-sway-rockpro64,\n"
             printf "          gentoo-sway-virt, nomadbsd\n"
             show_usage
