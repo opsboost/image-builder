@@ -91,7 +91,6 @@ freebsd_ci_root_password="freebsd-ci"
 # known default, not a secret, change it per fleet
 # shellcheck disable=SC2016 # literal crypt hash, must not expand
 default_password_hash='$6$I9Q9AyTL$Z76H7wD8mT9JAyrp/vaYyFwyA5wRVN0tze8pvM.MqScC7BBm2PU7pLL0h5nSxueqUpYAlZTox4Ag2Dp5vchjJ0'
-freebsd_use_release_script="${FREEBSD_USE_RELEASE_SCRIPT:-true}"
 
 # NomadBSD
 # Upstream publishes amd64, i386 and mac only - there is no arm64 build,
@@ -677,9 +676,14 @@ write_dma_heap_udev_rule() {
 write_sway_dropins() {
     local mnt_path
     mnt_path="${1}"
+    local board
+    board="${2}"
 
     mkdir -p "${mnt_path}/etc/sway/config.d"
     printf 'output Virtual-1 disable\n' >"${mnt_path}/etc/sway/config.d/no-virtual-output"
+    if [ "pine64" = "${board}" ]; then
+        printf 'output HDMI-A-1 mode 1920x1080@50Hz\n' >"${mnt_path}/etc/sway/config.d/hdmi-50hz"
+    fi
 
     # Hand the session to systemd: user services get WAYLAND_DISPLAY from the
     # running compositor, and units wanted by sway-session.target start once
@@ -825,6 +829,51 @@ enable_mpv_tv() {
 
     [ -x "${mnt_path}/usr/bin/mpv" ] || return 0
 
+    mkdir -p "${mnt_path}/usr/local/bin"
+    cat <<'EOF' >"${mnt_path}/usr/local/bin/tv-playlist"
+#!/bin/sh
+set -e
+src="$(curl -fsSL "${URL_TV}")"
+printf '%s\n' "${src}" | awk -v list="${TV_WHITELIST}" '
+function key(s) {
+    gsub(/[[:space:]]/, "", s)
+    return tolower(s)
+}
+BEGIN {
+    n = split(list, w, ",")
+    for (i = 1; i <= n; i++)
+        if (!(key(w[i]) in want))
+            want[key(w[i])] = i
+}
+/^#EXTINF/ {
+    info = $0
+    name = $0
+    sub(/.*,/, "", name)
+    next
+}
+/^#/ || !NF {
+    next
+}
+info != "" {
+    k = key(name)
+    if (!n)
+        out[++m] = info "\n" $0
+    else if ((k in want) && !(want[k] in out))
+        out[want[k]] = info "\n" $0
+    info = ""
+}
+END {
+    print "#EXTM3U"
+    for (i = 1; i <= (n ? n : m); i++)
+        if (i in out) {
+            print out[i]
+            found++
+        }
+    exit !found
+}' >"${1}"
+EOF
+    chmod 755 "${mnt_path}/usr/local/bin/tv-playlist"
+
     mkdir -p "${mnt_path}/etc/systemd/user/sway-session.target.wants"
     cat <<'EOF' >"${mnt_path}/etc/systemd/user/mpv-tv.service"
 [Unit]
@@ -834,7 +883,8 @@ After=graphical-session.target pipewire.service
 
 [Service]
 Environment=URL_TV=https://raw.githubusercontent.com/jnk22/kodinerds-iptv/master/iptv/clean/clean_tv.m3u
-ExecStart=/usr/bin/mpv --fs --input-ipc-server=%t/mpv-tv.sock ${URL_TV}
+ExecStartPre=/usr/local/bin/tv-playlist %t/mpv-tv.m3u
+ExecStart=/usr/bin/mpv --fs --quiet --input-ipc-server=%t/mpv-tv.sock %t/mpv-tv.m3u
 Restart=on-failure
 RestartSec=5s
 
@@ -1006,8 +1056,8 @@ monitor.alsa.rules = [
     }
   }
   {
-    matches = [ { node.name = "~alsa_input.platform-sound[.].*", alsa.card_name = "sun50i-a64-audio" } ]
-    actions = { update-props = { node.disabled = true } }
+    matches = [ { device.name = "alsa_card.platform-sound", device.nick = "sun50i-a64-audio" } ]
+    actions = { update-props = { device.disabled = true } }
   }
 ]
 EOF
@@ -3858,16 +3908,15 @@ find_ufs_partition() {
     return 1
 }
 
-# Set a known root password and enable the serial console on a built
-# disk image, so CI can boot-test it headless under qemu (-nographic
-# -serial pipe:...). Images built here have no NANO_CUSTOMIZE/release.sh
-# hook late enough to do this pre-image, so it's done post-build by
-# mounting the image directly
+# Set a known root password and a serial console on a built image, so CI
+# can boot test it headless under qemu
 freebsd_customize_image() {
     local image
     image="${1}"
     local password
     password="${2}"
+    local target_arch
+    target_arch="${3:-amd64}"
 
     local md
     md="$(mdconfig -a -t vnode -f "${image}")"
@@ -3884,14 +3933,24 @@ freebsd_customize_image() {
     mnt="$(mktemp -d)"
     mount "/dev/${part}" "${mnt}"
 
-    echo "${password}" | pw -R "${mnt}" usermod root -h 0
-    sed -i "" -e '/^tty[du]0/s/off/onifconsole/' "${mnt}/etc/ttys"
-    echo 'console="comconsole"' >>"${mnt}/boot/loader.conf"
-    # mini-memstick images unconditionally auto-launch bsdinstall via
-    # /etc/rc.local; drop it so the image boots to a plain login
-    # prompt instead, since here we're smoke-testing the built
-    # kernel/world, not the installer
-    rm -f "${mnt}/etc/rc.local"
+    # NanoBSD restores /etc from /conf/base/etc at boot, so edit both
+    local root
+    for root in "${mnt}" "${mnt}/conf/base"; do
+        if [ ! -d "${root}/etc" ]; then
+            continue
+        fi
+        echo "${password}" | pw -R "${root}" usermod root -h 0
+        sed -i "" -e '/^tty[du]0/s/off/onifconsole/' "${root}/etc/ttys"
+        # Boot to a login prompt instead of bsdinstall
+        rm -f "${root}/etc/rc.local"
+    done
+
+    # The arm64 EFI loader has no comconsole, its efi console follows the
+    # firmware ConOut, which is serial under qemu
+    if [ "$(freebsd_target "${target_arch}")" != "arm64" ]; then
+        echo 'console="comconsole"' >>"${mnt}/boot/loader.conf"
+    fi
+    echo 'autoboot_delay="2"' >>"${mnt}/boot/loader.conf"
 
     umount "${mnt}"
     rmdir "${mnt}"
@@ -3911,7 +3970,7 @@ freebsd_install_build_dependencies() {
     git config --global --add safe.directory '*'
 }
 
-# src.conf / make.conf / release.conf
+# src.conf / make.conf
 freebsd_fetch_build_config() {
     local target_arch
     target_arch="${1}"
@@ -3936,109 +3995,138 @@ freebsd_fetch_src() {
     fi
 }
 
-build_freebsd_kernel() {
-    local target_arch
-    target_arch="${1}"
-    local arch_flags
-    arch_flags="TARGET=$(freebsd_target "${target_arch}") TARGET_ARCH=$(freebsd_target_arch "${target_arch}")"
+# releng branch of a release, by default the build host's, the only one
+# its toolchain matches
+freebsd_release_branch() {
+    local release
+    release="${1:-$(freebsd-version -u | awk -F- '{ print $1 }')}"
 
-    cd freebsd-src
-    local version
-    version="$(freebsd-version)"
-
-    info "$(printf "Building version: %s\n" "${version}")"
-    sh -c "make ${arch_flags} buildkernel"
-
-    mkdir -p /tmp/build
-    sh -c "DESTDIR=/tmp/build make ${arch_flags} installkernel"
+    echo "releng/${release}"
 }
 
-build_freebsd_world() {
-    local target_arch
-    target_arch="${1}"
-    local arch_flags
-    arch_flags="TARGET=$(freebsd_target "${target_arch}") TARGET_ARCH=$(freebsd_target_arch "${target_arch}")"
+# Version of the source tree being built, not of the build host
+freebsd_src_version() {
+    local src_dir
+    src_dir="${1}"
 
-    local version
-    version="$(freebsd-version)"
-
-    mkdir -p /usr/obj
-    mount -t tmpfs tmpfs /usr/obj
-
-    sh -c "make ${arch_flags} -j4 buildworld"
-    mkdir -p /tmp/build
-    sh -c "DESTDIR=/tmp/build make ${arch_flags} installworld"
+    printf '%s-%s\n' \
+        "$(make -C "${src_dir}/release" -V REVISION)" \
+        "$(make -C "${src_dir}/release" -V BRANCH)"
 }
 
+# src.conf disables the clang and lld bootstrap, so the host toolchain has
+# to match the source tree. Each make target only probes its own tool
+freebsd_check_system_toolchain() {
+    local src_dir
+    src_dir="${1}"
+    local target_arch
+    target_arch="${2}"
+    local check
+
+    for check in compiler linker; do
+        if ! make -C "${src_dir}" SRCCONF=/dev/null __MAKE_CONF=/dev/null \
+            TARGET="$(freebsd_target "${target_arch}")" \
+            TARGET_ARCH="$(freebsd_target_arch "${target_arch}")" \
+            "test-system-${check}" |
+            awk -v c="${check}" '
+                { print > "/dev/stderr" }
+                tolower($0) ~ "^using_system_" c " *= *yes$" { ok = 1 }
+                END { exit !ok }'; then
+            error "$(printf "build host %s does not match %s, build VM and source must be the same release\n" "${check}" "${src_dir}")"
+            exit 1
+        fi
+    done
+}
+
+# Build world and kernel natively, then only the mini-memstick. release.sh
+# clones its own sources, builds a second world for its chroot and a full
+# release, which does not fit into a 6h CI job
 build_freebsd_release() {
     local target_arch
     target_arch="${1}"
+    local src_dir
+    src_dir="$(realpath "${2}")"
+    local ncpu
+    ncpu="$(sysctl -n hw.ncpu)"
     local version
-    version="$(freebsd-version)"
-    local src_path
-    src_path="freebsd-src"
-    # target_path is the CHROOTDIR
-    # the release script builds in
-    local target_path
-    target_path="/release"
-    local release_archive
-    release_archive="freebsd-${version}-${target_arch}.tar.xz"
+    version="$(freebsd_src_version "${src_dir}")"
+    local mk_flags
+    mk_flags=(
+        "TARGET=$(freebsd_target "${target_arch}")"
+        "TARGET_ARCH=$(freebsd_target_arch "${target_arch}")"
+        "SRCCONF=/etc/src.conf"
+        "__MAKE_CONF=/etc/make.conf"
+        "KERNCONF=GENERIC"
+    )
+    # MK_INCLUDES only applies to the image install, buildworld needs them
+    local release_flags
+    release_flags=("${mk_flags[@]}" NODISTSETS=yes NOPKGBASE=yes NOPKG=yes NOPORTS=yes NOSRC=yes MK_INCLUDES=no)
 
-    info "$(printf "Building release for version %s (%s)\n" "${version}" "${target_arch}")"
-    mkdir -p "$target_path/etc"
-    cp freebsd-config/release.conf "$target_path/etc"
+    info "$(printf "Building FreeBSD %s mini-memstick (%s)\n" "${version}" "${target_arch}")"
+    freebsd_check_system_toolchain "${src_dir}" "${target_arch}"
 
-    # release.conf ships amd64 defaults; override for the requested arch
-    cat >>"$target_path/etc/release.conf" <<EOF
-TARGET="$(freebsd_target "${target_arch}")"
-TARGET_ARCH="$(freebsd_target_arch "${target_arch}")"
-EOF
-
-    cd "${src_path}"
-    local release_log
-    release_log="$(mktemp)"
-    sh -c "release/release.sh -c $target_path/etc/release.conf mini-memstick" 2>&1 | tee "${release_log}"
-
-    if grep -q "SYSTEM_COMPILER: .* will be built" "${release_log}"; then
-        error "clang/lld bootstrap was triggered"
-    else
-        info "No clang/lld bootstrap triggered"
+    # Guest disk writes land in a qemu overlay on the CI runner
+    mkdir -p /usr/obj
+    if ! mount -p | awk '$2 == "/usr/obj" { found = 1 } END { exit !found }'; then
+        mount -t tmpfs tmpfs /usr/obj
     fi
-    rm -f "${release_log}"
+
+    make -C "${src_dir}" -j"${ncpu}" "${mk_flags[@]}" buildworld
+    make -C "${src_dir}" -j"${ncpu}" "${mk_flags[@]}" buildkernel
+    make -C "${src_dir}/release" "${release_flags[@]}" obj
+    make -C "${src_dir}/release" "${release_flags[@]}" mini-memstick.img
 
     local memstick_image
-    memstick_image="$(find "$target_path/R" -maxdepth 1 -name '*mini-memstick.img' | head -1)"
-    if [ -n "${memstick_image}" ]; then
-        freebsd_customize_image "${memstick_image}" "${freebsd_ci_root_password}"
-        cp "${memstick_image}" "mini-memstick-${target_arch}.img"
-    else
-        error "$(printf "build_freebsd_release: no mini-memstick.img found under %s/R\n" "${target_path}")"
+    memstick_image="$(make -C "${src_dir}/release" "${release_flags[@]}" -V .OBJDIR)/mini-memstick.img"
+    if [ ! -f "${memstick_image}" ]; then
+        error "$(printf "build_freebsd_release: %s was not built\n" "${memstick_image}")"
+        exit 1
     fi
 
-    info "$(printf "Creating compressed archive: %s\n" "${release_archive}")"
-    tar cJf "${release_archive}" "${target_path}"
+    freebsd_customize_image "${memstick_image}" "${freebsd_ci_root_password}" "${target_arch}"
+    cp "${memstick_image}" "${src_dir}/mini-memstick-${target_arch}.img"
+    info "$(printf "Built %s/mini-memstick-%s.img\n" "${src_dir}" "${target_arch}")"
 }
 
+# arm64 is cross built like the release, see ISSUES.md
 build_nanobsd_world() {
     local target_arch
     target_arch="${1}"
-    local version
-    version="$(freebsd-version)"
+    local src_dir
+    src_dir="$(realpath "${2}")"
 
-    # nanobsd.sh hardcodes NANO_SRC=/usr/src in defaults.sh and only
-    # a -c config file sourced during arg parsing can override it, so
-    # point it at our actual checkout instead of the /usr/src default.
-    # NANO_ARCH feeds TARGET_ARCH via nano_global_make_env, but nanobsd
-    # has no equivalent for TARGET, so extend CONF_WORLD (shared by
-    # both the build and install make.conf) to carry it too
+    freebsd_check_system_toolchain "${src_dir}" "${target_arch}"
+
+    # nanobsd.sh ignores src.conf and /etc/make.conf, CONF_WORLD carries
+    # the src.conf knobs into both of its own make.conf files
+    local world_knobs
+    world_knobs="$(awk '/^WITH(OUT)?_[A-Z0-9_]+=/' freebsd-config/src.conf)"
+
+    # Only a -c config overrides NANO_SRC=/usr/src. nanobsd.sh has no
+    # TARGET, so CONF_WORLD carries it. NanoBSD installs no modules and
+    # buildworld needs headers and static libraries, so those are dropped
+    # at install time only. The customize hook runs before setup_nanobsd
+    # copies /etc to /conf/base/etc
     local nano_conf
     nano_conf="$(mktemp)"
     cat >"${nano_conf}" <<EOF
-NANO_SRC=$(pwd)
+NANO_SRC=${src_dir}
 NANO_ARCH=$(freebsd_target_arch "${target_arch}")
 CONF_WORLD="\${CONF_WORLD}
 TARGET=$(freebsd_target "${target_arch}")
+${world_knobs}
 "
+CONF_BUILD="\${CONF_BUILD}
+NO_MODULES=yes
+"
+CONF_INSTALL="\${CONF_INSTALL}
+WITHOUT_INCLUDES=YES
+WITHOUT_INSTALLLIB=YES
+"
+cust_ci_root_password() (
+    echo '${freebsd_ci_root_password}' | pw -R "\${NANO_WORLDDIR}" usermod root -h 0
+)
+customize_cmd cust_ci_root_password
 EOF
 
     # nanobsd.sh redirects buildworld/buildkernel output into log
@@ -4046,10 +4134,10 @@ EOF
     # failure (set -e, no error message), so surface the tail of
     # those logs here since NANO_OBJ lives outside the synced
     # workspace and would otherwise be lost with the VM
-    if ! sh tools/tools/nanobsd/nanobsd.sh -c "${nano_conf}"; then
+    if ! (cd "${src_dir}" && sh tools/tools/nanobsd/nanobsd.sh -c "${nano_conf}"); then
         error "nanobsd build failed, dumping build logs:"
         local log
-        for log in /usr/obj/nanobsd.*/_.bw /usr/obj/nanobsd.*/_.bk; do
+        for log in /usr/obj/nanobsd.*/_.bw /usr/obj/nanobsd.*/_.bk /usr/obj/nanobsd.*/_.iw /usr/obj/nanobsd.*/_.di; do
             if [ -f "${log}" ]; then
                 error "=== tail -n 200 ${log} ==="
                 tail -n 200 "${log}" >&2
@@ -4058,7 +4146,7 @@ EOF
         exit 1
     fi
 
-    freebsd_customize_image "/usr/obj/nanobsd.full/_.disk.full" "${freebsd_ci_root_password}"
+    freebsd_customize_image "/usr/obj/nanobsd.full/_.disk.full" "${freebsd_ci_root_password}" "${target_arch}"
 }
 
 linux_install_kernel_build_dependencies() {
@@ -5089,7 +5177,7 @@ provision() {
     sway_configure_background
     sway_configure_terminal
     rm -f "${mnt_path}/etc/sway/config.d/exec-payload"
-    write_sway_dropins "${mnt_path}"
+    write_sway_dropins "${mnt_path}" "$(target_board "${build_target}")"
     write_mpv_config "${mnt_path}"
     write_dma_heap_udev_rule "${mnt_path}"
     enable_sway_session "${mnt_path}" "${user}"
@@ -6269,33 +6357,21 @@ main() {
         freebsd)
             local release
             release="${4}"
-            local freebsd_branch
-            if [ -n "${release}" ]; then
-                # Pin to the matching release branch. Without this,
-                # the default branch (main/CURRENT) gets built instead,
-                # which the base image's installed compiler doesn't
-                # match closely enough to be trusted, forcing a full
-                # clang/lld bootstrap rebuild from scratch
-                freebsd_branch="releng/${release}"
-            fi
 
             freebsd_install_build_dependencies
             freebsd_fetch_build_config "${target_arch}"
-            freebsd_fetch_src "${freebsd_source_url}" "${freebsd_branch}"
-
-            if [ "${freebsd_use_release_script}" = "true" ]; then
-                build_freebsd_release "${target_arch}"
-            else
-                build_freebsd_kernel "${target_arch}"
-                build_freebsd_world "${target_arch}"
-            fi
+            freebsd_fetch_src "${freebsd_source_url}" "$(freebsd_release_branch "${release}")"
+            build_freebsd_release "${target_arch}" freebsd-src
             exit 0
             ;;
         nanobsd)
+            local release
+            release="${4}"
+
             freebsd_install_build_dependencies
-            freebsd_fetch_src "${freebsd_source_url}"
-            build_freebsd_kernel "${target_arch}"
-            build_nanobsd_world "${target_arch}"
+            freebsd_fetch_build_config "${target_arch}"
+            freebsd_fetch_src "${freebsd_source_url}" "$(freebsd_release_branch "${release}")"
+            build_nanobsd_world "${target_arch}" freebsd-src
             exit 0
             ;;
         gentoo-containeros)
