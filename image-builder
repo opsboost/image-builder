@@ -86,7 +86,7 @@ freebsd_source_url="https://github.com/freebsd/freebsd-src"
 freebsd_config_url="https://github.com/bbusse/freebsd-config"
 # Root password baked into built images so CI can boot-test them under
 # qemu; these images are throwaway CI artifacts, not production systems
-freebsd_ci_root_password="freebsd-ci"
+freebsd_ci_root_password="moonshine"
 # Initial password hash shared by root and the image user for first login. A
 # known default, not a secret, change it per fleet
 # shellcheck disable=SC2016 # literal crypt hash, must not expand
@@ -3944,6 +3944,19 @@ freebsd_customize_image() {
         # Boot to a login prompt instead of bsdinstall
         rm -f "${root}/etc/rc.local"
     done
+
+    # mini-memstick mounts its root read-only, through the fstab entry and
+    # root_rw_mount="NO" that make-memstick.sh writes
+    # Mount it read-write instead
+    if grep -q '^/dev/ufs/FreeBSD_Install[[:space:]]' "${mnt}/etc/fstab" 2>/dev/null; then
+        sed -i "" -E 's#^(/dev/ufs/FreeBSD_Install[[:space:]]+/[[:space:]]+ufs[[:space:]]+)ro([,[:space:]])#\1rw\2#' "${mnt}/etc/fstab"
+        local rc_conf
+        for rc_conf in "${mnt}/etc/rc.conf" "${mnt}/etc/rc.conf.local"; do
+            if [ -f "${rc_conf}" ]; then
+                sed -i "" -e '/^root_rw_mount=/d' "${rc_conf}"
+            fi
+        done
+    fi
 
     # The arm64 EFI loader has no comconsole, its efi console follows the
     # firmware ConOut, which is serial under qemu
