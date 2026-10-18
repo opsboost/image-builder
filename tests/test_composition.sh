@@ -33,15 +33,93 @@ teardown_suite() {
     rm -f "${LIB}"
 }
 
-test_gentoo_composition_has_a_single_rootfs() {
+test_gentoo_composition_has_one_rootfs_and_refind() {
     composition_load "gentoo-containeros" "arm64"
 
-    assert_equals "1" "$(comp_count)" "gentoo-containeros has one slot"
+    assert_equals "2" "$(comp_count)" "the rootfs and rEFInd, no NomadBSD on arm64"
     assert_equals "16384" "$(composition_disk_size_mib)" "disk stays 16GiB"
     assert_equals "3" "${comp_part[0]}" "its rootfs is p3"
     assert_equals "rest" "${comp_size[0]}" "its rootfs fills the disk"
     assert_equals "xfs" "${comp_fs[0]}" "its rootfs is xfs"
     assert_equals "Image-virt-arm64" "${comp_kernel[0]}" "arm64 uses an Image, not a bzImage"
+    assert_equals "refind" "${comp_name[1]}"
+    assert_equals "0" "${comp_part[1]}" "rEFInd lives on the ESP"
+    assert_equals "EFI/refind/refind_aa64.efi" "${comp_kernel[1]}"
+}
+
+test_gentoo_image_carries_nomadbsd_on_amd64() {
+    composition_load "gentoo-sway" "amd64"
+
+    assert_equals "nomadbsd gentoo-sway refind" "${comp_name[*]}"
+    assert_equals "3 4 0" "${comp_part[*]}" "the Gentoo rootfs stays last, so it can grow"
+    assert_equals "$((16384 + 6144))" "$(composition_disk_size_mib)"
+    assert_equals "gentoo-sway" "${comp_default}" "Gentoo stays the default entry"
+}
+
+test_exclude_drops_a_slot_and_its_space() {
+    EXCLUDE_IMAGES="nomadbsd" composition_load "gentoo-sway" "amd64"
+
+    assert_equals "gentoo-sway refind" "${comp_name[*]}"
+    assert_equals "3" "${comp_part[0]}"
+    assert_equals "16384" "$(composition_disk_size_mib)" "NomadBSD's 6GiB go with it"
+}
+
+test_exclude_can_leave_nomadbsd_alone() {
+    EXCLUDE_IMAGES="gentoo-sway refind" composition_load "gentoo-sway" "amd64"
+
+    assert_equals "nomadbsd" "${comp_name[*]}"
+    assert_equals "$((3 + 256 + 6144 + 4))" "$(composition_disk_size_mib)" \
+                  "without the growing rootfs the disk is sized from its slots"
+    assert_equals "" "${comp_default}" "the first remaining slot becomes the default"
+}
+
+test_exclude_can_leave_refind_alone() {
+    EXCLUDE_IMAGES="gentoo-sway nomadbsd" composition_load "gentoo-sway" "amd64"
+
+    assert_equals "refind" "${comp_name[*]}"
+    assert_equals "$((3 + 256 + 4))" "$(composition_disk_size_mib)" "an ESP and nothing else"
+}
+
+test_exclude_refuses_a_name_the_image_does_not_have() {
+    assert_fails "EXCLUDE_IMAGES=typo composition_load gentoo-sway amd64" \
+                 "a typo is not silently ignored"
+    assert_fails "EXCLUDE_IMAGES=nomadbsd composition_load gentoo-sway-pine64 arm64" \
+                 "nor a slot this arch never has"
+}
+
+test_exclude_refuses_to_leave_nothing() {
+    assert_fails "EXCLUDE_IMAGES='gentoo-sway nomadbsd refind' composition_load gentoo-sway amd64"
+}
+
+test_refind_follows_the_arch() {
+    assert_equals "x64" "$(refind_efiarch amd64)"
+    assert_equals "aa64" "$(refind_efiarch arm64)"
+    assert_equals "" "$(refind_efiarch riscv64)"
+
+    composition_reset
+    composition_add_refind riscv64
+    assert_equals "0" "$(comp_count)" "no slot where rEFInd ships no binary"
+}
+
+test_refind_fetch_keeps_a_staged_binary() {
+    local d
+    d="$(mktemp -d)"
+    echo efi > "${d}/refind_x64.efi"
+
+    assert "refind_fetch ${d} amd64" "a staged binary needs no download"
+
+    rm -rf "${d}"
+}
+
+test_refind_fetch_refuses_a_zip_with_the_wrong_checksum() {
+    local d
+    d="$(mktemp -d)"
+    echo notazip > "${d}/refind-bin-${refind_version}.zip"
+
+    assert_fails "refind_fetch ${d} amd64" "the pinned SHA512 has to match"
+    assert "test ! -f ${d}/refind_x64.efi" "and nothing is extracted"
+
+    rm -rf "${d}"
 }
 
 test_pine64_keeps_its_own_kernel() {
@@ -54,10 +132,11 @@ test_pine64_keeps_its_own_kernel() {
 test_combined_image_has_one_slot_per_system() {
     composition_load "containeros-virt" "amd64"
 
-    assert_equals "3" "$(comp_count)" "gentoo, nomadbsd and u-root"
+    assert_equals "4" "$(comp_count)" "gentoo, nomadbsd, u-root and rEFInd"
     assert_equals "gentoo-containeros" "${comp_name[0]}"
     assert_equals "nomadbsd" "${comp_name[1]}"
     assert_equals "u-root" "${comp_name[2]}"
+    assert_equals "refind" "${comp_name[3]}"
 }
 
 test_combined_image_numbers_partitions_past_the_esp() {
@@ -165,6 +244,7 @@ test_partitions_are_laid_out_in_slot_order() {
 
 test_gpt_type_codes_match_the_filesystems() {
     assert_equals "A503" "$(gpt_type_code ufs)" "freebsd's loader finds its root by type"
+    assert_equals "A504" "$(gpt_type_code zfs)"
     assert_equals "8300" "$(gpt_type_code xfs)"
     assert_equals "0700" "$(gpt_type_code vfat)"
 }
@@ -189,6 +269,21 @@ test_ufs_partition_is_found_in_an_mbr_image() {
 
     assert_equals "104448 9203712" "$(image_partition_range img ufs)"
     assert_equals "2048 102400" "$(image_partition_range img esp)"
+
+    unset -f sfdisk
+}
+
+test_zfs_partition_is_found_in_a_freebsd_vm_image() {
+    # Makefile.vm's amd64 layout: gptzfsboot, the ESP, then the pool
+    sfdisk() {
+        printf 'img1 : start=    40, size=   1024, type=83BD6B9D-7F41-11DC-BE0B-001560B84F0F, uuid=A\n'
+        printf 'img2 : start=  1064, size=  66584, type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B, uuid=B\n'
+        printf 'img3 : start= 67648, size=4194304, type=516E7CBA-6ECF-11D6-8FF8-00022D09712B, uuid=C\n'
+    }
+
+    assert_equals "67648 4194304" "$(image_partition_range img zfs)"
+    assert_equals "1064 66584" "$(image_partition_range img esp)"
+    assert_fails "image_partition_range img ufs" "a pool is not mistaken for UFS"
 
     unset -f sfdisk
 }
@@ -316,6 +411,7 @@ test_a_shared_kernel_is_copied_to_the_esp_once() {
     echo kernel > "${d}/src/bzImage-virt-amd64-latest"
     echo loader > "${d}/src/nomadbsd-loader.efi"
     echo initrd > "${d}/src/initramfs-amd64.cpio"
+    echo refind > "${d}/src/refind_x64.efi"
 
     composition_load "containeros-virt" "amd64"
 
@@ -327,11 +423,12 @@ test_a_shared_kernel_is_copied_to_the_esp_once() {
                          "${d}/esp" "${comp_initrd[$i]}"
     done
 
-    assert_equals "3" "$(find "${d}/esp" -type f | wc -l | tr -d ' ')" \
-                  "one kernel, one initramfs and one EFI loader"
+    assert_equals "4" "$(find "${d}/esp" -type f | wc -l | tr -d ' ')" \
+                  "one kernel, one initramfs and two EFI loaders"
     assert "test -f ${d}/esp/bzImage-virt-amd64"
     assert "test -f ${d}/esp/initramfs-amd64.cpio"
     assert "test -f ${d}/esp/EFI/nomadbsd/loader.efi"
+    assert "test -f ${d}/esp/EFI/refind/refind_x64.efi"
 
     rm -rf "${d}"
 }
@@ -344,7 +441,7 @@ test_combined_image_is_refused_where_its_bsd_slot_has_no_image() {
 test_combined_image_composes_where_every_slot_exists() {
     NOMADBSD_IMAGE='' composition_load "containeros-virt" "amd64"
 
-    assert_equals "3" "$(comp_count)" "all three slots on amd64"
+    assert_equals "4" "$(comp_count)" "all four slots on amd64"
     assert_equals "bzImage-virt-amd64" "${comp_kernel[0]}" "with the amd64 kernel"
     assert_equals "initramfs-amd64.cpio" "${comp_initrd[2]}" "and the amd64 initramfs"
     assert_equals "amd64" "${comp_provider_arg[1]}" "the BSD slot is told the arch"
@@ -633,8 +730,14 @@ test_qemu_binary_and_machine_follow_the_arch() {
 test_qemu_uses_kvm_only_for_a_matching_host() {
     sys_arch() { echo "amd64"; }
 
-    assert_equals "kvm" "$(qemu_accel_for_arch amd64)" "a matching guest can use kvm"
-    assert_equals "kvm" "$(qemu_accel_for_arch x86_64)" "however the arch is spelled"
+    local native
+    native="tcg"
+    if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+        native="kvm"
+    fi
+
+    assert_equals "${native}" "$(qemu_accel_for_arch amd64)" "a matching guest uses kvm where it is usable"
+    assert_equals "${native}" "$(qemu_accel_for_arch x86_64)" "however the arch is spelled"
     assert_equals "tcg" "$(qemu_accel_for_arch arm64)" "a foreign guest has to be emulated"
 
     unset -f sys_arch
@@ -650,6 +753,7 @@ test_boot_test_pattern_follows_the_provider() {
                   "a systemd slot is up once it runs a getty"
     assert_equals "u-root" "$(BOOT_TEST_PATTERN='' boot_test_pattern u-root)"
     assert_equals "FreeBSD" "$(BOOT_TEST_PATTERN='' boot_test_pattern nomadbsd)"
+    assert_equals "rEFInd - Main Menu" "$(BOOT_TEST_PATTERN='' boot_test_pattern refind)"
 }
 
 test_boot_test_pattern_can_be_overridden() {
@@ -793,4 +897,93 @@ test_uefi_boards_and_boardless_targets_are_allowed() {
     assert "require_uefi_board gentoo-sway-pine64" "u-boot chainloads systemd-boot"
     assert "require_uefi_board gentoo-containeros" "no board named, nothing to check"
     assert "require_uefi_board containeros-virt"
+}
+
+test_freebsd_is_left_out_unless_included() {
+    composition_load "gentoo-sway-pine64" "arm64"
+
+    assert_status_code 1 "composition_has freebsd" "optional, so not composed by default"
+}
+
+test_freebsd_is_the_only_bsd_on_arm64() {
+    INCLUDE_IMAGES="freebsd" composition_load "gentoo-sway-pine64" "arm64"
+
+    assert_equals "freebsd gentoo-sway refind" "${comp_name[*]}"
+    assert_equals "3 4 0" "${comp_part[*]}" "ahead of the Gentoo rootfs, which stays last"
+    assert_equals "zfs" "${comp_fs[0]}"
+    assert_equals "efi" "${comp_boot_type[0]}"
+    assert_equals "EFI/freebsd/loader.efi" "${comp_kernel[0]}"
+    assert_equals "$((16384 + freebsd_slot_size))" "$(composition_disk_size_mib)"
+    assert_equals "rootdev=zfs:zroot/ROOT/default:" "${comp_cmdline[0]}" \
+                  "a ZFS root is named by its dataset, which needs no disk index"
+    assert_equals "gentoo-sway" "${comp_default}" "Gentoo stays the default entry"
+}
+
+test_freebsd_sits_next_to_nomadbsd_on_amd64() {
+    INCLUDE_IMAGES="freebsd" composition_load "gentoo-sway" "amd64"
+
+    assert_equals "nomadbsd freebsd gentoo-sway refind" "${comp_name[*]}"
+    assert_equals "3 4 5 0" "${comp_part[*]}"
+    assert_equals "$((16384 + 6144 + freebsd_slot_size))" "$(composition_disk_size_mib)"
+    assert_equals "" "${comp_cmdline[0]}" "NomadBSD comes first, the loader's walk finds it"
+    assert_equals "rootdev=zfs:zroot/ROOT/default:" "${comp_cmdline[1]}" \
+                  "pinned, or its loader would boot NomadBSD's root first"
+}
+
+test_freebsd_stays_pinned_once_nomadbsd_is_excluded() {
+    INCLUDE_IMAGES="freebsd" EXCLUDE_IMAGES="nomadbsd" composition_load "gentoo-sway" "amd64"
+
+    assert_equals "freebsd gentoo-sway refind" "${comp_name[*]}"
+    assert_equals "3" "${comp_part[0]}"
+    assert_equals "rootdev=zfs:zroot/ROOT/default:" "${comp_cmdline[0]}"
+}
+
+test_a_second_ufs_root_is_pinned_by_partition() {
+    composition_reset
+    composition_add "nomadbsd" "nomadbsd" "amd64" "ufs" "6144" "" "" "" "" "" "efi"
+    composition_add "freebsd" "freebsd" "amd64" "ufs" "2048" "" "" "" "" "" "efi"
+    comp_part=(3 4)
+
+    composition_pin_bsd_rootdev
+
+    assert_equals "" "${comp_cmdline[0]}" "the first UFS root keeps the loader's walk"
+    assert_equals "rootdev=disk0p4:" "${comp_cmdline[1]}"
+}
+
+test_freebsd_rootdev_reaches_the_boot_entry() {
+    local f
+    f="$(mktemp)"
+
+    create_boot_entry "${f}" "freebsd" "efi" "EFI/freebsd/loader.efi" "" "" "rootdev=zfs:zroot/ROOT/default:"
+
+    assert_equals "efi           /EFI/freebsd/loader.efi" "$(sed -n 2p "${f}")"
+    assert_equals "options       rootdev=zfs:zroot/ROOT/default:" "$(sed -n 3p "${f}")" \
+                  "systemd-boot passes options as the loader's load options"
+
+    rm -f "${f}"
+}
+
+test_include_refuses_a_slot_the_target_does_not_offer() {
+    assert_fails "INCLUDE_IMAGES=typo composition_load gentoo-sway amd64" \
+                 "a typo is not silently ignored"
+    assert_fails "INCLUDE_IMAGES=freebsd composition_load nomadbsd amd64" \
+                 "nor a target that never composes the slot"
+}
+
+test_freebsd_arch_gate_refuses_arches_freebsd_build_does_not_build() {
+    assert_fails "INCLUDE_IMAGES=freebsd composition_load gentoo-sway armv7"
+    assert "FREEBSD_IMAGE=/some/image freebsd_require_arch armv7 test" \
+           "an explicit image is the caller's business"
+}
+
+test_freebsd_image_name_follows_the_arch() {
+    assert_equals "freebsd-${freebsd_image_version}-arm64.img" \
+                  "$(freebsd_image_file aarch64)"
+    assert_equals "freebsd-${freebsd_image_version}-amd64.img" \
+                  "$(freebsd_image_file x86_64)"
+}
+
+test_freebsd_image_path_prefers_an_explicit_image() {
+    assert_equals "/tmp/x.img" "$(FREEBSD_IMAGE=/tmp/x.img freebsd_image_path /dl arm64)"
+    assert_equals "/dl/$(freebsd_image_file arm64)" "$(freebsd_image_path /dl arm64)"
 }
