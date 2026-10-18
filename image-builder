@@ -119,6 +119,15 @@ freebsd_slot_size="${FREEBSD_SLOT_SIZE:-4096}"
 # freebsd_vm_image_config
 freebsd_root_dataset="zroot/ROOT/default"
 
+ninefront_version="${NINEFRONT_VERSION:-11952}"
+ninefront_repo_url="${NINEFRONT_REPO_URL:-https://github.com/bbusse/9front-build/releases/download/latest}"
+ninefront_fs_flags="${NINEFRONT_FS_FLAGS:--A}"
+ninefront_loader_file="9front-loader.efi"
+ninefront_kernel_file="9front-9pc64"
+ninefront_esp_dir="EFI/9front"
+ninefront_slot_size="${NINEFRONT_SLOT_SIZE:-4096}"
+ninefront_root_disk="${NINEFRONT_ROOT_DISK:-sdE0}"
+
 refind_version="${REFIND_VERSION:-0.14.2}"
 refind_sha512="${REFIND_SHA512:-0d70cf0c61de376e2f564d0e0b89d12f04f0ec267f180b5887b64f6f5b6d34202383ffe73bf620b02d4d9c25619e5ed9be014cb8516c461090c1aca599b8f789}"
 
@@ -252,7 +261,7 @@ check_root_fail() {
 reexec_privileged() {
     if [ "$(id -u)" != "0" ]; then
         sudo -E "$SCRIPT_PATH"/"$SCRIPT_NAME" "${args[@]}"
-        exit 0
+        exit $?
     fi
 }
 
@@ -2027,6 +2036,9 @@ image_partition_range() {
     zfs)
         types="516E7CBA-6ECF-11D6-8FF8-00022D09712B"
         ;;
+    plan9)
+        types="C91818F9-8025-47AF-89D2-F030D7000C2C 39"
+        ;;
     esp)
         types="C12A7328-F81F-11D2-BA4B-00A0C93EC93B ef"
         ;;
@@ -2154,6 +2166,7 @@ image_ufs_range() {
 parted_fs_hint() {
     case "${1}" in
     vfat) echo "fat32" ;;
+    plan9) echo "" ;;
     *) echo "${1}" ;;
     esac
 }
@@ -2164,6 +2177,7 @@ gpt_type_code() {
     case "${1}" in
     ufs) echo "A503" ;;
     zfs) echo "A504" ;;
+    plan9) echo "3900" ;;
     vfat) echo "0700" ;;
     *) echo "8300" ;;
     esac
@@ -2203,8 +2217,11 @@ create_disk_parts_gpt() {
             end="$((start + comp_size[i]))MiB"
         fi
 
+        local fs_hint
+        fs_hint="$(parted_fs_hint "${comp_fs[$i]}")"
+
         parted -s "${file_disk}" mkpart "${comp_name[$i]}" \
-            "$(parted_fs_hint "${comp_fs[$i]}")" \
+            ${fs_hint:+"${fs_hint}"} \
             "${start}MiB" "${end}"
         sgdisk -t "${comp_part[$i]}:$(gpt_type_code "${comp_fs[$i]}")" \
             "${file_disk}" >/dev/null
@@ -2333,7 +2350,7 @@ composition_keep() {
 }
 
 # Slots composed only when INCLUDE_IMAGES asks for them
-composition_optional_slots="freebsd"
+composition_optional_slots="freebsd 9front"
 
 composition_included() {
     case " ${INCLUDE_IMAGES:-} " in
@@ -2642,6 +2659,22 @@ composition_load() {
                 "efi"
         fi
 
+        if composition_included "9front"; then
+            ninefront_require_arch "${target_arch}" "${build_target}"
+            comp_disk_size=$((comp_disk_size + ninefront_slot_size))
+            composition_add "9front" \
+                "9front" \
+                "${target_arch}" \
+                "plan9" \
+                "${ninefront_slot_size}" \
+                "${ninefront_loader_file}" \
+                "${ninefront_esp_dir}/bootx64.efi" \
+                "" \
+                "" \
+                "" \
+                "efi"
+        fi
+
         composition_add "gentoo-${target_flavour}" \
             "gentoo" \
             "${target_flavour}" \
@@ -2726,6 +2759,23 @@ composition_load() {
             "" \
             "efi"
         ;;
+    9front)
+        ninefront_require_arch "${target_arch}" "9front"
+
+        comp_esp_size=64
+
+        composition_add "9front" \
+            "9front" \
+            "${target_arch}" \
+            "plan9" \
+            "${ninefront_slot_size}" \
+            "${ninefront_loader_file}" \
+            "${ninefront_esp_dir}/bootx64.efi" \
+            "" \
+            "" \
+            "" \
+            "efi"
+        ;;
     *)
         # Keeps targets that partition a disk without describing one -
         # alma - on the layout they had before compositions existed
@@ -2800,6 +2850,9 @@ composition_fetch() {
                 "$(freebsd_image_path "${download_path}" "${comp_provider_arg[$i]}")" \
                 "${download_path}/${freebsd_loader_file}"
             ;;
+        9front)
+            ninefront_fetch "${download_path}" "${comp_provider_arg[$i]}"
+            ;;
         u-root)
             u_root_fetch "${download_path}" "${comp_provider_arg[$i]}"
             ;;
@@ -2850,7 +2903,7 @@ composition_mkfs() {
                 exit 1
             fi
             ;;
-        ufs | zfs)
+        ufs | zfs | plan9)
             info "$(printf "Skipping mkfs on %s: its %s filesystem is copied in whole\n" \
                 "${dev}" "$(echo "${comp_fs[$i]}" | tr '[:lower:]' '[:upper:]')")"
             ;;
@@ -2896,6 +2949,12 @@ install_rootfs_slots() {
                 "${dev}" \
                 "zfs"
             ;;
+        9front)
+            bsd_install_fs "9front" \
+                "$(ninefront_image_path "${src_path}")" \
+                "${dev}" \
+                "plan9"
+            ;;
         none | u-root)
             info "$(printf "Slot %s installs no rootfs, leaving %s empty\n" \
                 "${comp_name[$i]}" "${dev}")"
@@ -2907,7 +2966,9 @@ install_rootfs_slots() {
             ;;
         esac
 
-        verify_filesystem "${dev}" "$(printf "install_rootfs %s" "${comp_name[$i]}")"
+        if [ "plan9" != "${comp_fs[$i]}" ]; then
+            verify_filesystem "${dev}" "$(printf "install_rootfs %s" "${comp_name[$i]}")"
+        fi
     done
 }
 
@@ -3053,6 +3114,8 @@ bsd_stage_loader() {
     src_img="${2}"
     local dest
     dest="${3}"
+    local path
+    path="${4:-}"
 
     if [ -f "${dest}" ]; then
         info "$(printf "%s: EFI loader already staged: %s\n" "${name}" "${dest}")"
@@ -3114,15 +3177,19 @@ bsd_stage_loader() {
     # The binary is BOOTAA64.EFI on arm64 and BOOTX64.EFI on amd64, and
     # vfat is case insensitive, so search for it rather than guess
     local loader
-    loader="$(find "${esp_mnt}" \
-        \( -iname 'boot*.efi' -o -iname 'loader.efi' \) \
-        -type f | head -1)"
+    if [ -n "${path}" ]; then
+        loader="$(find "${esp_mnt}" -ipath "${esp_mnt}/${path}" -type f | head -1)"
+    else
+        loader="$(find "${esp_mnt}" \
+            \( -iname 'boot*.efi' -o -iname 'loader.efi' \) \
+            -type f | head -1)"
+    fi
 
     if [ -n "${loader}" ]; then
-        info "$(printf "%s: Staging EFI loader %s\n" "${name}" "${loader}")"
+        info "$(printf "%s: Staging %s\n" "${name}" "${loader}")"
         cp "${loader}" "${dest}"
     else
-        error "$(printf "%s: Found no EFI loader on the image's ESP\n" "${name}")"
+        error "$(printf "%s: Found no %s on the image's ESP\n" "${name}" "${path:-EFI loader}")"
         find "${esp_mnt}" || true
     fi
 
@@ -3252,8 +3319,50 @@ freebsd_require_arch() {
     exit 1
 }
 
+release_image_fetch() {
+    local name
+    name="${1}"
+    local download_path
+    download_path="${2}"
+    local repo_url
+    repo_url="${3}"
+    local release_file
+    release_file="${4}"
+    local img
+    img="${5}"
+    shift 5
+
+    info "$(printf "%s: Fetching %s\n" "${name}" "${release_file}")"
+    if ! (download_miss "${download_path}" \
+        "${repo_url}/${release_file}" \
+        "${repo_url}/${release_file}.sha384" \
+        "${release_file}.sha384"); then
+        error "$(printf "%s: No %s at %s\n" "${name}" "${release_file}" "${repo_url}")"
+        return 1
+    fi
+
+    if [ -f "${img}" ] && [ ! "${download_path}/${release_file}" -nt "${img}" ]; then
+        info "$(printf "%s: Image is up to date: %s\n" "${name}" "${img}")"
+        return 0
+    fi
+
+    info "$(printf "%s: Decompressing %s\n" "${name}" "${release_file}")"
+    if ! cp --sparse=always <(xz -d -c "${download_path}/${release_file}") "${img}.part"; then
+        error "$(printf "%s: Failed to decompress %s\n" "${name}" "${release_file}")"
+        rm -f "${img}.part"
+        return 1
+    fi
+    mv "${img}.part" "${img}"
+    rm -f "$@"
+}
+
 freebsd_image_file() {
     printf "freebsd-%s-%s.img" "${freebsd_image_version}" \
+        "$(freebsd_image_arch "${1}")"
+}
+
+freebsd_release_file() {
+    printf "freebsd-%s-%s-latest" "${freebsd_image_version}" \
         "$(freebsd_image_arch "${1}")"
 }
 
@@ -3286,44 +3395,90 @@ freebsd_image_fetch() {
         return 0
     fi
 
-    local img_file
-    img_file="$(freebsd_image_file "${target_arch}")"
-    local compressed_file
-    compressed_file="${img_file}.xz"
+    if ! release_image_fetch "FreeBSD" "${download_path}" \
+        "${freebsd_image_repo_url}" \
+        "$(freebsd_release_file "${target_arch}")" \
+        "$(freebsd_image_path "${download_path}" "${target_arch}")" \
+        "${download_path}/${freebsd_loader_file}"; then
+        error "Set FREEBSD_REPO_URL to a release carrying it, or"
+        error "FREEBSD_IMAGE to an already built image"
+        exit 1
+    fi
+}
 
-    if [ -f "${download_path}/${img_file}" ]; then
-        info "$(printf "FreeBSD: Image exists, not fetching again: %s\n" "${img_file}")"
+ninefront_require_arch() {
+    local target_arch
+    target_arch="${1}"
+    local context
+    context="${2}"
+
+    case "${target_arch}" in
+    amd64 | x86_64) return 0 ;;
+    esac
+
+    error "$(printf "%s: 9front slots are only built for amd64, not %s\n" \
+        "${context}" "${target_arch}")"
+    exit 1
+}
+
+ninefront_image_file() {
+    printf "9front-%s-amd64.img" "${ninefront_version}"
+}
+
+ninefront_release_file() {
+    printf "9front-%s-amd64-latest" "${ninefront_version}"
+}
+
+ninefront_image_path() {
+    if [ -n "${NINEFRONT_IMAGE}" ]; then
+        printf "%s" "${NINEFRONT_IMAGE}"
         return 0
     fi
 
-    if [ ! -f "${download_path}/${compressed_file}" ]; then
-        if ! (download "${freebsd_image_repo_url}/${compressed_file}" \
-            "${download_path}" \
-            "${DOWNLOAD_RETRIES}"); then
-            error "$(printf "FreeBSD: No %s at %s\n" "${compressed_file}" "${freebsd_image_repo_url}")"
-            error "Set FREEBSD_REPO_URL to a release carrying it, or"
-            error "FREEBSD_IMAGE to an already built image"
+    printf "%s/%s" "${1}" "$(ninefront_image_file)"
+}
+
+ninefront_fetch() {
+    local download_path
+    download_path="${1}"
+    local target_arch
+    target_arch="${2}"
+
+    ninefront_require_arch "${target_arch}" "9front"
+
+    local img
+    img="$(ninefront_image_path "${download_path}")"
+
+    if [ -n "${NINEFRONT_IMAGE}" ]; then
+        if [ ! -f "${NINEFRONT_IMAGE}" ]; then
+            error "$(printf "9front: NINEFRONT_IMAGE does not exist: %s\n" "${NINEFRONT_IMAGE}")"
             exit 1
         fi
-    fi
-
-    download "${freebsd_image_repo_url}/${compressed_file}.sha256" \
-        "${download_path}" \
-        "${DOWNLOAD_RETRIES}"
-
-    info "FreeBSD: Verifying checksum"
-    if ! checksum_verify "${download_path}/${compressed_file}.sha256" \
-        "${download_path}/${compressed_file}" \
-        "sha256"; then
-        error "$(printf "FreeBSD: Checksum mismatch: %s\n" "${compressed_file}")"
+        info "$(printf "9front: Using NINEFRONT_IMAGE: %s\n" "${NINEFRONT_IMAGE}")"
+    elif ! release_image_fetch "9front" "${download_path}" \
+        "${ninefront_repo_url}" \
+        "$(ninefront_release_file)" \
+        "${img}" \
+        "${download_path}/${ninefront_loader_file}" \
+        "${download_path}/${ninefront_kernel_file}"; then
+        error "Set NINEFRONT_REPO_URL to a release carrying it, or"
+        error "NINEFRONT_IMAGE to an already built image"
         exit 1
     fi
 
-    info "$(printf "FreeBSD: Decompressing %s\n" "${compressed_file}")"
-    if ! xz -d -k -f "${download_path}/${compressed_file}"; then
-        error "FreeBSD: Failed to decompress image"
-        exit 1
-    fi
+    bsd_stage_loader "9front" "${img}" \
+        "${download_path}/${ninefront_loader_file}" "efi/boot/bootx64.efi"
+    bsd_stage_loader "9front" "${img}" \
+        "${download_path}/${ninefront_kernel_file}" "9pc64"
+}
+
+ninefront_write_plan9_ini() {
+    cat <<EOF >"${1}"
+bootfile=/${ninefront_esp_dir}/9pc64
+console=0
+nobootprompt=local!/dev/${ninefront_root_disk}/fs ${ninefront_fs_flags}
+user=glenda
+EOF
 }
 
 # NomadBSD's build system runs on FreeBSD and takes ARCH=amd64|i386|mac
@@ -3774,6 +3929,12 @@ install_kernels() {
             "${mnt_path}" "${comp_initrd[$i]}"
         esp_install_file "${src_path}" "${comp_dtb_src[$i]}" \
             "${mnt_path}" "${comp_dtb[$i]}"
+
+        if [ "9front" = "${comp_provider[$i]}" ]; then
+            esp_install_file "${src_path}" "${ninefront_kernel_file}" \
+                "${mnt_path}" "${ninefront_esp_dir}/9pc64"
+            ninefront_write_plan9_ini "${mnt_path}/plan9.ini"
+        fi
     done
 
     printf "\n"
@@ -6255,6 +6416,9 @@ boot_test_pattern() {
     refind)
         echo "rEFInd - Main Menu"
         ;;
+    9front)
+        echo "term%"
+        ;;
     *)
         echo "login:"
         ;;
@@ -6578,7 +6742,7 @@ show_usage() {
     printf "                    gentoo-stage3 | linux-kernel | nanobsd |\n"
     printf "                    nomadbsd | openwrt | u-root\n"
     printf "\n"
-    printf "  create TARGET     alma | alpine-containeros[-BOARD] |\n"
+    printf "  create TARGET     9front | alma | alpine-containeros[-BOARD] |\n"
     printf "                    alpine-sway[-BOARD] |\n"
     printf "                    containeros-virt | freebsd |\n"
     printf "                    gentoo-containeros | gentoo-sway |\n"
@@ -6802,10 +6966,10 @@ main() {
                 rockpro64)
                     target_arch="arm64"
                     ;;
-                virt-arm64)
+                virt-arm64 | rpi3 | rpi4 | m2-pro)
                     target_arch="arm64"
                     ;;
-                beaglebone-black)
+                beaglebone-black | rpi1 | rpi2)
                     # 32 bit ARM, cross built on an arm64 host
                     target_arch="arm64"
                     ;;
@@ -6961,7 +7125,7 @@ main() {
             #                "${ansible_roles}"
             exit 0
             ;;
-        gentoo-containeros | gentoo-sway | gentoo-sway-virt | gentoo-sway-pine64 | gentoo-sway-rockpro64 | containeros-virt | nomadbsd)
+        gentoo-containeros | gentoo-sway | gentoo-sway-virt | gentoo-sway-pine64 | gentoo-sway-rockpro64 | containeros-virt | nomadbsd | 9front)
             # download_miss/gentoo_fetch_stage3 (called below) expect a
             # "path" in scope to fetch into
             local path
@@ -7057,7 +7221,7 @@ main() {
         *)
             printf "\n"
             printf "You need to specify a valid target system OS\n"
-            printf "  One of: alma, alpine-containeros, alpine-sway,\n"
+            printf "  One of: 9front, alma, alpine-containeros, alpine-sway,\n"
             printf "          containeros-virt, freebsd, gentoo-containeros,\n"
             printf "          gentoo-sway, gentoo-sway-pine64,\n"
             printf "          gentoo-sway-rockpro64,\n"
