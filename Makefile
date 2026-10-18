@@ -1,4 +1,4 @@
 test:
 	./tests/install_bash_unit.sh
-	./bash_unit
-	./bash_unit tests/test_image-builder.sh
+	./tests/bash_unit tests/test_composition.sh
+	./tests/bash_unit tests/test_image-builder.sh
