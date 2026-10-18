@@ -105,6 +105,20 @@ nomadbsd_source_url="https://github.com/NomadBSD/NomadBSD"
 nomadbsd_filesystem="${NOMADBSD_FILESYSTEM:-ufs}"
 nomadbsd_loader_file="nomadbsd-loader.efi"
 
+# FreeBSD slot: the ZFS image bbusse/freebsd-build builds and boot tests for
+# amd64 and arm64, composed into the disk next to NomadBSD. Optional, it is
+# only added when INCLUDE_IMAGES names it. FREEBSD_REPO_URL selects where the
+# image comes from, FREEBSD_IMAGE overrides the lookup with a local image
+freebsd_image_version="${FREEBSD_VERSION:-15.1}"
+freebsd_image_repo_url="${FREEBSD_REPO_URL:-https://github.com/bbusse/freebsd-build/releases/download/latest}"
+freebsd_loader_file="freebsd-loader.efi"
+# The image's zroot pool partition is 2 GiB and is copied in whole, so the
+# slot has to be larger. growfs grows the pool to fill the slot on first boot
+freebsd_slot_size="${FREEBSD_SLOT_SIZE:-4096}"
+# The boot environment freebsd-build's image boots, see
+# freebsd_vm_image_config
+freebsd_root_dataset="zroot/ROOT/default"
+
 refind_version="${REFIND_VERSION:-0.14.2}"
 refind_sha512="${REFIND_SHA512:-0d70cf0c61de376e2f564d0e0b89d12f04f0ec267f180b5887b64f6f5b6d34202383ffe73bf620b02d4d9c25619e5ed9be014cb8516c461090c1aca599b8f789}"
 
@@ -2010,6 +2024,9 @@ image_partition_range() {
     ufs)
         types="516E7CB6-6ECF-11D6-8FF8-00022D09712B a5"
         ;;
+    zfs)
+        types="516E7CBA-6ECF-11D6-8FF8-00022D09712B"
+        ;;
     esp)
         types="C12A7328-F81F-11D2-BA4B-00A0C93EC93B ef"
         ;;
@@ -2141,10 +2158,12 @@ parted_fs_hint() {
     esac
 }
 
-# sgdisk type codes: FreeBSD UFS, Microsoft basic data, Linux filesystem
+# sgdisk type codes: FreeBSD UFS and ZFS, Microsoft basic data, Linux
+# filesystem
 gpt_type_code() {
     case "${1}" in
     ufs) echo "A503" ;;
+    zfs) echo "A504" ;;
     vfat) echo "0700" ;;
     *) echo "8300" ;;
     esac
@@ -2313,6 +2332,35 @@ composition_keep() {
     slots=("${kept[@]}")
 }
 
+# Slots composed only when INCLUDE_IMAGES asks for them
+composition_optional_slots="freebsd"
+
+composition_included() {
+    case " ${INCLUDE_IMAGES:-} " in
+    *" ${1} "*) return 0 ;;
+    esac
+    return 1
+}
+
+# Refuse an INCLUDE_IMAGES entry the target did not compose, so a typo or a
+# target without that slot fails up front instead of building without it
+composition_check_include() {
+    local build_target
+    build_target="${1}"
+
+    local included
+    read -r -a included <<<"${INCLUDE_IMAGES:-}"
+
+    local x
+    for x in "${included[@]}"; do
+        if ! composition_has "${x}"; then
+            error "$(printf "INCLUDE_IMAGES: %s can not be added to %s, optional slots: %s\n" \
+                "${x}" "${build_target}" "${composition_optional_slots}")"
+            exit 1
+        fi
+    done
+}
+
 composition_exclude() {
     local excluded
     read -r -a excluded <<<"${EXCLUDE_IMAGES:-}"
@@ -2441,6 +2489,42 @@ composition_finalize() {
     done
 }
 
+# FreeBSD's loader.efi, chainloaded from the shared ESP, walks the disk's
+# partitions in order and boots the first one holding a FreeBSD root - with
+# NomadBSD ahead of it on the disk, the FreeBSD entry would boot NomadBSD.
+# loader.efi turns name=value load options into loader variables, and
+# rootdev overrides that walk, so pin it from the boot entry's options.
+# uefi_rootdev would name the partition without assuming a disk index, but it
+# only matches a full hardware device path. disk0 is the disk the loader
+# enumerates first, the image's own disk when it is the only one attached.
+# The first FreeBSD root on the disk keeps the walk, which needs no disk index.
+# A ZFS root is pinned by its pool and dataset instead, which needs no disk
+# index either, so it is pinned wherever it sits
+composition_pin_bsd_rootdev() {
+    local seen
+    seen=""
+
+    local i
+    for i in "${!comp_name[@]}"; do
+        case "${comp_fs[$i]}" in
+        zfs)
+            if [ "freebsd" = "${comp_provider[$i]}" ]; then
+                comp_cmdline[i]="rootdev=zfs:${freebsd_root_dataset}:"
+            fi
+            ;;
+        ufs)
+            if [ -n "${seen}" ] && [ "freebsd" = "${comp_provider[$i]}" ]; then
+                comp_cmdline[i]="rootdev=disk0p${comp_part[$i]}:"
+            fi
+            ;;
+        *)
+            continue
+            ;;
+        esac
+        seen="1"
+    done
+}
+
 composition_disk_size_mib() {
     if [ -n "${comp_disk_size}" ]; then
         echo "${comp_disk_size}"
@@ -2534,6 +2618,24 @@ composition_load() {
                 "6144" \
                 "${nomadbsd_loader_file}" \
                 "EFI/nomadbsd/loader.efi" \
+                "" \
+                "" \
+                "" \
+                "efi"
+        fi
+
+        # Ahead of the gentoo slot, which runs to the end of the disk: the
+        # space right after it is never free, so growfs only fills its slot
+        if composition_included "freebsd"; then
+            freebsd_require_arch "${target_arch}" "${build_target}"
+            comp_disk_size=$((comp_disk_size + freebsd_slot_size))
+            composition_add "freebsd" \
+                "freebsd" \
+                "${target_arch}" \
+                "zfs" \
+                "${freebsd_slot_size}" \
+                "${freebsd_loader_file}" \
+                "EFI/freebsd/loader.efi" \
                 "" \
                 "" \
                 "" \
@@ -2645,8 +2747,10 @@ composition_load() {
         ;;
     esac
 
+    composition_check_include "${build_target}"
     composition_exclude
     composition_finalize
+    composition_pin_bsd_rootdev
 }
 
 # Fetch and stage everything the slots need before the disk image is
@@ -2689,6 +2793,12 @@ composition_fetch() {
         nomadbsd)
             nomadbsd_fetch "${download_path}" "${comp_provider_arg[$i]}"
             nomadbsd_stage_loader "${download_path}" "${comp_provider_arg[$i]}"
+            ;;
+        freebsd)
+            freebsd_image_fetch "${download_path}" "${comp_provider_arg[$i]}"
+            bsd_stage_loader "FreeBSD" \
+                "$(freebsd_image_path "${download_path}" "${comp_provider_arg[$i]}")" \
+                "${download_path}/${freebsd_loader_file}"
             ;;
         u-root)
             u_root_fetch "${download_path}" "${comp_provider_arg[$i]}"
@@ -2740,8 +2850,9 @@ composition_mkfs() {
                 exit 1
             fi
             ;;
-        ufs)
-            info "$(printf "Skipping mkfs on %s: its UFS filesystem is copied in whole\n" "${dev}")"
+        ufs | zfs)
+            info "$(printf "Skipping mkfs on %s: its %s filesystem is copied in whole\n" \
+                "${dev}" "$(echo "${comp_fs[$i]}" | tr '[:lower:]' '[:upper:]')")"
             ;;
         *)
             error "$(printf "composition_mkfs: Unsupported filesystem: %s\n" "${comp_fs[$i]}")"
@@ -2778,6 +2889,12 @@ install_rootfs_slots() {
             nomadbsd_install_rootfs "${dev}" \
                 "${src_path}" \
                 "${comp_provider_arg[$i]}"
+            ;;
+        freebsd)
+            bsd_install_fs "FreeBSD" \
+                "$(freebsd_image_path "${src_path}" "${comp_provider_arg[$i]}")" \
+                "${dev}" \
+                "zfs"
             ;;
         none | u-root)
             info "$(printf "Slot %s installs no rootfs, leaving %s empty\n" \
@@ -2927,29 +3044,25 @@ nomadbsd_fetch() {
     fi
 }
 
-# NomadBSD boots through FreeBSD's EFI loader. Take it out of the
-# image's own ESP so a systemd-boot entry can chainload it
-nomadbsd_stage_loader() {
-    local src_path
-    src_path="${1}"
-    local target_arch
-    target_arch="${2}"
-
+# FreeBSD derived images boot through FreeBSD's EFI loader. Take it out of
+# the image's own ESP so a systemd-boot entry can chainload it
+bsd_stage_loader() {
+    local name
+    name="${1}"
+    local src_img
+    src_img="${2}"
     local dest
-    dest="${src_path}/${nomadbsd_loader_file}"
+    dest="${3}"
 
     if [ -f "${dest}" ]; then
-        info "$(printf "NomadBSD: EFI loader already staged: %s\n" "${dest}")"
+        info "$(printf "%s: EFI loader already staged: %s\n" "${name}" "${dest}")"
         return 0
     fi
-
-    local src_img
-    src_img="$(nomadbsd_image_path "${src_path}" "${target_arch}")"
 
     local range
     range="$(image_partition_range "${src_img}" "esp")"
     if [ -z "${range}" ]; then
-        error "$(printf "NomadBSD: Found no ESP in %s\n" "${src_img}")"
+        error "$(printf "%s: Found no ESP in %s\n" "${name}" "${src_img}")"
         sfdisk -d "${src_img}" || true
         exit 1
     fi
@@ -2960,18 +3073,18 @@ nomadbsd_stage_loader() {
     size_sectors="${range##* }"
 
     local esp_img
-    esp_img="${src_path}/nomadbsd-esp.img"
+    esp_img="${dest%.efi}-esp.img"
     local esp_mnt
-    esp_mnt="${src_path}/nomadbsd-esp"
+    esp_mnt="${dest%.efi}-esp"
 
-    info "$(printf "NomadBSD: Reading the image's ESP (%s MiB)\n" \
-        "$((size_sectors / 2048))")"
+    info "$(printf "%s: Reading the image's ESP (%s MiB)\n" \
+        "${name}" "$((size_sectors / 2048))")"
 
     if ! dd if="${src_img}" of="${esp_img}" bs=4M \
         iflag=skip_bytes,count_bytes \
         skip="$((start_sector * 512))" \
         count="$((size_sectors * 512))"; then
-        error "NomadBSD: Failed to read the image's ESP"
+        error "$(printf "%s: Failed to read the image's ESP\n" "${name}")"
         rm -f "${esp_img}"
         exit 1
     fi
@@ -2986,13 +3099,13 @@ nomadbsd_stage_loader() {
     loop_dev="$(losetup --find --show --read-only "${esp_img}")"
 
     if [ -z "${loop_dev}" ]; then
-        error "$(printf "NomadBSD: Failed to attach the image's ESP: %s\n" "${esp_img}")"
+        error "$(printf "%s: Failed to attach the image's ESP: %s\n" "${name}" "${esp_img}")"
         rm -f "${esp_img}"
         exit 1
     fi
 
     if ! mount -t vfat -o ro "${loop_dev}" "${esp_mnt}"; then
-        error "$(printf "NomadBSD: Failed to mount the image's ESP: %s\n" "${loop_dev}")"
+        error "$(printf "%s: Failed to mount the image's ESP: %s\n" "${name}" "${loop_dev}")"
         losetup -d "${loop_dev}" || true
         rm -f "${esp_img}"
         exit 1
@@ -3006,10 +3119,10 @@ nomadbsd_stage_loader() {
         -type f | head -1)"
 
     if [ -n "${loader}" ]; then
-        info "$(printf "NomadBSD: Staging EFI loader %s\n" "${loader}")"
+        info "$(printf "%s: Staging EFI loader %s\n" "${name}" "${loader}")"
         cp "${loader}" "${dest}"
     else
-        error "NomadBSD: Found no EFI loader on the image's ESP"
+        error "$(printf "%s: Found no EFI loader on the image's ESP\n" "${name}")"
         find "${esp_mnt}" || true
     fi
 
@@ -3023,29 +3136,46 @@ nomadbsd_stage_loader() {
     fi
 }
 
-# NomadBSD ships a whole disk image rather than a rootfs tarball, and
-# Linux can not write UFS, so move the filesystem across as a block
-# range instead of copying files into a mounted UFS
-nomadbsd_install_rootfs() {
-    local dest_dev
-    dest_dev="${1}"
+nomadbsd_stage_loader() {
     local src_path
-    src_path="${2}"
+    src_path="${1}"
     local target_arch
-    target_arch="${3}"
+    target_arch="${2}"
 
+    bsd_stage_loader "NomadBSD" \
+        "$(nomadbsd_image_path "${src_path}" "${target_arch}")" \
+        "${src_path}/${nomadbsd_loader_file}"
+}
+
+# FreeBSD derived images ship as whole disk images rather than a rootfs
+# tarball, and Linux can write neither UFS nor a FreeBSD zpool, so move the
+# filesystem across as a block range instead of copying files into it. A
+# pool copied into a larger slot keeps its size, growfs expands it with
+# zpool online -e on first boot
+bsd_install_fs() {
+    local name
+    name="${1}"
     local src_img
-    src_img="$(nomadbsd_image_path "${src_path}" "${target_arch}")"
+    src_img="${2}"
+    local dest_dev
+    dest_dev="${3}"
+    local fs
+    fs="${4:-ufs}"
+    local fs_label
+    fs_label="$(echo "${fs}" | tr '[:lower:]' '[:upper:]')"
 
     if [ ! -f "${src_img}" ]; then
-        error "$(printf "NomadBSD: Missing image: %s\n" "${src_img}")"
+        error "$(printf "%s: Missing image: %s\n" "${name}" "${src_img}")"
         exit 1
     fi
 
     local range
-    range="$(image_ufs_range "${src_img}")"
+    case "${fs}" in
+    ufs) range="$(image_ufs_range "${src_img}")" ;;
+    *) range="$(image_partition_range "${src_img}" "${fs}")" ;;
+    esac
     if [ -z "${range}" ]; then
-        error "$(printf "NomadBSD: Found no UFS filesystem in %s\n" "${src_img}")"
+        error "$(printf "%s: Found no %s filesystem in %s\n" "${name}" "${fs_label}" "${src_img}")"
         sfdisk -d "${src_img}" || true
         exit 1
     fi
@@ -3061,25 +3191,139 @@ nomadbsd_install_rootfs() {
     dest_bytes="$(blockdev --getsize64 "${dest_dev}")"
 
     if [ "${dest_bytes}" -lt "${src_bytes}" ]; then
-        error "$(printf "NomadBSD: Slot %s holds %s bytes but the UFS filesystem needs %s\n" \
-            "${dest_dev}" "${dest_bytes}" "${src_bytes}")"
+        error "$(printf "%s: Slot %s holds %s bytes but the %s filesystem needs %s\n" \
+            "${name}" "${dest_dev}" "${dest_bytes}" "${fs_label}" "${src_bytes}")"
         error "Raise the slot's size in composition_load"
         exit 1
     fi
 
-    info "$(printf "NomadBSD: Copying UFS filesystem (%s MiB) to %s\n" \
-        "$((src_bytes / 1048576))" "${dest_dev}")"
+    info "$(printf "%s: Copying %s filesystem (%s MiB) to %s\n" \
+        "${name}" "${fs_label}" "$((src_bytes / 1048576))" "${dest_dev}")"
 
     if ! dd if="${src_img}" of="${dest_dev}" bs=4M \
         iflag=skip_bytes,count_bytes \
         skip="$((start_sector * 512))" \
         count="${src_bytes}" \
         status=progress conv=fsync; then
-        error "NomadBSD: Failed to copy the UFS filesystem"
+        error "$(printf "%s: Failed to copy the %s filesystem\n" "${name}" "${fs_label}")"
         exit 1
     fi
 
     sync
+}
+
+nomadbsd_install_rootfs() {
+    local dest_dev
+    dest_dev="${1}"
+    local src_path
+    src_path="${2}"
+    local target_arch
+    target_arch="${3}"
+
+    bsd_install_fs "NomadBSD" \
+        "$(nomadbsd_image_path "${src_path}" "${target_arch}")" \
+        "${dest_dev}"
+}
+
+# Map a target arch onto the token freebsd-build's images are named with
+freebsd_image_arch() {
+    case "${1}" in
+    amd64 | x86_64) echo "amd64" ;;
+    arm64 | aarch64) echo "arm64" ;;
+    *) echo "" ;;
+    esac
+}
+
+# Refuse a FreeBSD slot on an architecture freebsd-build does not build,
+# at composition time. An explicitly supplied image passes, as for NomadBSD
+freebsd_require_arch() {
+    local target_arch
+    target_arch="${1}"
+    local context
+    context="${2}"
+
+    if [ -n "${FREEBSD_IMAGE}" ] || [ -n "$(freebsd_image_arch "${target_arch}")" ]; then
+        return 0
+    fi
+
+    error "$(printf "%s: freebsd-build publishes no %s image, only amd64 and arm64\n" \
+        "${context}" "${target_arch}")"
+    error "Set FREEBSD_IMAGE to a locally supplied image to override this"
+    exit 1
+}
+
+freebsd_image_file() {
+    printf "freebsd-%s-%s.img" "${freebsd_image_version}" \
+        "$(freebsd_image_arch "${1}")"
+}
+
+freebsd_image_path() {
+    local src_path
+    src_path="${1}"
+    local target_arch
+    target_arch="${2}"
+
+    if [ -n "${FREEBSD_IMAGE}" ]; then
+        printf "%s" "${FREEBSD_IMAGE}"
+        return 0
+    fi
+
+    printf "%s/%s" "${src_path}" "$(freebsd_image_file "${target_arch}")"
+}
+
+freebsd_image_fetch() {
+    local download_path
+    download_path="${1}"
+    local target_arch
+    target_arch="${2}"
+
+    if [ -n "${FREEBSD_IMAGE}" ]; then
+        if [ ! -f "${FREEBSD_IMAGE}" ]; then
+            error "$(printf "FreeBSD: FREEBSD_IMAGE does not exist: %s\n" "${FREEBSD_IMAGE}")"
+            exit 1
+        fi
+        info "$(printf "FreeBSD: Using FREEBSD_IMAGE: %s\n" "${FREEBSD_IMAGE}")"
+        return 0
+    fi
+
+    local img_file
+    img_file="$(freebsd_image_file "${target_arch}")"
+    local compressed_file
+    compressed_file="${img_file}.xz"
+
+    if [ -f "${download_path}/${img_file}" ]; then
+        info "$(printf "FreeBSD: Image exists, not fetching again: %s\n" "${img_file}")"
+        return 0
+    fi
+
+    if [ ! -f "${download_path}/${compressed_file}" ]; then
+        if ! (download "${freebsd_image_repo_url}/${compressed_file}" \
+            "${download_path}" \
+            "${DOWNLOAD_RETRIES}"); then
+            error "$(printf "FreeBSD: No %s at %s\n" "${compressed_file}" "${freebsd_image_repo_url}")"
+            error "Set FREEBSD_REPO_URL to a release carrying it, or"
+            error "FREEBSD_IMAGE to an already built image"
+            exit 1
+        fi
+    fi
+
+    download "${freebsd_image_repo_url}/${compressed_file}.sha256" \
+        "${download_path}" \
+        "${DOWNLOAD_RETRIES}"
+
+    info "FreeBSD: Verifying checksum"
+    if ! checksum_verify "${download_path}/${compressed_file}.sha256" \
+        "${download_path}/${compressed_file}" \
+        "sha256"; then
+        error "$(printf "FreeBSD: Checksum mismatch: %s\n" "${compressed_file}")"
+        exit 1
+    fi
+
+    info "$(printf "FreeBSD: Decompressing %s\n" "${compressed_file}")"
+    if ! xz -d -k -f "${download_path}/${compressed_file}"; then
+        error "FreeBSD: Failed to decompress image"
+        exit 1
+    fi
 }
 
 # NomadBSD's build system runs on FreeBSD and takes ARCH=amd64|i386|mac
@@ -3885,7 +4129,7 @@ freebsd_target_arch() {
 }
 
 # Recursively walk gpart's MBR -> BSD label layout (used by both
-# nanobsd and mini-memstick images) to find the freebsd-ufs partition,
+# nanobsd images) to find the freebsd-ufs partition,
 # without hardcoding slice/partition numbers
 find_ufs_partition() {
     local geom
@@ -3908,8 +4152,8 @@ find_ufs_partition() {
     return 1
 }
 
-# Set a known root password and a serial console on a built image, so CI
-# can boot test it headless under qemu
+# Set a known root password and a serial console on a built NanoBSD image,
+# so CI can boot test it headless under qemu
 freebsd_customize_image() {
     local image
     image="${1}"
@@ -3944,19 +4188,6 @@ freebsd_customize_image() {
         # Boot to a login prompt instead of bsdinstall
         rm -f "${root}/etc/rc.local"
     done
-
-    # mini-memstick mounts its root read-only, through the fstab entry and
-    # root_rw_mount="NO" that make-memstick.sh writes
-    # Mount it read-write instead
-    if grep -q '^/dev/ufs/FreeBSD_Install[[:space:]]' "${mnt}/etc/fstab" 2>/dev/null; then
-        sed -i "" -E 's#^(/dev/ufs/FreeBSD_Install[[:space:]]+/[[:space:]]+ufs[[:space:]]+)ro([,[:space:]])#\1rw\2#' "${mnt}/etc/fstab"
-        local rc_conf
-        for rc_conf in "${mnt}/etc/rc.conf" "${mnt}/etc/rc.conf.local"; do
-            if [ -f "${rc_conf}" ]; then
-                sed -i "" -e '/^root_rw_mount=/d' "${rc_conf}"
-            fi
-        done
-    fi
 
     # The arm64 EFI loader has no comconsole, its efi console follows the
     # firmware ConOut, which is serial under qemu
@@ -4051,7 +4282,7 @@ freebsd_check_system_toolchain() {
     done
 }
 
-# Build world and kernel natively, then only the mini-memstick. release.sh
+# Build world and kernel natively, then only the ZFS VM image. release.sh
 # clones its own sources, builds a second world for its chroot and a full
 # release, which does not fit into a 6h CI job
 build_freebsd_release() {
@@ -4075,7 +4306,7 @@ build_freebsd_release() {
     local release_flags
     release_flags=("${mk_flags[@]}" NODISTSETS=yes NOPKGBASE=yes NOPKG=yes NOPORTS=yes NOSRC=yes MK_INCLUDES=no)
 
-    info "$(printf "Building FreeBSD %s mini-memstick (%s)\n" "${version}" "${target_arch}")"
+    info "$(printf "Building FreeBSD %s ZFS image (%s)\n" "${version}" "${target_arch}")"
     freebsd_check_system_toolchain "${src_dir}" "${target_arch}"
 
     # Guest disk writes land in a qemu overlay on the CI runner
@@ -4087,18 +4318,142 @@ build_freebsd_release() {
     make -C "${src_dir}" -j"${ncpu}" "${mk_flags[@]}" buildworld
     make -C "${src_dir}" -j"${ncpu}" "${mk_flags[@]}" buildkernel
     make -C "${src_dir}/release" "${release_flags[@]}" obj
-    make -C "${src_dir}/release" "${release_flags[@]}" mini-memstick.img
 
-    local memstick_image
-    memstick_image="$(make -C "${src_dir}/release" "${release_flags[@]}" -V .OBJDIR)/mini-memstick.img"
-    if [ ! -f "${memstick_image}" ]; then
-        error "$(printf "build_freebsd_release: %s was not built\n" "${memstick_image}")"
+    local release_objdir
+    release_objdir="$(make -C "${src_dir}/release" "${release_flags[@]}" -V .OBJDIR)"
+    # vm-image is a stamp target and mk-vmimage.sh refuses nothing on a
+    # second run, so clear what an earlier build left behind
+    rm -rf "${release_objdir}/vm-image" "${release_objdir}/vm-image-raw-zfs" \
+        "${release_objdir}/raw.zfs.img" "${release_objdir}/vm.zfs.raw"
+
+    local vm_conf
+    vm_conf="$(freebsd_vm_image_config)"
+
+    # release/Makefile.vm's ZFS VM image: GPT with an ESP, gptzfsboot on
+    # amd64 for BIOS boot, and a zroot pool with the usual ROOT/default
+    # boot environment and datasets. NOPKGBASE installs world and kernel
+    # from the build above, which only lands in METALOG under NO_ROOT, and
+    # NO_ROOT in turn needs WITHOUT_QEMU. The pool is 2 GiB, growfs grows
+    # it to fill the disk on first boot
+    FREEBSD_VM_ROOT_PASSWORD="${freebsd_ci_root_password}" \
+        make -C "${src_dir}/release" "${release_flags[@]}" \
+        WITH_VMIMAGES=yes VMFORMATS=raw VMFSLIST=zfs VMSIZE=2048m \
+        NO_ROOT=yes WITHOUT_QEMU=yes VM_IMAGE_CONFIG="${vm_conf}" \
+        vm-image
+    rm -f "${vm_conf}"
+
+    # Makefile.vm runs mk-vmimage.sh with "|| true", so a failed image
+    # build only shows as a missing image
+    local vm_image
+    vm_image="${release_objdir}/vm.zfs.raw"
+    if [ ! -s "${vm_image}" ]; then
+        error "$(printf "build_freebsd_release: %s was not built\n" "${vm_image}")"
         exit 1
     fi
 
-    freebsd_customize_image "${memstick_image}" "${freebsd_ci_root_password}" "${target_arch}"
-    cp "${memstick_image}" "${src_dir}/mini-memstick-${target_arch}.img"
-    info "$(printf "Built %s/mini-memstick-%s.img\n" "${src_dir}" "${target_arch}")"
+    cp "${vm_image}" "${src_dir}/freebsd-${target_arch}.img"
+    info "$(printf "Built %s/freebsd-%s.img\n" "${src_dir}" "${target_arch}")"
+}
+
+# Write a VM_IMAGE_CONFIG for release/Makefile.vm and print its path.
+# mk-vmimage.sh sources it, under set -e, and runs vm_extra_pre_umount
+# against the staged tree in DESTDIR before makefs builds the pool from
+# DESTDIR's METALOG, so new files need a METALOG entry while edits to
+# installed files do not. Everything the image needs on top of the stock
+# VM image goes here: the CI root password, a serial console, growfs, and
+# what podman expects - fdescfs on /dev/fd, pf for the NAT and port
+# redirects the CNI bridge plugin sets up, the Linuxulator for
+# --os=linux images, and a zroot/containers dataset for its storage.
+# pf comes from the loader so that net.pf.filter_local, which lets the
+# host reach redirected ports on localhost, exists by the time
+# sysctl.conf is applied
+freebsd_vm_image_config() {
+    local conf
+    conf="$(mktemp)"
+    cat >"${conf}" <<'VMEOF'
+NOSWAP=yes
+
+vm_extra_pre_umount() {
+	echo "${FREEBSD_VM_ROOT_PASSWORD}" | pw -R "${DESTDIR}" usermod root -h 0
+	sed -i "" -e '/^tty[du]0/s/off/onifconsole/' "${DESTDIR}/etc/ttys"
+
+	# The arm64 EFI loader has no comconsole, its efi console follows the
+	# firmware ConOut, which is serial under qemu
+	if [ "${TARGET}" != "arm64" ]; then
+		echo 'console="comconsole"' >>"${DESTDIR}/boot/loader.conf"
+	fi
+	echo 'autoboot_delay="2"' >>"${DESTDIR}/boot/loader.conf"
+	echo 'pf_load="YES"' >>"${DESTDIR}/boot/loader.conf"
+
+	echo 'fdesc /dev/fd fdescfs rw 0 0' >>"${DESTDIR}/etc/fstab"
+	echo 'net.pf.filter_local=1' >>"${DESTDIR}/etc/sysctl.conf"
+
+	# growfs would add swap at the end of the disk, in a composed image
+	# a partition nobody asked for, outside any slot
+	cat >>"${DESTDIR}/etc/rc.conf" <<'EOF'
+growfs_enable="YES"
+growfs_swap_size="0"
+pf_enable="YES"
+linux_enable="YES"
+containers_dataset_enable="YES"
+EOF
+
+	# containernetworking-plugins' pf.conf.sample, which only arrives
+	# with the package, so pf_enable has a ruleset to load on first
+	# boot. vtnet0 is the NIC under qemu, change it on other hardware
+	cat >"${DESTDIR}/etc/pf.conf" <<'EOF'
+v4egress_if = "vtnet0"
+v6egress_if = "vtnet0"
+
+nat on $v4egress_if inet from <cni-nat> to any -> ($v4egress_if)
+nat on $v6egress_if inet6 from <cni-nat> to !ff00::/8 -> ($v6egress_if)
+
+rdr-anchor "cni-rdr/*"
+nat-anchor "cni-rdr/*"
+table <cni-nat>
+EOF
+	grep -q '^\./etc/pf\.conf ' "${DESTDIR}/METALOG" ||
+		metalog_add_data ./etc/pf.conf
+
+	# makefs only creates the datasets vmimage.subr's buildfs names, so
+	# podman's dataset is made on first boot instead, next to growfs
+	mkdir -p "${DESTDIR}/usr/local/etc/rc.d"
+	cat >"${DESTDIR}/usr/local/etc/rc.d/containers_dataset" <<'EOF'
+#!/bin/sh
+#
+# PROVIDE: containers_dataset
+# REQUIRE: zfs
+# KEYWORD: firstboot
+
+. /etc/rc.subr
+
+name="containers_dataset"
+rcvar="containers_dataset_enable"
+start_cmd="containers_dataset_start"
+stop_cmd=":"
+
+# podman's zfs storage driver keeps images and containers under
+# /var/db/containers, in a dataset of the pool the root lives in
+containers_dataset_start()
+{
+	local pool
+
+	pool="$(zfs list -H -o name / | cut -d/ -f1)"
+	if zfs list -H "${pool}/containers" >/dev/null 2>&1; then
+		return 0
+	fi
+	zfs create -o mountpoint=/var/db/containers "${pool}/containers"
+}
+
+load_rc_config $name
+run_rc_command "$1"
+EOF
+	metalog_add_data ./usr/local/etc/rc.d/containers_dataset 0555
+
+	return 0
+}
+VMEOF
+    printf "%s" "${conf}"
 }
 
 # arm64 is cross built like the release, see ISSUES.md
@@ -6248,6 +6603,11 @@ show_usage() {
     printf "  long as one remains, e.g. EXCLUDE_IMAGES=\"gentoo-sway refind\"\n"
     printf "  leaves NomadBSD alone\n"
     printf "\n"
+    printf "  INCLUDE_IMAGES adds optional slots to the Gentoo images: freebsd,\n"
+    printf "  the amd64/arm64 FreeBSD bbusse/freebsd-build publishes, next to\n"
+    printf "  NomadBSD. FREEBSD_VERSION, FREEBSD_REPO_URL and FREEBSD_IMAGE\n"
+    printf "  choose the image like their NOMADBSD_* counterparts\n"
+    printf "\n"
 }
 
 main() {
@@ -6449,7 +6809,7 @@ main() {
                     # 32 bit ARM, cross built on an arm64 host
                     target_arch="arm64"
                     ;;
-                x230)
+                x201 | x230)
                     target_arch="amd64"
                     ;;
                 virt-amd64)
