@@ -2166,7 +2166,7 @@ image_ufs_range() {
 parted_fs_hint() {
     case "${1}" in
     vfat) echo "fat32" ;;
-    plan9) echo "" ;;
+    ufs | plan9) echo "" ;;
     *) echo "${1}" ;;
     esac
 }
@@ -4771,6 +4771,7 @@ linux_build_kernel() {
             --platform="${platform}" \
             --build-arg KERNEL_VERSION="${kernel_version}" \
             --build-arg KERNEL_REF="${kernel_ref}" \
+            --build-arg ZFS_REF="${ZFS_REF:-master}" \
             --build-arg KERNEL_CONFIG="kernel-config-${kernel_flavour}" \
             -v "${PWD}"/output:/output \
             -t "ghcr.io/bbusse/linux-kernel-${kernel_flavour}:latest" \
@@ -5485,7 +5486,7 @@ gentoo_install_stage4_binpkgs() {
     # against what stage3 already has installed (e.g. iptables)
     # instead of erroring out on the resulting slot conflict
     # shellcheck disable=SC2086 # $sets is an intentional word-split set list
-    chroot "${mnt_path}" emerge --usepkg --newuse --update --getbinpkg=n ${sets}
+    chroot "${mnt_path}" env -u TARGET emerge --usepkg --newuse --update --getbinpkg=n ${sets}
 
     # Diagnostic: confirm the merge actually landed on this mount before
     # unmounting, so a future "file missing after boot" report can be
