@@ -236,7 +236,7 @@ test_partitions_are_laid_out_in_slot_order() {
     assert_matches "mkpart esp fat32 3MiB 515MiB" "${out}" "the esp follows the reserved area"
     assert_matches "mkpart gentoo-containeros xfs 515MiB 10755MiB" "${out}" \
                    "the first rootfs starts where the esp ends"
-    assert_matches "mkpart nomadbsd ufs 10755MiB 16899MiB" "${out}" \
+    assert_matches "mkpart nomadbsd 10755MiB 16899MiB" "${out}" \
                    "the second rootfs starts where the first ends"
 
     unset -f parted sgdisk
@@ -402,6 +402,93 @@ test_checksum_verify_rejects_a_mismatch() {
     assert_fails "checksum_verify ${c} ${f} sha256"
 
     rm -f "${f}" "${c}"
+}
+
+test_compare_checksums_matches_the_full_sha384() {
+    local f
+    f="$(mktemp)"
+    printf 'hello\n' > "${f}"
+
+    local c
+    c="$(mktemp)"
+    printf '1d0f284efe3edea4b9ca3bd514fa134b17eae361ccc7a1eefeff801b9bd6604e01f21f6bf249ef030599f0c218f2ba8c  %s\n' \
+           "other-name" > "${c}"
+
+    assert_equals "0" "$(compare_checksums "${c}" "${f}")" \
+                  "releases name the file without -latest, so only the hash counts"
+
+    rm -f "${f}" "${c}"
+}
+
+test_compare_checksums_rejects_a_difference_after_64_digits() {
+    local f
+    f="$(mktemp)"
+    printf 'hello\n' > "${f}"
+
+    local c
+    c="$(mktemp)"
+    printf '1d0f284efe3edea4b9ca3bd514fa134b17eae361ccc7a1eefeff801b9bd6604e%032d  %s\n' \
+           0 "$(basename "${f}")" > "${c}"
+
+    assert_equals "1" "$(compare_checksums "${c}" "${f}")" \
+                  "a sha384 has 96 hex digits and all of them have to match"
+
+    rm -f "${f}" "${c}"
+}
+
+test_compare_checksums_rejects_a_missing_checksum_file() {
+    local f
+    f="$(mktemp)"
+    printf 'hello\n' > "${f}"
+
+    assert_equals "1" "$(compare_checksums "${f}.sha384" "${f}" 2>/dev/null)"
+
+    rm -f "${f}"
+}
+
+make_test_repo() {
+    git init -q -b main "${1}"
+    printf 'main\n' > "${1}/branch"
+    git -C "${1}" add branch
+    git -C "${1}" -c user.name=t -c user.email=t@t commit -q -m main
+    git -C "${1}" checkout -q -b other
+    printf 'other\n' > "${1}/branch"
+    git -C "${1}" -c user.name=t -c user.email=t@t commit -q -am other
+    git -C "${1}" checkout -q main
+}
+
+test_git_fresh_clone_replaces_a_leftover_clone() {
+    local d
+    d="$(mktemp -d)"
+    make_test_repo "${d}/src"
+
+    mkdir -p "${d}/work/gentoo-config"
+    touch "${d}/work/gentoo-config/stale"
+
+    (cd "${d}/work" && git_fresh_clone gentoo-config "file://${d}/src") >/dev/null 2>&1
+    assert_equals 0 "$?" "a clone left by an earlier run should not stop the next one"
+    assert_equals "main" "$(cat "${d}/work/gentoo-config/branch")"
+    assert_fails "test -e ${d}/work/gentoo-config/stale" \
+                 "the leftover clone should be replaced, not reused"
+
+    rm -rf "${d}"
+}
+
+test_git_fresh_clone_passes_clone_options() {
+    local d
+    d="$(mktemp -d)"
+    make_test_repo "${d}/src"
+
+    (cd "${d}" && git_fresh_clone out/repo -b other "file://${d}/src") >/dev/null 2>&1
+    assert_equals 0 "$?"
+    assert_equals "other" "$(cat "${d}/out/repo/branch")"
+
+    rm -rf "${d}"
+}
+
+test_every_clone_goes_through_git_fresh_clone() {
+    assert_equals "1" "$(grep -c 'git clone' "${SCRIPT_UNDER_TEST}")" \
+                  "a bare git clone fails when an earlier run left its folder behind"
 }
 
 test_a_shared_kernel_is_copied_to_the_esp_once() {
@@ -725,6 +812,16 @@ test_qemu_binary_and_machine_follow_the_arch() {
 
     assert_equals "q35" "$(qemu_machine_for_arch amd64)"
     assert_matches "virt" "$(qemu_machine_for_arch arm64)"
+    assert_matches "highmem-ecam=off" "$(qemu_machine_for_arch arm64)" \
+                   "9qemu only finds PCI config space at the low ECAM window"
+}
+
+test_arm64_qemu_devices_are_modern_virtio() {
+    assert_matches "disable-legacy=on" "$(qemu_disk_args arm64 /x.raw)" \
+                   "9qemu's virtio drivers only bind non-transitional devices"
+    assert_equals "virtio-net-pci-non-transitional" "$(qemu_nic_model_for_arch arm64)"
+    assert_equals "-drive format=raw,file=/x.raw" "$(qemu_disk_args amd64 /x.raw | tr '\n' ' ' | sed 's/ $//')"
+    assert_equals "virtio-net-pci" "$(qemu_nic_model_for_arch amd64)"
 }
 
 test_qemu_uses_kvm_only_for_a_matching_host() {
@@ -986,4 +1083,427 @@ test_freebsd_image_name_follows_the_arch() {
 test_freebsd_image_path_prefers_an_explicit_image() {
     assert_equals "/tmp/x.img" "$(FREEBSD_IMAGE=/tmp/x.img freebsd_image_path /dl arm64)"
     assert_equals "/dl/$(freebsd_image_file arm64)" "$(freebsd_image_path /dl arm64)"
+}
+
+test_plan9_partition_is_typed_and_left_unhinted() {
+    assert_equals "3900" "$(gpt_type_code plan9)"
+    assert_equals "" "$(parted_fs_hint plan9)" "parted knows no Plan 9 filesystem"
+}
+
+test_plan9_partition_is_found_in_an_mbr_image() {
+    sfdisk() {
+        printf 'img1 : start=    63, size=7720897, type=39, bootable\n'
+    }
+
+    assert_equals "63 7720897" "$(image_partition_range img plan9)"
+    assert_fails "image_partition_range img esp" "an MBR Plan 9 disk has no ESP"
+
+    unset -f sfdisk
+}
+
+test_plan9_partition_is_found_in_a_gpt_image() {
+    sfdisk() {
+        printf 'img1 : start=  2048, size= 532480, type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B, uuid=A\n'
+        printf 'img2 : start=534528, size=8388608, type=C91818F9-8025-47AF-89D2-F030D7000C2C, uuid=B\n'
+    }
+
+    assert_equals "534528 8388608" "$(image_partition_range img plan9)"
+
+    unset -f sfdisk
+}
+
+test_9front_is_left_out_unless_included() {
+    composition_load "gentoo-sway" "amd64"
+
+    assert_status_code 1 "composition_has 9front" "optional, so not composed by default"
+}
+
+test_9front_sits_ahead_of_the_gentoo_rootfs() {
+    INCLUDE_IMAGES="9front" composition_load "gentoo-sway" "amd64"
+
+    assert_equals "nomadbsd 9front gentoo-sway refind" "${comp_name[*]}"
+    assert_equals "3 4 5 0" "${comp_part[*]}"
+    assert_equals "plan9" "${comp_fs[1]}"
+    assert_equals "efi" "${comp_boot_type[1]}"
+    assert_equals "EFI/9front/bootx64.efi" "${comp_kernel[1]}"
+    assert_equals "" "${comp_cmdline[1]}" "its root is named in plan9.ini, not the load options"
+    assert_equals "$((16384 + 6144 + ninefront_slot_size))" "$(composition_disk_size_mib)"
+    assert_equals "gentoo-sway" "${comp_default}"
+}
+
+test_9front_composes_next_to_freebsd() {
+    INCLUDE_IMAGES="freebsd 9front" composition_load "gentoo-sway" "amd64"
+
+    assert_equals "nomadbsd freebsd 9front gentoo-sway refind" "${comp_name[*]}"
+    assert_equals "rootdev=zfs:zroot/ROOT/default:" "${comp_cmdline[1]}"
+}
+
+test_9front_partition_gets_no_fs_hint() {
+    INCLUDE_IMAGES="9front" EXCLUDE_IMAGES="nomadbsd" composition_load "gentoo-sway" "amd64"
+    parted() { echo "parted $*"; }
+    sgdisk() { :; }
+
+    local out
+    out="$(create_disk_parts_gpt "/tmp/test.raw")"
+
+    assert_matches "mkpart 9front 259MiB $((259 + ninefront_slot_size))MiB" "${out}"
+
+    unset -f parted sgdisk
+}
+
+test_filesystem_probes_the_partition_without_udev() {
+    loop_mount() { echo "Loop mounting ${1}"; }
+    loop_unmount() { echo "unmount_recursive: unmounting /mnt/disk-image"; }
+    loop_device() { echo "/dev/loop3"; }
+    lsblk() { :; }
+    blkid() {
+        if [ "-p -o value -s TYPE /dev/loop3p5" = "$*" ]; then
+            echo "xfs"
+        fi
+    }
+
+    assert_equals "xfs" "$(filesystem /tmp/test.raw 5 2>/dev/null)" \
+                  "lsblk's fstype comes from udev, which a container may not have"
+    assert_matches "Loop mounting /tmp/test.raw" "$(filesystem /tmp/test.raw 5 2>&1 >/dev/null)" \
+                   "loop_mount's messages go to stderr, not into the filesystem type"
+
+    unset -f loop_mount loop_unmount loop_device lsblk blkid
+}
+
+test_nothing_reads_device_metadata_from_udev() {
+    local hits
+    hits="$(grep -n -E '\$\( *lsblk|`lsblk|lsblk[^|]*\|[^|]|/dev/disk/by-|/run/udev|udevadm +info|ID_FS_|findfs ' \
+        "${SCRIPT_UNDER_TEST}" | grep -v -E '^[0-9]+: *#')"
+
+    assert_equals "" "${hits}" \
+                  "read filesystem types and ids with blkid, containers and early boot have no udev database"
+}
+
+test_filesystem_fails_when_the_partition_has_none() {
+    loop_mount() { :; }
+    loop_unmount() { :; }
+    loop_device() { echo "/dev/loop3"; }
+    blkid() { return 2; }
+
+    assert_fails "filesystem /tmp/test.raw 5 2>/dev/null"
+
+    unset -f loop_mount loop_unmount loop_device blkid
+}
+
+test_esp_is_named_efiboot0_for_a_freebsd_slot() {
+    INCLUDE_IMAGES="freebsd 9front" composition_load "gentoo-sway-virt" "arm64"
+    parted() { echo "parted $*"; }
+    sgdisk() { :; }
+
+    local out
+    out="$(create_disk_parts_gpt "/tmp/test.raw")"
+
+    assert_matches "mkpart efiboot0 fat32 3MiB" "${out}" \
+                   "FreeBSD's fstab mounts /boot/efi from /dev/gpt/efiboot0"
+
+    unset -f parted sgdisk
+}
+
+test_esp_keeps_its_name_without_a_freebsd_slot() {
+    INCLUDE_IMAGES="9front" composition_load "gentoo-sway-virt" "arm64"
+    parted() { echo "parted $*"; }
+    sgdisk() { :; }
+
+    local out
+    out="$(create_disk_parts_gpt "/tmp/test.raw")"
+
+    assert_matches "mkpart esp fat32 3MiB" "${out}"
+
+    unset -f parted sgdisk
+}
+
+test_9front_is_refused_on_boards() {
+    assert_fails "INCLUDE_IMAGES=9front composition_load gentoo-sway-pine64 arm64" \
+                 "9qemu only boots qemu's virt machine"
+}
+
+test_9front_is_refused_off_amd64_and_arm64() {
+    assert_fails "ninefront_require_arch armv7 test"
+    assert "ninefront_require_arch x86_64 test" "however the arch is spelled"
+    assert "ninefront_require_arch aarch64 test" "however the arch is spelled"
+}
+
+test_9front_arm64_slot_starts_bootaa64() {
+    INCLUDE_IMAGES="9front" composition_load "gentoo-sway" "arm64"
+
+    local i
+    for i in "${!comp_name[@]}"; do
+        [ "9front" = "${comp_name[$i]}" ] && break
+    done
+    assert_equals "9front" "${comp_name[$i]}"
+    assert_equals "EFI/9front/bootaa64.efi" "${comp_kernel[$i]}"
+}
+
+test_9front_arm64_plan9_ini_boots_9qemu_from_virtio() {
+    local f
+    f="$(mktemp)"
+
+    ninefront_write_plan9_ini "${f}" "arm64"
+
+    assert_equals "bootfile=/EFI/9front/9qemu" "$(grep '^bootfile=' "${f}")"
+    assert_equals "nobootprompt=local!/dev/sdF0/fs -A" "$(grep '^nobootprompt=' "${f}")" \
+                  "qemu's virt machine attaches the disk through virtio"
+
+    rm -f "${f}"
+}
+
+test_9front_root_disk_can_be_overridden() {
+    assert_equals "sdN0" "$(ninefront_root_disk=sdN0 ninefront_root_disk_name arm64)"
+}
+
+test_9front_plan9_ini_boots_its_slot_without_prompting() {
+    local f
+    f="$(mktemp)"
+
+    ninefront_write_plan9_ini "${f}" "amd64"
+
+    assert_equals "bootfile=/EFI/9front/9pc64" "$(grep '^bootfile=' "${f}")" \
+                  "the loader reads the kernel from the ESP it was started from"
+    assert_equals "nobootprompt=local!/dev/sdE0/fs -A" "$(grep '^nobootprompt=' "${f}")" \
+                  "gefs is attached with the flags 9front's installer gives it"
+    assert_equals "user=glenda" "$(grep '^user=' "${f}")"
+    assert_equals "console=0" "$(grep '^console=' "${f}")"
+
+    rm -f "${f}"
+}
+
+test_9front_boot_test_waits_for_a_shell() {
+    assert_equals "init: starting /bin/rc" "$(BOOT_TEST_PATTERN='' boot_test_pattern 9front)" \
+                  "headless 9qemu never starts rio, so there is no term% on arm64"
+}
+
+test_9front_image_is_named_after_the_release() {
+    assert_equals "/dl/9front-${ninefront_version}-amd64.img" "$(ninefront_image_path /dl x86_64)" \
+                  "named the way 9front-build publishes it"
+    assert_equals "/dl/9front-${ninefront_version}-arm64.img" "$(ninefront_image_path /dl aarch64)"
+}
+
+test_9front_release_file_follows_release_yml_naming() {
+    assert_equals "9front-${ninefront_version}-arm64-latest" "$(ninefront_release_file arm64)"
+    assert_equals "9front-${ninefront_version}-amd64-latest" "$(ninefront_release_file amd64)" \
+                  "release.yml publishes each file as <file>-latest, as it does the kernels"
+}
+
+test_9front_image_path_prefers_an_explicit_image() {
+    assert_equals "/tmp/x.img" "$(NINEFRONT_IMAGE=/tmp/x.img ninefront_image_path /dl)"
+}
+
+test_9front_target_is_a_single_slot() {
+    composition_load "9front" "amd64"
+
+    assert_equals "9front" "${comp_name[*]}"
+    assert_equals "3" "${comp_part[0]}"
+    assert_equals "64" "${comp_esp_size}"
+    assert_equals "$((3 + 64 + 4 + ninefront_slot_size))" "$(composition_disk_size_mib)"
+}
+
+test_9front_target_builds_for_arm64() {
+    composition_load "9front" "arm64"
+
+    assert_equals "EFI/9front/bootaa64.efi" "${comp_kernel[0]}"
+    assert_fails "composition_load 9front armv7"
+}
+
+test_plan9_slot_skips_the_filesystem_check() {
+    composition_load "9front" "amd64"
+
+    local checked
+    checked="$(
+        bsd_install_fs() { :; }
+        verify_filesystem() { echo "${1}"; }
+        install_rootfs_slots /mnt /dl
+    )"
+
+    assert_equals "" "${checked}" "blkid mistakes the 9fat at the partition's start for the whole partition"
+}
+
+test_freebsd_release_file_follows_release_yml_naming() {
+    assert_equals "freebsd-${freebsd_image_version}-arm64-latest" "$(freebsd_release_file aarch64)"
+    assert_equals "freebsd-${freebsd_image_version}-amd64-latest" "$(freebsd_release_file x86_64)"
+}
+
+test_release_image_fetch_keeps_an_up_to_date_image() {
+    local d
+    d="$(mktemp -d)"
+    touch -t 202601010000 "${d}/x-latest"
+    touch -t 202601020000 "${d}/x.img"
+    touch "${d}/loader.efi"
+
+    local out
+    out="$(
+        download_miss() { :; }
+        xz() { echo "decompressed"; }
+        release_image_fetch "X" "${d}" "https://example.invalid" "x-latest" "${d}/x.img" "${d}/loader.efi"
+        echo "rc=$?"
+    )"
+
+    assert_equals "rc=0" "${out}" "nothing to decompress when the image is newer than the download"
+    assert "test -f ${d}/loader.efi" "the staged loader still matches the image"
+
+    rm -rf "${d}"
+}
+
+test_release_image_fetch_refreshes_a_new_image() {
+    local d
+    d="$(mktemp -d)"
+    touch -t 202601010000 "${d}/x.img"
+    touch -t 202601020000 "${d}/x-latest"
+    touch "${d}/loader.efi"
+
+    (
+        download_miss() { :; }
+        xz() { echo "new image"; }
+        cp() { cat "${2}" >"${3}"; }
+        release_image_fetch "X" "${d}" "https://example.invalid" "x-latest" "${d}/x.img" "${d}/loader.efi"
+    )
+
+    assert_equals "new image" "$(cat "${d}/x.img")"
+    assert_fails "test -f ${d}/loader.efi" "a loader staged from the old image is dropped"
+    assert_fails "test -f ${d}/x.img.part"
+
+    rm -rf "${d}"
+}
+
+test_release_image_fetch_reports_a_missing_release() {
+    assert_fails "( download_miss() { return 1; }; release_image_fetch X /tmp https://example.invalid x-latest /tmp/x.img )"
+}
+
+test_u_boot_image_prefers_an_explicit_image() {
+    assert_equals "/tmp/u.bin" "$(UBOOT_IMAGE=/tmp/u.bin u_boot_image pine64)"
+}
+
+test_u_boot_image_takes_the_first_packaged_one() {
+    local d
+    d="$(mktemp -d)"
+    touch "${d}/b.bin" "${d}/c.bin"
+
+    assert_equals "${d}/b.bin" "$(
+        u_boot_candidates() { printf "%s\n" "${d}/a.bin" "${d}/b.bin" "${d}/c.bin"; }
+        UBOOT_IMAGE='' u_boot_image pine64
+    )"
+
+    rm -rf "${d}"
+}
+
+test_u_boot_image_fails_without_a_packaged_one() {
+    assert_fails "( u_boot_candidates() { echo /nonexistent/u.bin; }; UBOOT_IMAGE='' u_boot_image pine64 )" \
+                 "a missing U-Boot is reported rather than written as nothing"
+    assert_equals "" "$(u_boot_candidates rockpro64)" "only pine64 is written with U-Boot so far"
+}
+
+test_install_u_boot_refuses_a_missing_image() {
+    assert_fails "( dd() { echo called; }; install_bootloader_u_boot /nonexistent/u.bin /dev/null )"
+}
+
+test_install_u_boot_writes_at_8k_and_syncs() {
+    local u
+    u="$(mktemp)"
+
+    local args
+    args="$(
+        dd() { echo "$*"; }
+        install_bootloader_u_boot "${u}" /dev/sdX
+    )"
+
+    assert_matches "of=/dev/sdX" "${args}"
+    assert_matches "bs=1024 seek=8" "${args}" "the Allwinner boot ROM reads the SPL from 8 KiB"
+    assert_matches "conv=notrunc,fsync" "${args}"
+    assert_fails "( dd() { return 1; }; install_bootloader_u_boot ${u} /dev/sdX )" \
+                 "a failed write is reported"
+
+    rm -f "${u}"
+}
+
+test_mpv_outputs_44k_by_default() {
+    local d
+    d="$(mktemp -d)"
+
+    write_mpv_config "${d}"
+
+    assert_equals "audio-samplerate=44100" \
+                  "$(awk '/^\[/ { exit } /^audio-samplerate=/' "${d}/etc/mpv/mpv.conf")" \
+                  "AirPlay sinks run at 44.1 kHz, resampling for them in PipeWire's RT thread starves the decoder"
+
+    rm -rf "${d}"
+}
+
+fake_rootfs_with() {
+    local d
+    d="$(mktemp -d)"
+    local b
+    for b in "$@"; do
+        mkdir -p "${d}/usr/bin"
+        touch "${d}/usr/bin/${b}"
+        chmod +x "${d}/usr/bin/${b}"
+    done
+    echo "${d}"
+}
+
+test_board_tv_runs_mpv_on_drm_on_tty1() {
+    local d
+    d="$(fake_rootfs_with mpv)"
+
+    enable_mpv_tv "${d}" moonshine pine64
+
+    assert "test -L ${d}/etc/systemd/system/graphical.target.wants/tv-tty1@moonshine.service"
+    local unit
+    unit="$(cat "${d}/etc/systemd/system/tv-tty1@.service")"
+    assert_matches "TTYPath=/dev/tty1" "${unit}"
+    assert_matches "StandardInput=tty" "${unit}" "mpv releases the display on a VT switch through its tty"
+    assert_matches "ExecStart=/usr/local/bin/mpv-tv-vt" "${unit}"
+    assert_matches "profile=vt" "$(cat "${d}/usr/local/bin/mpv-tv-vt")" \
+                   "the VI plane shows the NV12 frames, the GPU only draws the OSD"
+    assert_matches "drm-mode=1920x1080@50" "$(cat "${d}/usr/local/bin/mpv-tv-vt")" \
+                   "the European channels are 50 fps, a 60 Hz mode judders"
+    assert_fails "test -e ${d}/etc/systemd/user/mpv-tv.service" "no second mpv inside sway"
+
+    rm -rf "${d}"
+}
+
+test_virt_tv_stays_in_sway() {
+    local d
+    d="$(fake_rootfs_with mpv)"
+
+    enable_mpv_tv "${d}" moonshine ""
+
+    assert "test -L ${d}/etc/systemd/user/sway-session.target.wants/mpv-tv.service"
+    assert_fails "test -e ${d}/etc/systemd/system/tv-tty1@.service"
+
+    rm -rf "${d}"
+}
+
+test_board_sway_starts_on_tty2_on_demand() {
+    local d
+    d="$(fake_rootfs_with sway)"
+
+    enable_sway_session "${d}" moonshine rockpro64
+
+    local unit
+    unit="$(cat "${d}/etc/systemd/system/autovt@tty2.service")"
+    assert_matches "User=moonshine" "${unit}"
+    assert_matches "TTYPath=/dev/tty2" "${unit}"
+    assert_matches "ExecStart=/usr/bin/sway" "${unit}"
+    assert_fails "test -e ${d}/etc/systemd/system/graphical.target.wants/sway-tty1@moonshine.service" \
+                 "tty1 belongs to the TV, logind starts sway when tty2 is switched to"
+    assert "test -L ${d}/etc/systemd/system/default.target"
+
+    rm -rf "${d}"
+}
+
+test_virt_sway_keeps_tty1() {
+    local d
+    d="$(fake_rootfs_with sway)"
+    mkdir -p "${d}/etc/systemd/system"
+
+    enable_sway_session "${d}" moonshine ""
+
+    assert "test -L ${d}/etc/systemd/system/graphical.target.wants/sway-tty1@moonshine.service"
+    assert_fails "test -e ${d}/etc/systemd/system/autovt@tty2.service"
+
+    rm -rf "${d}"
 }
