@@ -123,10 +123,10 @@ ninefront_version="${NINEFRONT_VERSION:-11952}"
 ninefront_repo_url="${NINEFRONT_REPO_URL:-https://github.com/bbusse/9front-build/releases/download/latest}"
 ninefront_fs_flags="${NINEFRONT_FS_FLAGS:--A}"
 ninefront_loader_file="9front-loader.efi"
-ninefront_kernel_file="9front-9pc64"
+ninefront_kernel_file="9front-kernel"
 ninefront_esp_dir="EFI/9front"
 ninefront_slot_size="${NINEFRONT_SLOT_SIZE:-4096}"
-ninefront_root_disk="${NINEFRONT_ROOT_DISK:-sdE0}"
+ninefront_root_disk="${NINEFRONT_ROOT_DISK:-}"
 
 refind_version="${REFIND_VERSION:-0.14.2}"
 refind_sha512="${REFIND_SHA512:-0d70cf0c61de376e2f564d0e0b89d12f04f0ec267f180b5887b64f6f5b6d34202383ffe73bf620b02d4d9c25619e5ed9be014cb8516c461090c1aca599b8f789}"
@@ -276,37 +276,17 @@ trim() {
     printf "%s" "${var}"
 }
 
+git_fresh_clone() {
+    local dir
+    dir="${1}"
+    shift
+
+    rm -rf "${dir}"
+    git clone --depth 1 "$@" "${dir}"
+}
+
 compare_checksums() {
-    local file
-    file="${1}"
-    local csum_1
-    local csum_2
-    csum_1=$(cat "${file}")
-    csum_1=${csum_1:0:64}
-    local os
-    os=$(uname)
-
-    case "$os" in
-    Linux)
-        csum_2=$(sha384sum "${2}")
-        csum_2=${csum_2:0:64}
-        ;;
-    Darwin | FreeBSD)
-        csum_2=$(sha384 "${2}")
-        ;;
-    esac
-
-    info "$(printf "Comparing checksums\nA: %s\nB: %s\n" "${csum_1}" "${csum_2}")"
-
-    if [ -z ${csum_1+x} ]; then
-        echo 1
-    fi
-
-    if [ -z ${csum_2+x} ]; then
-        echo 1
-    fi
-
-    if [ "$csum_1" == "$csum_2" ]; then
+    if checksum_verify "${1}" "${2}" sha384; then
         echo 0
     else
         echo 1
@@ -607,6 +587,8 @@ enable_sway_session() {
     mnt_path="${1}"
     local user
     user="${2}"
+    local board
+    board="${3:-}"
     local path
     path="${mnt_path}/etc/systemd/system"
 
@@ -618,6 +600,30 @@ enable_sway_session() {
     # containeros shares this provisioning and has no sway
     if [ ! -x "${mnt_path}/usr/bin/sway" ]; then
         debug "enable_sway_session: no sway in rootfs, skipping"
+        return 0
+    fi
+
+    if [ -n "${board}" ]; then
+        mkdir -p "${path}"
+        cat <<EOF >"${path}/autovt@tty2.service"
+[Unit]
+Description=sway on tty2 as ${user}
+After=systemd-user-sessions.service
+Conflicts=getty@tty2.service
+
+[Service]
+User=${user}
+PAMName=login
+TTYPath=/dev/tty2
+TTYReset=yes
+TTYVHangup=yes
+Environment=XDG_SESSION_TYPE=wayland
+ExecStart=/usr/bin/sway
+Restart=on-failure
+RestartSec=2
+EOF
+        ln -s -f "/usr/lib/systemd/system/graphical.target" \
+            "${path}/default.target"
         return 0
     fi
 
@@ -666,6 +672,7 @@ write_mpv_config() {
 # See image-builder write_mpv_config
 hwdec=v4l2request
 vo=dmabuf-wayland
+audio-samplerate=44100
 
 # When the decoder rejects a stream: mpv --profile=sw <url>
 # Software decode, GPU rendering, works for anything up to about 720p
@@ -849,6 +856,10 @@ EOF
 enable_mpv_tv() {
     local mnt_path
     mnt_path="${1}"
+    local user
+    user="${2:-}"
+    local board
+    board="${3:-}"
 
     [ -x "${mnt_path}/usr/bin/mpv" ] || return 0
 
@@ -896,6 +907,55 @@ END {
 }' >"${1}"
 EOF
     chmod 755 "${mnt_path}/usr/local/bin/tv-playlist"
+
+    if [ -n "${board}" ] && [ -n "${user}" ]; then
+        cat <<'EOF' >"${mnt_path}/usr/local/bin/mpv-tv-vt"
+#!/bin/sh
+set -e
+run="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+card=""
+for s in /sys/class/drm/card*-*/status; do
+    if [ -f "${s}" ] && [ "$(cat "${s}")" = connected ]; then
+        card="/dev/dri/$(basename "$(dirname "${s}")" | cut -d- -f1)"
+        break
+    fi
+done
+/usr/local/bin/tv-playlist "${run}/mpv-tv.m3u"
+exec /usr/bin/mpv --profile=vt ${card:+"--drm-device=${card}"} --drm-mode=1920x1080@50 --fs --quiet \
+    --input-ipc-server="${run}/mpv-tv.sock" "${run}/mpv-tv.m3u"
+EOF
+        chmod 755 "${mnt_path}/usr/local/bin/mpv-tv-vt"
+
+        local system
+        system="${mnt_path}/etc/systemd/system"
+        mkdir -p "${system}/graphical.target.wants"
+        cat <<'EOF' >"${system}/tv-tty1@.service"
+[Unit]
+Description=mpv TV on tty1 as %i
+After=systemd-user-sessions.service
+Conflicts=getty@tty1.service autovt@tty1.service
+
+[Service]
+User=%i
+PAMName=login
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+StandardInput=tty
+StandardOutput=journal
+StandardError=journal
+Environment=URL_TV=https://raw.githubusercontent.com/jnk22/kodinerds-iptv/master/iptv/clean/clean_tv.m3u
+ExecStart=/usr/local/bin/mpv-tv-vt
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=graphical.target
+EOF
+        ln -s -f /etc/systemd/system/tv-tty1@.service \
+            "${system}/graphical.target.wants/tv-tty1@${user}.service"
+        return 0
+    fi
 
     mkdir -p "${mnt_path}/etc/systemd/user/sway-session.target.wants"
     cat <<'EOF' >"${mnt_path}/etc/systemd/user/mpv-tv.service"
@@ -2183,6 +2243,17 @@ gpt_type_code() {
     esac
 }
 
+esp_partition_name() {
+    local i
+    for i in "${!comp_provider[@]}"; do
+        if [ "freebsd" = "${comp_provider[$i]}" ]; then
+            echo "efiboot0"
+            return 0
+        fi
+    done
+    echo "esp"
+}
+
 # GPT layout: p1 is a small reserved area, p2 the shared ESP, then one
 # partition per slot that needs a filesystem
 create_disk_parts_gpt() {
@@ -2197,7 +2268,7 @@ create_disk_parts_gpt() {
     local esp_end
     esp_end=$((esp_start + comp_esp_size))
 
-    parted -s "${file_disk}" mkpart esp fat32 "${esp_start}MiB" "${esp_end}MiB"
+    parted -s "${file_disk}" mkpart "$(esp_partition_name)" fat32 "${esp_start}MiB" "${esp_end}MiB"
     parted -s "${file_disk}" set 2 boot on
     sgdisk -t 2:EF00 "${file_disk}" >/dev/null
 
@@ -2668,7 +2739,7 @@ composition_load() {
                 "plan9" \
                 "${ninefront_slot_size}" \
                 "${ninefront_loader_file}" \
-                "${ninefront_esp_dir}/bootx64.efi" \
+                "${ninefront_esp_dir}/$(ninefront_loader_name "${target_arch}")" \
                 "" \
                 "" \
                 "" \
@@ -2770,7 +2841,7 @@ composition_load() {
             "plan9" \
             "${ninefront_slot_size}" \
             "${ninefront_loader_file}" \
-            "${ninefront_esp_dir}/bootx64.efi" \
+            "${ninefront_esp_dir}/$(ninefront_loader_name "${target_arch}")" \
             "" \
             "" \
             "" \
@@ -2951,7 +3022,7 @@ install_rootfs_slots() {
             ;;
         9front)
             bsd_install_fs "9front" \
-                "$(ninefront_image_path "${src_path}")" \
+                "$(ninefront_image_path "${src_path}" "${comp_provider_arg[$i]}")" \
                 "${dev}" \
                 "plan9"
             ;;
@@ -3412,21 +3483,61 @@ ninefront_require_arch() {
     local context
     context="${2}"
 
-    case "${target_arch}" in
-    amd64 | x86_64) return 0 ;;
-    esac
+    if [ -z "$(ninefront_image_arch "${target_arch}")" ]; then
+        error "$(printf "%s: 9front slots are only built for amd64 and arm64, not %s\n" \
+            "${context}" "${target_arch}")"
+        exit 1
+    fi
 
-    error "$(printf "%s: 9front slots are only built for amd64, not %s\n" \
-        "${context}" "${target_arch}")"
-    exit 1
+    if [ "arm64" = "$(ninefront_image_arch "${target_arch}")" ] &&
+        [ -n "$(target_board "${context}")" ]; then
+        error "$(printf "%s: 9front's arm64 kernel is 9qemu, it boots qemu's virt machine only\n" \
+            "${context}")"
+        exit 1
+    fi
+}
+
+ninefront_image_arch() {
+    case "${1}" in
+    amd64 | x86_64) echo "amd64" ;;
+    arm64 | aarch64) echo "arm64" ;;
+    esac
+}
+
+ninefront_loader_name() {
+    case "$(ninefront_image_arch "${1}")" in
+    amd64) echo "bootx64.efi" ;;
+    arm64) echo "bootaa64.efi" ;;
+    esac
+}
+
+ninefront_kernel_name() {
+    case "$(ninefront_image_arch "${1}")" in
+    amd64) echo "9pc64" ;;
+    arm64) echo "9qemu" ;;
+    esac
+}
+
+ninefront_root_disk_name() {
+    if [ -n "${ninefront_root_disk}" ]; then
+        echo "${ninefront_root_disk}"
+        return 0
+    fi
+
+    case "$(ninefront_image_arch "${1}")" in
+    amd64) echo "sdE0" ;;
+    arm64) echo "sdF0" ;;
+    esac
 }
 
 ninefront_image_file() {
-    printf "9front-%s-amd64.img" "${ninefront_version}"
+    printf "9front-%s-%s.img" "${ninefront_version}" \
+        "$(ninefront_image_arch "${1}")"
 }
 
 ninefront_release_file() {
-    printf "9front-%s-amd64-latest" "${ninefront_version}"
+    printf "9front-%s-%s-latest" "${ninefront_version}" \
+        "$(ninefront_image_arch "${1}")"
 }
 
 ninefront_image_path() {
@@ -3435,7 +3546,7 @@ ninefront_image_path() {
         return 0
     fi
 
-    printf "%s/%s" "${1}" "$(ninefront_image_file)"
+    printf "%s/%s" "${1}" "$(ninefront_image_file "${2}")"
 }
 
 ninefront_fetch() {
@@ -3447,7 +3558,7 @@ ninefront_fetch() {
     ninefront_require_arch "${target_arch}" "9front"
 
     local img
-    img="$(ninefront_image_path "${download_path}")"
+    img="$(ninefront_image_path "${download_path}" "${target_arch}")"
 
     if [ -n "${NINEFRONT_IMAGE}" ]; then
         if [ ! -f "${NINEFRONT_IMAGE}" ]; then
@@ -3457,7 +3568,7 @@ ninefront_fetch() {
         info "$(printf "9front: Using NINEFRONT_IMAGE: %s\n" "${NINEFRONT_IMAGE}")"
     elif ! release_image_fetch "9front" "${download_path}" \
         "${ninefront_repo_url}" \
-        "$(ninefront_release_file)" \
+        "$(ninefront_release_file "${target_arch}")" \
         "${img}" \
         "${download_path}/${ninefront_loader_file}" \
         "${download_path}/${ninefront_kernel_file}"; then
@@ -3467,16 +3578,18 @@ ninefront_fetch() {
     fi
 
     bsd_stage_loader "9front" "${img}" \
-        "${download_path}/${ninefront_loader_file}" "efi/boot/bootx64.efi"
+        "${download_path}/${ninefront_loader_file}" \
+        "efi/boot/$(ninefront_loader_name "${target_arch}")"
     bsd_stage_loader "9front" "${img}" \
-        "${download_path}/${ninefront_kernel_file}" "9pc64"
+        "${download_path}/${ninefront_kernel_file}" \
+        "$(ninefront_kernel_name "${target_arch}")"
 }
 
 ninefront_write_plan9_ini() {
     cat <<EOF >"${1}"
-bootfile=/${ninefront_esp_dir}/9pc64
+bootfile=/${ninefront_esp_dir}/$(ninefront_kernel_name "${2}")
 console=0
-nobootprompt=local!/dev/${ninefront_root_disk}/fs ${ninefront_fs_flags}
+nobootprompt=local!/dev/$(ninefront_root_disk_name "${2}")/fs ${ninefront_fs_flags}
 user=glenda
 EOF
 }
@@ -3505,7 +3618,7 @@ nomadbsd_build() {
     info "$(printf "NomadBSD: Building a %s %s image\n" \
         "${nomad_arch}" "${nomadbsd_filesystem}")"
 
-    git clone --depth 1 "${nomadbsd_source_url}"
+    git_fresh_clone NomadBSD "${nomadbsd_source_url}"
     cd NomadBSD
     ./build -a "${nomad_arch}" -f "${nomadbsd_filesystem}" all
 }
@@ -3757,16 +3870,48 @@ loop_mounts() {
     echo "${mounts}"
 }
 
+u_boot_candidates() {
+    case "${1}" in
+    pine64)
+        printf "%s\n" \
+            /usr/local/share/u-boot/u-boot-pine64/u-boot-sunxi-with-spl.bin \
+            /usr/lib/u-boot/pine64_plus/u-boot-sunxi-with-spl.bin \
+            /usr/share/uboot/pine64_plus/u-boot-sunxi-with-spl.bin
+        ;;
+    esac
+}
+
+u_boot_image() {
+    if [ -n "${UBOOT_IMAGE}" ]; then
+        printf "%s" "${UBOOT_IMAGE}"
+        return 0
+    fi
+
+    local f
+    for f in $(u_boot_candidates "${1}"); do
+        if [ -f "${f}" ]; then
+            printf "%s" "${f}"
+            return 0
+        fi
+    done
+    return 1
+}
+
 install_bootloader_u_boot() {
     local img
-    local img="${1}"
+    img="${1}"
     local dev
-    local dev="${2}"
+    dev="${2}"
 
-    if dd if="${img}" of="${dev}" bs=1024 seek=8; then
-        echo 0
-    else
-        echo 1
+    if [ ! -f "${img}" ]; then
+        error "$(printf "U-Boot: Missing %s\n" "${img}")"
+        return 1
+    fi
+
+    info "$(printf "U-Boot: Writing %s to %s\n" "${img}" "${dev}")"
+    if ! dd if="${img}" of="${dev}" bs=1024 seek=8 conv=notrunc,fsync; then
+        error "$(printf "U-Boot: Failed to write %s to %s\n" "${img}" "${dev}")"
+        return 1
     fi
 }
 
@@ -3932,8 +4077,9 @@ install_kernels() {
 
         if [ "9front" = "${comp_provider[$i]}" ]; then
             esp_install_file "${src_path}" "${ninefront_kernel_file}" \
-                "${mnt_path}" "${ninefront_esp_dir}/9pc64"
-            ninefront_write_plan9_ini "${mnt_path}/plan9.ini"
+                "${mnt_path}" \
+                "${ninefront_esp_dir}/$(ninefront_kernel_name "${comp_provider_arg[$i]}")"
+            ninefront_write_plan9_ini "${mnt_path}/plan9.ini" "${comp_provider_arg[$i]}"
         fi
     done
 
@@ -4380,7 +4526,7 @@ freebsd_fetch_build_config() {
     local target_arch
     target_arch="${1}"
 
-    git clone --depth 1 "${freebsd_config_url}"
+    git_fresh_clone freebsd-config "${freebsd_config_url}"
     sudo cp freebsd-config/src.conf /etc/
     # MODULES_OVERRIDE lists arch-specific kernel modules (e.g. aesni
     # is amd64/i386-only), so make.conf is split per arch
@@ -4394,9 +4540,9 @@ freebsd_fetch_src() {
     branch="${2}"
 
     if [ -n "${branch}" ]; then
-        git clone --depth 1 -b "${branch}" "${freebsd_source_url}"
+        git_fresh_clone freebsd-src -b "${branch}" "${freebsd_source_url}"
     else
-        git clone --depth 1 "${freebsd_source_url}"
+        git_fresh_clone freebsd-src "${freebsd_source_url}"
     fi
 }
 
@@ -4750,7 +4896,7 @@ linux_build_kernel() {
         podman_install
 
         mkdir -p "${PWD}/output"
-        git clone --depth 1 --branch "${kernel_ref}" "${kernel_src_url}" output/linux
+        git_fresh_clone output/linux --branch "${kernel_ref}" "${kernel_src_url}"
 
         cd output/linux
 
@@ -4832,7 +4978,7 @@ alpine_build() {
 
     info "$(printf "Alpine: Building %s for %s\n" "${target_flavour}" "${arch}")"
 
-    git clone --depth 1 "$alpine_config_url"
+    git_fresh_clone alpine-config "${alpine_config_url}"
 
     sudo docker run --privileged --rm multiarch/qemu-user-static --persistent yes
 
@@ -4849,13 +4995,6 @@ alpine_build() {
     sudo gunzip "$target_image_name".img.gz
     sudo xz "$target_image_name".img
     sudo sha384sum "$target_image_name".img.xz | sudo tee "$target_image_name".img.xz.sha384
-}
-
-gentoo_fetch_config() {
-    local url
-    url="${1}"
-
-    git clone --depth 1 "${url}"
 }
 
 gentoo_fetch_stage4() {
@@ -4943,7 +5082,7 @@ build_gentoo_stage4() {
 
     info "$(printf "Gentoo: Building stage4")"
 
-    git clone --depth 1 --branch "${GENTOO_BUILD_REF:-main}" "$gentoo_build_container_url"
+    git_fresh_clone gentoo-build --branch "${GENTOO_BUILD_REF:-main}" "${gentoo_build_container_url}"
     cd gentoo-build
     mkdir output
 
@@ -5029,9 +5168,9 @@ openwrt_build() {
     branch="${OPENWRT_BRANCH:-dev}"
 
     info "$(printf "OpenWrt: Fetching source (branch %s) and config" "${branch}")"
-    git clone --depth 1 -b "${branch}" "${openwrt_source_url}"
+    git_fresh_clone openwrt -b "${branch}" "${openwrt_source_url}"
     cd openwrt
-    git clone --depth 1 "${openwrt_config_url}"
+    git_fresh_clone openwrt-config "${openwrt_config_url}"
     mv openwrt-config/openwrt-config-"$flavour" .config
     # Files the image carries on top of its packages, per flavour, e.g.
     # first boot uci-defaults. The build copies files/ into the rootfs
@@ -5362,10 +5501,10 @@ gentoo_add_overlays() {
     # shellcheck disable=SC2086 # $overlays is an intentional word-split URL list
     for url in ${overlays}; do
         tmp_dir="$(mktemp -d)"
+        git_fresh_clone "${tmp_dir}" "${url}"
         # mktemp makes the directory 0700 and it becomes the repository as
         # is, which portage then cannot enter once it drops to the portage user for a fetch
         chmod 0755 "${tmp_dir}"
-        git clone --depth 1 "${url}" "${tmp_dir}"
         name="$(cat "${tmp_dir}/profiles/repo_name")"
         info "$(printf "Gentoo: Adding overlay %s (%s)\n" "${name}" "${url}")"
 
@@ -5406,7 +5545,7 @@ gentoo_install_stage4_binpkgs() {
     verify_stage_fs "${rootfs_dev}" "${mnt_path}" "stage4: tar extract"
 
     info "$(printf "Gentoo: Installing Portage config\n")"
-    git clone --depth 1 "${gentoo_config_url}"
+    git_fresh_clone gentoo-config "${gentoo_config_url}"
     mkdir -p "${mnt_path}/etc/portage/package.use" "${mnt_path}/etc/portage/package.unmask"
     cp gentoo-config/make.conf "${mnt_path}/etc/portage/"
     cp gentoo-config/package.use "${mnt_path}/etc/portage/package.use/"
@@ -5710,7 +5849,7 @@ provision() {
     write_sway_dropins "${mnt_path}" "$(target_board "${build_target}")"
     write_mpv_config "${mnt_path}"
     write_dma_heap_udev_rule "${mnt_path}"
-    enable_sway_session "${mnt_path}" "${user}"
+    enable_sway_session "${mnt_path}" "${user}" "$(target_board "${build_target}")"
 
     info "Enabling pipewire user units"
     enable_pipewire_user_units "${mnt_path}"
@@ -5724,7 +5863,7 @@ provision() {
     set_raop_volume "${mnt_path}"
     enable_spotifyd "${mnt_path}"
     enable_uxplay "${mnt_path}"
-    enable_mpv_tv "${mnt_path}"
+    enable_mpv_tv "${mnt_path}" "${user}" "$(target_board "${build_target}")"
 
     info "Enabling sshd"
     service_enable "${mnt_path}" "sshd" "getty"
@@ -5767,7 +5906,7 @@ filesystem() {
     local dev
     local fs
 
-    loop_mount "${disk_file}"
+    loop_mount "${disk_file}" >&2
 
     local ret
     ret="$(loop_device)"
@@ -5780,14 +5919,14 @@ filesystem() {
 
     # loop_mount already waits for loop0's partition device nodes to exist,
     # so no extra grace sleep is needed here before reading fstype
-    fs="$(lsblk -f -n -ofstype "${dev}")"
+    fs="$(blkid -p -o value -s TYPE "${dev}" 2>/dev/null)"
     if [ -z "${fs}" ]; then
         error "$(printf "Failed to determine filesystem of %s\n" "${dev}")"
-        loop_unmount ""
+        loop_unmount "" >&2
         exit 1
     fi
 
-    loop_unmount ""
+    loop_unmount "" >&2
 
     printf "%s" "${fs}"
 }
@@ -6150,9 +6289,33 @@ qemu_bin_for_arch() {
     esac
 }
 
+qemu_disk_args() {
+    local target_arch
+    target_arch="${1}"
+    local disk_file
+    disk_file="${2}"
+
+    case "${target_arch}" in
+    arm64 | aarch64)
+        printf '%s\n' -drive "if=none,id=disk0,format=raw,file=${disk_file}" \
+            -device "virtio-blk-pci,disable-legacy=on,drive=disk0"
+        ;;
+    *)
+        printf '%s\n' -drive "format=raw,file=${disk_file}"
+        ;;
+    esac
+}
+
+qemu_nic_model_for_arch() {
+    case "${1}" in
+    arm64 | aarch64) echo "virtio-net-pci-non-transitional" ;;
+    *) echo "virtio-net-pci" ;;
+    esac
+}
+
 qemu_machine_for_arch() {
     case "${1}" in
-    arm64 | aarch64) echo "virt,gic-version=max" ;;
+    arm64 | aarch64) echo "virt,gic-version=max,highmem-ecam=off" ;;
     *) echo "q35" ;;
     esac
 }
@@ -6418,7 +6581,7 @@ boot_test_pattern() {
         echo "rEFInd - Main Menu"
         ;;
     9front)
-        echo "term%"
+        echo "init: starting /bin/rc"
         ;;
     *)
         echo "login:"
@@ -6551,6 +6714,9 @@ boot_test_run() {
         "$(basename "${disk_file}")" "${target_arch}" "${accel}" "${timeout_s}")"
     info "$(printf "boot-test: Waiting for /%s/\n" "${pattern}")"
 
+    local disk_args
+    mapfile -t disk_args < <(qemu_disk_args "${target_arch}" "${disk_file}")
+
     # -nic none: without it a guest that fails to boot falls through to
     # a PXE attempt and burns the rest of the timeout
 
@@ -6563,7 +6729,7 @@ boot_test_run() {
         -nic none \
         -drive "if=pflash,format=raw,unit=0,file=${fw_code},readonly=on" \
         -drive "if=pflash,format=raw,unit=1,file=${work}/efi-vars.fd" \
-        -drive "format=raw,file=${disk_file}" &
+        "${disk_args[@]}" &
 
     local qemu_pid
     qemu_pid=$!
@@ -6682,12 +6848,12 @@ run_virt_linux() {
          ${display_args} \
          -drive if=pflash,format=raw,unit=0,file=${fw_code},readonly=on \
          -drive if=pflash,format=raw,unit=1,file=${fw_vars_local} \
-         -drive format=raw,file=${disk_file}"
+         $(qemu_disk_args "${target_arch}" "${disk_file}" | tr '\n' ' ')"
 
     if [ -n "${SUDO_USER}" ]; then
         chown "${SUDO_USER}" "${fw_vars_local}"
         virt_setup_network "${net_dev_suffix}" "${net_local_address}"
-        cmd="${cmd} -nic tap,ifname=tap-${net_dev_suffix},script=no,downscript=no,vhost=on,model=virtio-net-pci"
+        cmd="${cmd} -nic tap,ifname=tap-${net_dev_suffix},script=no,downscript=no,vhost=on,model=$(qemu_nic_model_for_arch "${target_arch}")"
         cmd="runuser -u ${SUDO_USER} -- ${cmd}"
     fi
 
@@ -6772,6 +6938,9 @@ show_usage() {
     printf "  the amd64/arm64 FreeBSD bbusse/freebsd-build publishes, next to\n"
     printf "  NomadBSD. FREEBSD_VERSION, FREEBSD_REPO_URL and FREEBSD_IMAGE\n"
     printf "  choose the image like their NOMADBSD_* counterparts\n"
+    printf "\n"
+    printf "  write puts U-Boot on a pine64 card after the image, taken from\n"
+    printf "  UBOOT_IMAGE or the FreeBSD, Debian or Fedora U-Boot package\n"
     printf "\n"
 }
 
@@ -7361,19 +7530,26 @@ main() {
             exit 1
         fi
 
+        local board
+        board="$(target_board "${img}")"
+        local u_boot
+        u_boot=""
+        if [ "pine64" = "${board}" ] && ! u_boot="$(u_boot_image "${board}")"; then
+            error "$(printf "U-Boot: Found no U-Boot for %s, set UBOOT_IMAGE or install one of:\n%s\n" \
+                "${board}" "$(u_boot_candidates "${board}")")"
+            exit 1
+        fi
+
         local r
         r=$(write_image_to_disk "${img_path}/${img_file}" "${device}")
 
         if [ 0 != "$r" ]; then
             error "Failed to write image"
+            exit 1
         fi
 
-        if [ "gentoo-sway-pine64" = "${img}" ]; then
-            # FreeBSD Ports contains builds for Pine64/RockPro64
-            local img_bootloader
-            img_bootloader="/usr/local/share/u-boot/u-boot-pine64/u-boot-sunxi-with-spl.bin"
-            info "Writing u-boot bootloader"
-            install_bootloader_u_boot "${img_bootloader}" "${device}"
+        if [ -n "${u_boot}" ] && ! install_bootloader_u_boot "${u_boot}" "${device}"; then
+            exit 1
         fi
 
         if $SEND_NOTIFICATION; then
