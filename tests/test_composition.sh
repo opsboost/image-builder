@@ -50,8 +50,8 @@ test_gentoo_composition_has_one_rootfs_and_refind() {
 test_gentoo_image_carries_nomadbsd_on_amd64() {
     composition_load "gentoo-sway" "amd64"
 
-    assert_equals "nomadbsd gentoo-sway refind" "${comp_name[*]}"
-    assert_equals "3 4 0" "${comp_part[*]}" "the Gentoo rootfs stays last, so it can grow"
+    assert_equals "nomadbsd gentoo-sway gentoo-sway-x230 gentoo-sway-x201 refind" "${comp_name[*]}"
+    assert_equals "3 4 0 0 0" "${comp_part[*]}" "the Gentoo rootfs stays last, so it can grow"
     assert_equals "$((16384 + 6144))" "$(composition_disk_size_mib)"
     assert_equals "gentoo-sway" "${comp_default}" "Gentoo stays the default entry"
 }
@@ -59,7 +59,7 @@ test_gentoo_image_carries_nomadbsd_on_amd64() {
 test_exclude_drops_a_slot_and_its_space() {
     EXCLUDE_IMAGES="nomadbsd" composition_load "gentoo-sway" "amd64"
 
-    assert_equals "gentoo-sway refind" "${comp_name[*]}"
+    assert_equals "gentoo-sway gentoo-sway-x230 gentoo-sway-x201 refind" "${comp_name[*]}"
     assert_equals "3" "${comp_part[0]}"
     assert_equals "16384" "$(composition_disk_size_mib)" "NomadBSD's 6GiB go with it"
 }
@@ -487,8 +487,8 @@ test_git_fresh_clone_passes_clone_options() {
 }
 
 test_every_clone_goes_through_git_fresh_clone() {
-    assert_equals "1" "$(grep -c 'git clone' "${SCRIPT_UNDER_TEST}")" \
-                  "a bare git clone fails when an earlier run left its folder behind"
+    assert_equals "1" "$(grep 'git clone' "${SCRIPT_UNDER_TEST}" | grep -vc 'set -- git clone --quiet --depth 1')" \
+                  "a bare git clone fails when an earlier run left its folder behind; provision-git-clone on the device skips existing folders itself"
 }
 
 test_a_shared_kernel_is_copied_to_the_esp_once() {
@@ -1019,8 +1019,8 @@ test_freebsd_is_the_only_bsd_on_arm64() {
 test_freebsd_sits_next_to_nomadbsd_on_amd64() {
     INCLUDE_IMAGES="freebsd" composition_load "gentoo-sway" "amd64"
 
-    assert_equals "nomadbsd freebsd gentoo-sway refind" "${comp_name[*]}"
-    assert_equals "3 4 5 0" "${comp_part[*]}"
+    assert_equals "nomadbsd freebsd gentoo-sway gentoo-sway-x230 gentoo-sway-x201 refind" "${comp_name[*]}"
+    assert_equals "3 4 5 0 0 0" "${comp_part[*]}"
     assert_equals "$((16384 + 6144 + freebsd_slot_size))" "$(composition_disk_size_mib)"
     assert_equals "" "${comp_cmdline[0]}" "NomadBSD comes first, the loader's walk finds it"
     assert_equals "rootdev=zfs:zroot/ROOT/default:" "${comp_cmdline[1]}" \
@@ -1030,7 +1030,7 @@ test_freebsd_sits_next_to_nomadbsd_on_amd64() {
 test_freebsd_stays_pinned_once_nomadbsd_is_excluded() {
     INCLUDE_IMAGES="freebsd" EXCLUDE_IMAGES="nomadbsd" composition_load "gentoo-sway" "amd64"
 
-    assert_equals "freebsd gentoo-sway refind" "${comp_name[*]}"
+    assert_equals "freebsd gentoo-sway gentoo-sway-x230 gentoo-sway-x201 refind" "${comp_name[*]}"
     assert_equals "3" "${comp_part[0]}"
     assert_equals "rootdev=zfs:zroot/ROOT/default:" "${comp_cmdline[0]}"
 }
@@ -1073,11 +1073,11 @@ test_freebsd_arch_gate_refuses_arches_freebsd_build_does_not_build() {
            "an explicit image is the caller's business"
 }
 
-test_freebsd_image_name_follows_the_arch() {
-    assert_equals "freebsd-${freebsd_image_version}-arm64.img" \
+test_freebsd_image_name_follows_the_arch_and_filesystem() {
+    assert_equals "freebsd-${freebsd_image_version}-arm64-zfs.img" \
                   "$(freebsd_image_file aarch64)"
-    assert_equals "freebsd-${freebsd_image_version}-amd64.img" \
-                  "$(freebsd_image_file x86_64)"
+    assert_equals "freebsd-${freebsd_image_version}-amd64-ufs.img" \
+                  "$(freebsd_rootfs_fs=ufs freebsd_image_file x86_64)"
 }
 
 test_freebsd_image_path_prefers_an_explicit_image() {
@@ -1121,8 +1121,8 @@ test_9front_is_left_out_unless_included() {
 test_9front_sits_ahead_of_the_gentoo_rootfs() {
     INCLUDE_IMAGES="9front" composition_load "gentoo-sway" "amd64"
 
-    assert_equals "nomadbsd 9front gentoo-sway refind" "${comp_name[*]}"
-    assert_equals "3 4 5 0" "${comp_part[*]}"
+    assert_equals "nomadbsd 9front gentoo-sway gentoo-sway-x230 gentoo-sway-x201 refind" "${comp_name[*]}"
+    assert_equals "3 4 5 0 0 0" "${comp_part[*]}"
     assert_equals "plan9" "${comp_fs[1]}"
     assert_equals "efi" "${comp_boot_type[1]}"
     assert_equals "EFI/9front/bootx64.efi" "${comp_kernel[1]}"
@@ -1134,8 +1134,194 @@ test_9front_sits_ahead_of_the_gentoo_rootfs() {
 test_9front_composes_next_to_freebsd() {
     INCLUDE_IMAGES="freebsd 9front" composition_load "gentoo-sway" "amd64"
 
-    assert_equals "nomadbsd freebsd 9front gentoo-sway refind" "${comp_name[*]}"
+    assert_equals "nomadbsd freebsd 9front gentoo-sway gentoo-sway-x230 gentoo-sway-x201 refind" "${comp_name[*]}"
     assert_equals "rootdev=zfs:zroot/ROOT/default:" "${comp_cmdline[1]}"
+}
+
+test_gentoo_sway_boots_every_amd64_kernel_from_one_root() {
+    composition_load "gentoo-sway" "amd64"
+
+    assert_equals "nomadbsd gentoo-sway gentoo-sway-x230 gentoo-sway-x201 refind" "${comp_name[*]}"
+    assert_equals "gentoo-kernel gentoo-kernel" "${comp_provider[2]} ${comp_provider[3]}"
+    assert_equals "gentoo-sway gentoo-sway" "${comp_provider_arg[2]} ${comp_provider_arg[3]}" \
+                  "the hardware kernels boot the Gentoo slot's root"
+    assert_equals "bzImage-x230-latest bzImage-x230" "${comp_kernel_src[2]} ${comp_kernel[2]}"
+    assert_equals "bzImage-x201-latest bzImage-x201" "${comp_kernel_src[3]} ${comp_kernel[3]}"
+    assert_equals "bzImage-virt-amd64" "${comp_kernel[1]}" "the Gentoo slot keeps the virt kernel"
+    assert_equals "0 0" "${comp_part[2]} ${comp_part[3]}" "kernel entries get no partition"
+    assert_equals "1" "${comp_default_saved}"
+    assert_matches "init=/lib/systemd/systemd" "${comp_cmdline[2]}"
+}
+
+test_gentoo_sway_boots_every_arm64_kernel_from_one_root() {
+    composition_load "gentoo-sway" "arm64"
+
+    assert_equals "gentoo-sway gentoo-sway-pine64 gentoo-sway-rockpro64 refind" "${comp_name[*]}"
+    assert_equals "Image-pine64 dtb-pine64" "${comp_kernel[1]} ${comp_dtb[1]}"
+    assert_equals "Image-rockpro64 dtb-rockpro64" "${comp_kernel[2]} ${comp_dtb[2]}"
+    assert_matches "console=ttyS0,115200n8" "${comp_cmdline[1]}" "pine64's UART"
+    assert_matches "console=ttyS2,115200n8" "${comp_cmdline[2]}" "rockpro64's UART"
+    assert_matches "console=ttyAMA0,115200n8" "${comp_cmdline[0]}" "qemu virt's UART"
+}
+
+test_other_gentoo_sway_targets_keep_a_single_kernel() {
+    local t
+    for t in "gentoo-sway-virt amd64" "gentoo-sway-pine64 arm64"; do
+        # shellcheck disable=SC2086 # target and arch, word split on purpose
+        composition_load ${t}
+        assert_equals "" "$(printf '%s\n' "${comp_provider[@]}" | grep -x gentoo-kernel)" "${t}"
+        assert_equals "" "${comp_default_saved}" "${t}"
+    done
+}
+
+test_excluding_the_gentoo_slot_drops_its_kernels() {
+    EXCLUDE_IMAGES="gentoo-sway" composition_load "gentoo-sway" "amd64"
+
+    assert_equals "nomadbsd refind" "${comp_name[*]}" \
+                  "a kernel entry without its root would not boot"
+}
+
+test_kernel_entries_are_fetched_with_their_device_trees() {
+    local log
+    log="$(mktemp)"
+    # The dtb is fetched in a subshell, so record to a file
+    download_miss() { basename "${2}" >>"${log}"; }
+    gentoo_fetch_stage3() { :; }
+    gentoo_fetch_stage4() { :; }
+    refind_fetch() { :; }
+
+    composition_load "gentoo-sway" "arm64"
+    composition_fetch /tmp arm64 >/dev/null 2>&1
+
+    local fetched
+    fetched="$(tr '\n' ' ' <"${log}")"
+    assert_matches "Image-pine64-latest dtb-pine64-latest" "${fetched}"
+    assert_matches "Image-rockpro64-latest dtb-rockpro64-latest" "${fetched}"
+
+    unset -f download_miss gentoo_fetch_stage3 gentoo_fetch_stage4 refind_fetch
+    rm -f "${log}"
+}
+
+test_kernel_entries_boot_the_gentoo_partition_and_the_last_entry_picked() {
+    local d
+    d="$(mktemp -d)"
+    reexec_privileged() { :; }
+    esp_mount() { :; }
+    unmount_recursive() { :; }
+    part_dev() { echo "/dev/test-p${1}"; }
+    blkid() { echo "PU-${*: -1}"; }
+
+    composition_load "gentoo-sway" "amd64"
+    install_boot_entries /dev/test-p2 "${d}" >/dev/null
+
+    local e="${d}/loader/entries"
+    assert_matches "root=PARTUUID=PU-/dev/test-p4 " "$(cat "${e}/gentoo-sway-x230.conf")" \
+                   "x230 boots the Gentoo slot, p4 after nomadbsd's p3"
+    assert_matches "linux         /bzImage-x230" "$(cat "${e}/gentoo-sway-x230.conf")"
+    assert_matches "root=PARTUUID=PU-/dev/test-p4 " "$(cat "${e}/gentoo-sway.conf")"
+    assert_matches "default @saved" "$(cat "${d}/loader/loader.conf")"
+    assert_matches "sort-key      a" "$(cat "${e}/gentoo-sway.conf")" \
+                   "with nothing saved yet, @saved boots the entry sorting first"
+    assert_matches "sort-key      b-02" "$(cat "${e}/gentoo-sway-x230.conf")"
+
+    unset -f reexec_privileged esp_mount unmount_recursive part_dev blkid
+    rm -rf "${d}"
+}
+
+test_single_kernel_targets_keep_a_fixed_default() {
+    local d
+    d="$(mktemp -d)"
+    reexec_privileged() { :; }
+    esp_mount() { :; }
+    unmount_recursive() { :; }
+    part_dev() { echo "/dev/test-p${1}"; }
+    blkid() { echo "PU-${*: -1}"; }
+
+    composition_load "gentoo-sway-virt" "amd64"
+    install_boot_entries /dev/test-p2 "${d}" >/dev/null
+
+    assert_matches "default gentoo-sway-virt.conf" "$(cat "${d}/loader/loader.conf")"
+    assert_fails "grep -q sort-key ${d}/loader/entries/gentoo-sway-virt.conf"
+
+    unset -f reexec_privileged esp_mount unmount_recursive part_dev blkid
+    rm -rf "${d}"
+}
+
+test_boot_test_keeps_the_images_loader_conf_intact() {
+    local d
+    d="$(mktemp -d)"
+    mkdir -p "${d}/loader/entries"
+    printf 'default @saved\ntimeout 5\n' >"${d}/loader/loader.conf"
+    touch "${d}/loader/entries/gentoo-sway.conf"
+
+    loop_mount() { echo "Loop mounting ${1}"; }
+    loop_unmount() { echo "loop_unmount"; }
+    esp() { echo "/dev/test-p2"; }
+    esp_mount() { echo "TARGET SOURCE FSTYPE OPTIONS"; }
+    unmount_recursive() { echo "unmount_recursive: unmounting ${1}"; }
+
+    local previous
+    previous="$(boot_test_select_entry /tmp/test.raw "${d}" gentoo-sway 2>/dev/null)"
+
+    assert_equals "$(printf 'default @saved\ntimeout 5')" "${previous}" \
+                  "only the image's loader.conf is put back, not the mount helpers' output"
+    assert_matches "default gentoo-sway.conf" "$(cat "${d}/loader/loader.conf")"
+
+    unset -f loop_mount loop_unmount esp esp_mount unmount_recursive
+    rm -rf "${d}"
+}
+
+test_boot_test_skips_hardware_kernels_unless_named() {
+    composition_load "gentoo-sway" "amd64"
+
+    assert_equals "" "$(boot_test_skip_reason 1 "")" "the Gentoo slot boots under qemu"
+    assert_matches "hardware kernel" "$(boot_test_skip_reason 2 "")"
+    assert_equals "" "$(boot_test_skip_reason 2 "gentoo-sway-x230")" \
+                  "a hardware kernel asked for by name is booted"
+    assert_equals "login:" "$(BOOT_TEST_PATTERN='' boot_test_pattern gentoo-kernel)"
+}
+
+test_portage_snapshot_comes_from_the_stage4() {
+    local d
+    d="$(mktemp -d)"
+    mkdir -p "${d}/etc/gentoo-build"
+
+    assert_equals "" "$(GENTOO_PORTAGE_SNAPSHOT='' gentoo_portage_snapshot "${d}")" \
+                  "an older stage4 without a record syncs the latest tree"
+
+    printf '20261019\n' >"${d}/etc/gentoo-build/portage-snapshot"
+    assert_equals "20261019" "$(GENTOO_PORTAGE_SNAPSHOT='' gentoo_portage_snapshot "${d}")" \
+                  "the tree the binpkgs were built against keeps them matching"
+    assert_equals "20261001" "$(GENTOO_PORTAGE_SNAPSHOT=20261001 gentoo_portage_snapshot "${d}")" \
+                  "GENTOO_PORTAGE_SNAPSHOT overrides the stage4's record"
+
+    assert_fails "GENTOO_PORTAGE_SNAPSHOT=latest gentoo_portage_snapshot ${d} 2>/dev/null" \
+                 "only a YYYYMMDD date reaches emerge-webrsync --revert"
+
+    rm -rf "${d}"
+}
+
+test_overlays_come_from_the_stage4() {
+    local d
+    d="$(mktemp -d)"
+    mkdir -p "${d}/etc/gentoo-build"
+
+    assert_equals "" "$(GENTOO_OVERLAYS='' gentoo_stage4_overlays "${d}")"
+
+    printf 'https://github.com/bbusse/bbusse-overlay\n' >"${d}/etc/gentoo-build/overlays"
+    assert_equals "https://github.com/bbusse/bbusse-overlay" \
+                  "$(GENTOO_OVERLAYS='' gentoo_stage4_overlays "${d}")" \
+                  "binpkgs built from an overlay ebuild need that overlay"
+
+    printf 'https://a.example/x  https://b.example/y\n\n' >"${d}/etc/gentoo-build/overlays"
+    assert_equals "https://a.example/x https://b.example/y" \
+                  "$(GENTOO_OVERLAYS='' gentoo_stage4_overlays "${d}")"
+
+    assert_equals "https://c.example/z" \
+                  "$(GENTOO_OVERLAYS=https://c.example/z gentoo_stage4_overlays "${d}")" \
+                  "GENTOO_OVERLAYS overrides the stage4's record"
+
+    rm -rf "${d}"
 }
 
 test_9front_partition_gets_no_fs_hint() {
@@ -1168,6 +1354,118 @@ test_filesystem_probes_the_partition_without_udev() {
                    "loop_mount's messages go to stderr, not into the filesystem type"
 
     unset -f loop_mount loop_unmount loop_device lsblk blkid
+}
+
+test_9p_automount_is_installed_and_enabled_inside_the_image() {
+    local d
+    d="$(mktemp -d)"
+    mkdir -p "${d}/usr/local/sbin" "${d}/etc/systemd/system"
+
+    virtio_9p_automount "${d}"
+
+    local script unit link
+    script="${d}/usr/local/sbin/9p-automount"
+    unit="${d}/etc/systemd/system/9p-automount.service"
+    link="${d}/etc/systemd/system/multi-user.target.wants/9p-automount.service"
+
+    assert "test -x ${script}"
+    assert "sh -n ${script}" "the script should parse"
+    assert_matches "/sys/bus/virtio/devices/\*/mount_tag" "$(cat "${script}")"
+    assert_matches "mount -t 9p -o trans=virtio" "$(cat "${script}")"
+
+    assert_matches "ExecStart=/usr/local/sbin/9p-automount" "$(cat "${unit}")"
+    assert_matches "Type=oneshot" "$(cat "${unit}")"
+    assert_matches "WantedBy=multi-user.target" "$(cat "${unit}")"
+
+    assert "test -L ${link}"
+    assert_equals "../9p-automount.service" "$(readlink "${link}")" \
+                  "a link to the build-time mount path dangles once the image boots"
+    assert "test -f ${link}" "the enable link should resolve to the unit inside the image"
+
+    rm -rf "${d}"
+}
+
+test_no_symlink_in_the_image_points_at_the_build_mount_path() {
+    local d
+    d="$(mktemp -d)"
+    mkdir -p "${d}/etc/systemd/system/getty.target.wants" "${d}/etc/systemd/user" \
+             "${d}/etc/systemd/network" "${d}/usr/local/sbin" "${d}/usr/local/bin" \
+             "${d}/usr/lib/systemd/system" "${d}/usr/bin" "${d}/usr/share/zoneinfo/UTC" \
+             "${d}/home/u"
+    touch "${d}/usr/lib/systemd/system/bluetooth.service"
+    touch "${d}/usr/lib/systemd/system/systemd-networkd-wait-online.service"
+    touch "${d}/usr/bin/bt-agent"
+    chmod 755 "${d}/usr/bin/bt-agent"
+
+    chroot() { :; }
+    sudo() { :; }
+    systemctl() { :; }
+    download() { :; }
+    download_miss() { :; }
+    curl() { :; }
+    git() { :; }
+    podman() { :; }
+
+    local c
+    for c in "enable_bluetooth_sink ${d}" \
+             "write_swapfile_unit ${d}" \
+             "provision_systemd_firstboot ${d} u" \
+             "write_provision_fetch ${d} u" \
+             "write_booted_service ${d} host" \
+             "write_net_config ${d} arm64 iproute2-static eth0 10.0.0.2/24" \
+             "write_net_config ${d} arm64 systemd-networkd-dhcp" \
+             "add_dhcp_client ${d} arm64" \
+             "service_enable ${d} foo multi-user" \
+             "virtio_9p_automount ${d}"; do
+        (${c}) >/dev/null 2>&1 || true
+    done
+
+    unset -f chroot sudo systemctl download download_miss curl git podman
+
+    local s="${d}/etc/systemd/system"
+    local l
+    for l in bluetooth.target.wants/bt-agent.service \
+             bluetooth.target.wants/set-bt-discoverable.service \
+             swap.target.wants/swapfile.swap \
+             sysinit.target.wants/firstboot-provision@u.service \
+             multi-user.target.wants/fetch-provision@u.service \
+             getty.target.wants/booted.service \
+             getty.target.wants/net-config.service \
+             getty.target.wants/net-interface.path \
+             multi-user.target.wants/net-dhcp.service \
+             network-online.target.wants/systemd-networkd-wait-online.service \
+             multi-user.target.wants/foo.service \
+             multi-user.target.wants/9p-automount.service; do
+        assert "test -L ${s}/${l}" "$(printf '%s should have been enabled' "${l}")"
+    done
+
+    local bad
+    bad="$(find "${d}" -type l | while read -r l; do
+        case "$(readlink "${l}")" in
+        "${d}"*) printf '%s -> %s\n' "${l#"${d}"}" "$(readlink "${l}")" ;;
+        esac
+    done)"
+
+    assert_equals "" "${bad}" \
+                  "a link to the build-time mount path dangles once the image boots"
+
+    local misnamed
+    misnamed="$(find "${d}" -type l -path '*.wants/*' | while read -r l; do
+        local name unit
+        name="$(basename "${l}")"
+        unit="$(basename "$(readlink "${l}")")"
+        case "${name}" in
+        *@?*.*) name="${name%%@*}@.${name##*.}" ;;
+        esac
+        if [ "${name}" != "${unit}" ]; then
+            printf '%s -> %s\n' "${l#"${d}"}" "$(readlink "${l}")"
+        fi
+    done)"
+
+    assert_equals "" "${misnamed}" \
+                  "systemd enables the unit a .wants link is named after, not the one it points to"
+
+    rm -rf "${d}"
 }
 
 test_nothing_reads_device_metadata_from_udev() {
@@ -1323,8 +1621,10 @@ test_plan9_slot_skips_the_filesystem_check() {
 }
 
 test_freebsd_release_file_follows_release_yml_naming() {
-    assert_equals "freebsd-${freebsd_image_version}-arm64-latest" "$(freebsd_release_file aarch64)"
-    assert_equals "freebsd-${freebsd_image_version}-amd64-latest" "$(freebsd_release_file x86_64)"
+    assert_equals "freebsd-${freebsd_image_version}-arm64-zfs-latest" "$(freebsd_release_file aarch64)"
+    assert_equals "freebsd-${freebsd_image_version}-amd64-ufs-latest" \
+                  "$(freebsd_rootfs_fs=ufs freebsd_release_file x86_64)"
+    assert_equals "freebsd-${freebsd_image_version}-amd64-latest" "$(freebsd_legacy_release_file x86_64)"
 }
 
 test_release_image_fetch_keeps_an_up_to_date_image() {
@@ -1450,7 +1750,12 @@ test_board_tv_runs_mpv_on_drm_on_tty1() {
 
     enable_mpv_tv "${d}" moonshine pine64
 
-    assert "test -L ${d}/etc/systemd/system/graphical.target.wants/tv-tty1@moonshine.service"
+    assert "test -L ${d}/etc/systemd/system/role-tv.target.wants/tv-tty1@moonshine.service"
+    assert_fails "test -e ${d}/etc/systemd/system/graphical.target.wants/tv-tty1@moonshine.service" \
+                 "TV is opt-in through role tv"
+    assert "grep -qx 'WantedBy=multi-user.target' ${d}/etc/systemd/system/role-tv.target"
+    assert_fails "test -e ${d}/etc/systemd/system/multi-user.target.wants/role-tv.target" \
+                 "provisioning enables the role, the image does not"
     local unit
     unit="$(cat "${d}/etc/systemd/system/tv-tty1@.service")"
     assert_matches "TTYPath=/dev/tty1" "${unit}"
@@ -1472,6 +1777,9 @@ test_virt_tv_stays_in_sway() {
     enable_mpv_tv "${d}" moonshine ""
 
     assert "test -L ${d}/etc/systemd/user/sway-session.target.wants/mpv-tv.service"
+    assert "test -f ${d}/etc/systemd/system/role-tv.target"
+    assert "grep -qx 'ConditionPathExists=/etc/systemd/system/multi-user.target.wants/role-tv.target' ${d}/etc/systemd/user/mpv-tv.service" \
+           "a user unit cannot hang off a system target, it checks the role is enabled"
     assert_fails "test -e ${d}/etc/systemd/system/tv-tty1@.service"
 
     rm -rf "${d}"
@@ -1485,7 +1793,10 @@ test_board_sway_starts_on_tty2_on_demand() {
 
     local unit
     unit="$(cat "${d}/etc/systemd/system/autovt@tty2.service")"
-    assert_matches "User=moonshine" "${unit}"
+    assert_fails "grep -q '^User=' ${d}/etc/systemd/system/autovt@tty2.service" \
+                 "the user lives in a drop-in that provisioning can rewrite"
+    assert_equals "$(printf '[Service]\nUser=moonshine\nEnvironmentFile=-/home/moonshine/.config/environment.d/50-provision.conf')" \
+                  "$(cat "${d}/etc/systemd/system/autovt@tty2.service.d/user.conf")"
     assert_matches "TTYPath=/dev/tty2" "${unit}"
     assert_matches "ExecStart=/usr/bin/sway" "${unit}"
     assert_fails "test -e ${d}/etc/systemd/system/graphical.target.wants/sway-tty1@moonshine.service" \
@@ -1505,5 +1816,892 @@ test_virt_sway_keeps_tty1() {
     assert "test -L ${d}/etc/systemd/system/graphical.target.wants/sway-tty1@moonshine.service"
     assert_fails "test -e ${d}/etc/systemd/system/autovt@tty2.service"
 
+    rm -rf "${d}"
+}
+
+set_default_boot_fixture() {
+    local d
+    d="${1}"
+    mkdir -p "${d}/loader/entries"
+    printf 'default @saved\ntimeout 5\nconsole-mode keep\neditor no\n' >"${d}/loader/loader.conf"
+    printf 'title gentoo-sway\nsort-key a\n' >"${d}/loader/entries/gentoo-sway.conf"
+    printf 'title gentoo-sway-pine64\nsort-key b-01\n' >"${d}/loader/entries/gentoo-sway-pine64.conf"
+    printf 'title refind\nsort-key b-03\n' >"${d}/loader/entries/refind.conf"
+    printf 'title gentoo-sway-rockpro64\nsort-key b-02\n' >"${d}/loader/entries/gentoo-sway-rockpro64.conf"
+}
+
+test_boot_entries_are_listed_in_menu_order() {
+    local d
+    d="$(mktemp -d)"
+    set_default_boot_fixture "${d}"
+    printf 'title zz\n' >"${d}/loader/entries/aa-unsorted.conf"
+
+    assert_equals "gentoo-sway gentoo-sway-pine64 gentoo-sway-rockpro64 refind aa-unsorted" \
+                  "$(boot_entries "${d}" | tr '\n' ' ' | sed 's/ $//')" \
+                  "sort-key order, entries without one last"
+
+    rm -rf "${d}"
+}
+
+test_set_default_boot_picks_an_entry_by_number_or_name() {
+    local d
+    d="$(mktemp -d)"
+    set_default_boot_fixture "${d}"
+    local disk
+    disk="$(mktemp)"
+
+    MNT="${d}"
+    mktemp() { if [ "-d" = "${1}" ]; then echo "${MNT}"; else command mktemp "$@"; fi; }
+    rmdir() { :; }
+    disk_esp_attach() { echo "attached ${1}" >>"${MNT}/calls"; }
+    disk_esp_detach() { echo "detached ${1}" >>"${MNT}/calls"; }
+
+    local out
+    out="$(echo 3 | set_default_boot "${disk}" 2>/dev/null)"
+    assert_equals 0 "$?"
+    assert_matches " 1\) gentoo-sway"$'\n' "${out}"
+    assert_matches " 5\) the one last booted \(@saved\)  \(default\)" "${out}" \
+                   "the current default is marked"
+    assert_equals "$(printf 'default gentoo-sway-rockpro64.conf\ntimeout 5\nconsole-mode keep\neditor no')" \
+                  "$(cat "${d}/loader/loader.conf")" "only the default line changes"
+
+    set_default_boot "${disk}" refind >/dev/null 2>&1
+    assert_equals "refind.conf" "$(loader_default "${d}")"
+
+    set_default_boot "${disk}" 5 >/dev/null 2>&1
+    assert_equals "@saved" "$(loader_default "${d}")" "the number after the entries is @saved"
+
+    echo "" | set_default_boot "${disk}" >/dev/null 2>&1
+    assert_equals "@saved" "$(loader_default "${d}")" "Enter keeps the default"
+
+    set_default_boot "${disk}" 6 >/dev/null 2>&1
+    assert_equals 1 "$?" "a number past the list is refused"
+    set_default_boot "${disk}" nomadbsd >/dev/null 2>&1
+    assert_equals 1 "$?" "a name not on the ESP is refused"
+    assert_equals "@saved" "$(loader_default "${d}")"
+
+    assert_equals 6 "$(grep -c '^detached' "${d}/calls")" "the ESP is detached after every run"
+
+    unset -f mktemp rmdir disk_esp_attach disk_esp_detach
+    rm -rf "${d}" "${disk}"
+}
+
+test_set_default_boot_needs_an_existing_disk() {
+    set_default_boot "" >/dev/null 2>&1
+    assert_equals 1 "$?"
+    set_default_boot /nonexistent/disk.raw >/dev/null 2>&1
+    assert_equals 1 "$?"
+}
+
+test_set_default_boot_attaches_images_with_hdiutil_on_macos() {
+    local calls
+    calls="$(mktemp)"
+    CALLS="${calls}"
+
+    sys_os() { echo macos; }
+    hdiutil() {
+        echo "hdiutil $*" >>"${CALLS}"
+        if [ "attach" = "${1}" ]; then
+            printf '/dev/disk9          \tGUID_partition_scheme\n/dev/disk9s1        \tEFI\n'
+        fi
+    }
+    diskutil() { echo "diskutil $*" >>"${CALLS}"; }
+
+    local attached
+    attached="$(disk_esp_attach /tmp/test.raw /tmp/mnt)"
+    disk_esp_detach /tmp/mnt "${attached}"
+
+    assert_equals "$(printf '%s\n' \
+        "hdiutil attach -imagekey diskimage-class=CRawDiskImage -nomount /tmp/test.raw" \
+        "diskutil mount -mountPoint /tmp/mnt /dev/disk9s2" \
+        "diskutil unmount /tmp/mnt" \
+        "hdiutil detach /dev/disk9")" "$(cat "${calls}")"
+
+    unset -f sys_os hdiutil diskutil
+    rm -f "${calls}"
+}
+
+test_set_default_boot_leaves_a_macos_device_attached() {
+    local calls
+    calls="$(mktemp)"
+    CALLS="${calls}"
+
+    sys_os() { echo macos; }
+    hdiutil() { echo "hdiutil $*" >>"${CALLS}"; }
+    diskutil() { echo "diskutil $*" >>"${CALLS}"; }
+
+    local attached
+    attached="$(disk_esp_attach /dev/disk4 /tmp/mnt)"
+    disk_esp_detach /tmp/mnt "${attached}"
+
+    assert_equals "" "${attached}"
+    assert_fails "grep -q hdiutil ${calls}" "a card is mounted, never attached or ejected"
+
+    unset -f sys_os hdiutil diskutil
+    rm -f "${calls}"
+}
+
+test_set_default_boot_loop_mounts_on_linux() {
+    local calls
+    calls="$(mktemp)"
+    CALLS="${calls}"
+
+    sys_os() { echo fedora; }
+    loop_mount() { echo "loop_mount ${1}" >>"${CALLS}"; echo "Loop mounting ${1}"; }
+    esp() { echo "/dev/loop0p2"; }
+    esp_mount() { echo "esp_mount ${1} ${2}" >>"${CALLS}"; }
+    unmount_recursive() { echo "unmount_recursive ${1}" >>"${CALLS}"; }
+    loop_unmount() { echo "loop_unmount" >>"${CALLS}"; }
+
+    local attached
+    attached="$(disk_esp_attach /tmp/test.raw /tmp/mnt 2>/dev/null)"
+    disk_esp_detach /tmp/mnt "${attached}"
+
+    assert_equals "" "${attached}" "the mount helpers' output stays out of the result"
+    assert_equals "$(printf '%s\n' \
+        "loop_mount /tmp/test.raw" \
+        "esp_mount /dev/loop0p2 /tmp/mnt" \
+        "unmount_recursive /tmp/mnt" \
+        "loop_unmount")" "$(cat "${calls}")"
+
+    unset -f sys_os loop_mount esp esp_mount unmount_recursive loop_unmount
+    rm -f "${calls}"
+}
+
+test_provision_pins_are_normalised_and_validated() {
+    local a
+    a="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+    local b
+    b="BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="
+
+    assert_equals "" "$(provision_pins "")"
+    assert_equals "sha256//${a}" "$(provision_pins "${a}")" "a bare hash gets the sha256// prefix"
+    assert_equals "sha256//${a};sha256//${b}" "$(provision_pins " sha256//${a} ; ${b};")"
+
+    provision_pins "sha256//tooshort=" >/dev/null 2>&1
+    assert_equals 1 "$?"
+    provision_pins "sha1//${a}" >/dev/null 2>&1
+    assert_equals 1 "$?" "only sha256 pins"
+}
+
+provision_test_keypair() {
+    local dir
+    dir="${1}"
+    local name
+    name="${2}"
+
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+        -keyout "${dir}/${name}.key" -out "${dir}/${name}.pem" \
+        -subj "/CN=${name}" -days 1 >/dev/null 2>&1
+}
+
+test_provision_certs_put_certs_key_and_pin_on_the_esp() {
+    local d
+    d="$(mktemp -d)"
+    local f
+    f="$(mktemp -d)"
+    local disk
+    disk="$(mktemp)"
+    provision_test_keypair "${f}" ca
+    provision_test_keypair "${f}" rw-vfm
+
+    MNT="${d}"
+    mktemp() { if [ "-d" = "${1}" ]; then echo "${MNT}"; else command mktemp "$@"; fi; }
+    rmdir() { :; }
+    disk_esp_attach() { echo "attached ${1}" >>"${MNT}/calls"; }
+    disk_esp_detach() { echo "detached ${1}" >>"${MNT}/calls"; }
+
+    provision_pinned_pubkey=""
+    provision_certs "${disk}" "${f}/rw-vfm.pem" "${f}/rw-vfm.key" "${f}/ca.pem" >/dev/null 2>&1
+    assert_equals 0 "$?"
+    assert "cmp -s ${f}/ca.pem ${d}/provision/ca.pem"
+    assert "cmp -s ${f}/rw-vfm.pem ${d}/provision/client.pem"
+    assert "cmp -s ${f}/rw-vfm.key ${d}/provision/client.key"
+    assert_fails "test -e ${d}/provision/pinnedpubkey" "no pin without PROVISION_PINNED_PUBKEY"
+
+    provision_pinned_pubkey="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+    provision_certs "${disk}" "" "" "" >/dev/null 2>&1
+    assert_equals 0 "$?" "a pin alone is enough"
+    assert_equals "sha256//AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" \
+                  "$(cat "${d}/provision/pinnedpubkey")"
+
+    assert_equals 2 "$(grep -c '^detached' "${d}/calls")" "the ESP is detached after every run"
+
+    provision_pinned_pubkey=""
+    unset -f mktemp rmdir disk_esp_attach disk_esp_detach
+    rm -rf "${d}" "${f}" "${disk}"
+}
+
+test_provision_add_trust_takes_the_device_certs_from_cfg_provision() {
+    local d
+    d="$(mktemp -d)"
+    local c
+    c="$(mktemp -d)"
+    local disk
+    disk="$(mktemp)"
+    mkdir -p "${c}/certs/rw-vfm"
+    provision_test_keypair "${c}/certs/rw-vfm" rw-vfm
+    provision_test_keypair "${c}" ca
+    cp "${c}/ca.pem" "${c}/certs/rw-vfm/ca.pem"
+
+    MNT="${d}"
+    mktemp() { if [ "-d" = "${1}" ]; then echo "${MNT}"; else command mktemp "$@"; fi; }
+    rmdir() { :; }
+    disk_esp_attach() { echo "attached ${1}" >>"${MNT}/calls"; }
+    disk_esp_detach() { echo "detached ${1}" >>"${MNT}/calls"; }
+
+    provision_pinned_pubkey=""
+    cfg_provision="${c}"
+    provision_add_trust "${disk}" rw-vfm >/dev/null 2>&1
+    assert_equals 0 "$?"
+    assert "cmp -s ${c}/ca.pem ${d}/provision/ca.pem"
+    assert "cmp -s ${c}/certs/rw-vfm/rw-vfm.pem ${d}/provision/client.pem"
+    assert "cmp -s ${c}/certs/rw-vfm/rw-vfm.key ${d}/provision/client.key"
+    assert_equals 1 "$(grep -c '^detached' "${d}/calls")"
+
+    unset -f mktemp rmdir disk_esp_attach disk_esp_detach
+    rm -rf "${d}" "${c}" "${disk}"
+}
+
+test_provision_add_trust_refuses_before_touching_the_disk() {
+    local c
+    c="$(mktemp -d)"
+    local disk
+    disk="$(mktemp)"
+    mkdir -p "${c}/certs/rw-vfm" "${c}/certs/wheel-fm"
+    provision_test_keypair "${c}/certs/rw-vfm" rw-vfm
+    provision_test_keypair "${c}/certs/rw-vfm" ca
+    provision_test_keypair "${c}/certs/wheel-fm" other
+    mv "${c}/certs/wheel-fm/other.pem" "${c}/certs/wheel-fm/wheel-fm.pem"
+    mv "${c}/certs/wheel-fm/other.key" "${c}/certs/wheel-fm/wheel-fm.key"
+    cp "${c}/certs/rw-vfm/ca.pem" "${c}/certs/wheel-fm/ca.pem"
+
+    CALLS="$(mktemp)"
+    disk_esp_attach() { echo attached >>"${CALLS}"; }
+    provision_pinned_pubkey=""
+    cfg_provision="${c}"
+
+    provision_add_trust "${disk}" "" >/dev/null 2>&1
+    assert_equals 1 "$?" "no name"
+    provision_add_trust "${disk}" "../rw-vfm" >/dev/null 2>&1
+    assert_equals 1 "$?" "a path is not a name"
+    provision_add_trust "${disk}" nodev >/dev/null 2>&1
+    assert_equals 1 "$?" "a device cfg-provision has no certificate for"
+    provision_add_trust "${disk}" wheel-fm >/dev/null 2>&1
+    assert_equals 1 "$?" "a certificate for another CN"
+    provision_add_trust /nonexistent/disk.raw rw-vfm >/dev/null 2>&1
+    assert_equals 1 "$?" "a missing disk"
+    rm "${c}/certs/rw-vfm/ca.pem"
+    provision_add_trust "${disk}" rw-vfm >/dev/null 2>&1
+    assert_equals 1 "$?" "no CA certificate"
+
+    assert_equals "" "$(cat "${CALLS}")" "the disk is never attached"
+
+    unset -f disk_esp_attach
+    rm -rf "${c}" "${disk}" "${CALLS}"
+}
+
+test_provision_certs_refuse_before_touching_the_disk() {
+    local f
+    f="$(mktemp -d)"
+    local disk
+    disk="$(mktemp)"
+    provision_test_keypair "${f}" ca
+    provision_test_keypair "${f}" rw-vfm
+    provision_test_keypair "${f}" other
+    echo "ssh-ed25519 AAAA" >"${f}/notcert"
+
+    CALLS="$(mktemp)"
+    disk_esp_attach() { echo attached >>"${CALLS}"; }
+
+    provision_pinned_pubkey=""
+    provision_certs "" "${f}/rw-vfm.pem" "${f}/rw-vfm.key" "" >/dev/null 2>&1
+    assert_equals 1 "$?" "no disk"
+    provision_certs /nonexistent/disk.raw "${f}/rw-vfm.pem" "${f}/rw-vfm.key" "" >/dev/null 2>&1
+    assert_equals 1 "$?" "a missing disk"
+    provision_certs "${disk}" "" "" "" >/dev/null 2>&1
+    assert_equals 1 "$?" "nothing to put there"
+    provision_certs "${disk}" "${f}/rw-vfm.pem" "" "" >/dev/null 2>&1
+    assert_equals 1 "$?" "a client certificate without its key"
+    provision_certs "${disk}" "" "${f}/rw-vfm.key" "" >/dev/null 2>&1
+    assert_equals 1 "$?" "a key without its certificate"
+    provision_certs "${disk}" "${f}/rw-vfm.pem" "${f}/other.key" "" >/dev/null 2>&1
+    assert_equals 1 "$?" "a key that does not belong to the certificate"
+    provision_certs "${disk}" "${f}/notcert" "${f}/rw-vfm.key" "" >/dev/null 2>&1
+    assert_equals 1 "$?" "a client certificate that is not PEM"
+    provision_certs "${disk}" "" "" "${f}/notcert" >/dev/null 2>&1
+    assert_equals 1 "$?" "a CA certificate that is not PEM"
+    provision_certs "${disk}" "" "" /nonexistent/ca.pem >/dev/null 2>&1
+    assert_equals 1 "$?" "a missing CA certificate"
+    provision_pinned_pubkey="bogus"
+    provision_certs "${disk}" "" "" "" >/dev/null 2>&1
+    assert_equals 1 "$?" "a malformed pin"
+
+    assert_equals "" "$(cat "${CALLS}")" "the disk is never attached"
+
+    provision_pinned_pubkey=""
+    unset -f disk_esp_attach
+    rm -rf "${f}" "${disk}" "${CALLS}"
+}
+
+provision_toml_python() {
+    local p
+    for p in python3 python3.14 python3.13 python3.12 python3.11; do
+        if command -v "${p}" >/dev/null 2>&1 && "${p}" -c 'import tomllib' 2>/dev/null; then
+            echo "${p}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+test_sway_targets_use_systemd_networkd() {
+    local t
+    for t in gentoo-sway gentoo-sway-virt gentoo-sway-pine64 gentoo-sway-rockpro64; do
+        assert_equals "systemd-networkd-dhcp" "$(net_mode_for_target gokrazy-dhcp "${t}")" "${t}"
+    done
+    assert_equals "gokrazy-dhcp" "$(net_mode_for_target gokrazy-dhcp gentoo-containeros)" \
+                  "the other targets keep gokrazy"
+    assert_equals "iproute2-static" "$(net_mode_for_target iproute2-static alpine-sway)"
+}
+
+test_networkd_dhcp_makes_network_online_wait_for_the_lease() {
+    local d
+    d="$(mktemp -d)"
+    mkdir -p "${d}/usr/lib/systemd/system"
+    touch "${d}/usr/lib/systemd/system/systemd-networkd-wait-online.service"
+
+    write_net_config "${d}" arm64 systemd-networkd-dhcp "" "" "" >/dev/null 2>&1
+
+    assert_matches "DHCP=yes" "$(cat "${d}/etc/systemd/network/20-dhcp.network")"
+    assert_equals "/usr/lib/systemd/system/systemd-networkd-wait-online.service" \
+                  "$(readlink "${d}/etc/systemd/system/network-online.target.wants/systemd-networkd-wait-online.service")" \
+                  "fetch-provision runs after network-online.target, which only waits with wait-online"
+    assert_fails "test -e ${d}/etc/systemd/system/multi-user.target.wants/net-dhcp.service" \
+                 "gokrazy is not started next to networkd"
+
+    rm -rf "${d}"
+}
+
+test_portage_snapshot_is_downloaded_once_and_kept_out_of_the_image() {
+    local d
+    d="$(mktemp -d)"
+    mkdir -p "${d}/mnt" "${d}/cache"
+
+    MNT="${d}/mnt"
+    chroot() {
+        shift
+        case "${1}" in
+        portageq) echo /var/cache/distfiles ;;
+        emerge-webrsync)
+            local f
+            for f in gentoo-20261018.tar.xz gentoo-20261018.tar.xz.md5sum gentoo-20261018.tar.xz.gpgsig; do
+                if [ -s "${MNT}/var/cache/distfiles/${f}" ]; then
+                    echo "reused ${f}" >>"${MNT}/../calls"
+                else
+                    echo "fetched" >"${MNT}/var/cache/distfiles/${f}"
+                fi
+            done
+            echo "$*" >>"${MNT}/../calls"
+            ;;
+        esac
+    }
+
+    (cd "${d}/cache" && gentoo_sync_portage_snapshot "${MNT}" 20261018)
+    assert_equals 0 "$?"
+    assert_equals "emerge-webrsync --keep --revert=20261018" "$(cat "${d}/calls")"
+    assert "test -s ${d}/cache/gentoo-20261018.tar.xz" "the snapshot is cached for the next run"
+    assert "test -s ${d}/cache/gentoo-20261018.tar.xz.gpgsig"
+    assert_equals "" "$(ls -A "${MNT}/var/cache/distfiles")" "the tarball does not stay in the image"
+
+    rm -f "${d}/calls"
+    (cd "${d}/cache" && gentoo_sync_portage_snapshot "${MNT}" 20261018)
+    assert_equals 3 "$(grep -c '^reused' "${d}/calls")" "the next run reuses the cached snapshot"
+    assert_equals "" "$(ls -A "${MNT}/var/cache/distfiles")"
+
+    unset -f chroot
+    rm -rf "${d}"
+}
+
+stage3_fetch_fixture() {
+    local d
+    d="${1}"
+    printf 'stage3 payload\n' >"${d}/served"
+    local sum
+    sum="$(shasum -a 256 "${d}/served" 2>/dev/null || sha256sum "${d}/served")"
+    printf -- '-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA256\n\n# SHA256 HASH\n%s  stage3-arm64-systemd-20261018T231554Z.tar.xz\n-----BEGIN PGP SIGNATURE-----\nAAAA\n-----END PGP SIGNATURE-----\n' \
+        "${sum%% *}" >"${d}/served.sha256"
+    printf '# Latest as of\nstage3-arm64-systemd-20261018T231554Z.tar.xz 264113192\n' >"${d}/served.txt"
+}
+
+stage3_fetch_stub_download() {
+    download() {
+        echo "${1##*/}" >>"${FIXTURE}/calls"
+        case "${1}" in
+        *.txt) cp "${FIXTURE}/served.txt" "${2}/${1##*/}" ;;
+        *.sha256) cp "${FIXTURE}/served.sha256" "${2}/${1##*/}" ;;
+        *) cp "${FIXTURE}/served" "${2}/${1##*/}" ;;
+        esac
+    }
+}
+
+test_stage3_is_not_downloaded_again_when_it_matches_its_sha256() {
+    local d
+    d="$(mktemp -d)"
+    mkdir -p "${d}/dl"
+    stage3_fetch_fixture "${d}"
+    FIXTURE="${d}"
+    stage3_fetch_stub_download
+    cp "${d}/served" "${d}/dl/stage3-arm64-systemd-20261018T231554Z.tar.xz"
+
+    path="${d}/dl" gentoo_fetch_stage3 arm64 >/dev/null 2>&1
+    assert_equals 0 "$?"
+    assert_fails "grep -qx stage3-arm64-systemd-20261018T231554Z.tar.xz ${d}/calls" \
+                 "the cached stage3 is used"
+
+    printf 'stale\n' >"${d}/dl/stage3-arm64-systemd-20261018T231554Z.tar.xz"
+    rm -f "${d}/calls"
+    path="${d}/dl" gentoo_fetch_stage3 arm64 >/dev/null 2>&1
+    assert_equals 0 "$?"
+    assert "grep -qx stage3-arm64-systemd-20261018T231554Z.tar.xz ${d}/calls" \
+           "a stage3 that does not match is fetched again"
+    assert_equals "stage3 payload" "$(cat "${d}/dl/stage3-arm64-systemd-20261018T231554Z.tar.xz")"
+
+    unset -f download
+    rm -rf "${d}"
+}
+
+test_stage3_download_that_does_not_match_fails() {
+    local d
+    d="$(mktemp -d)"
+    mkdir -p "${d}/dl"
+    stage3_fetch_fixture "${d}"
+    FIXTURE="${d}"
+    stage3_fetch_stub_download
+    printf 'corrupt\n' >"${d}/served"
+
+    (path="${d}/dl" gentoo_fetch_stage3 arm64 >/dev/null 2>&1)
+    assert_equals 1 "$?"
+
+    unset -f download
+    rm -rf "${d}"
+}
+
+test_freebsd_ufs_slot_boots_its_own_partition() {
+    local freebsd_rootfs_fs
+    freebsd_rootfs_fs=ufs
+    INCLUDE_IMAGES="freebsd" composition_load "gentoo-sway" "amd64"
+
+    assert_equals "nomadbsd freebsd gentoo-sway" "${comp_name[*]:0:3}"
+    assert_equals "ufs" "${comp_fs[1]}"
+    assert_equals "rootdev=disk0p4:" "${comp_cmdline[1]}" \
+                  "NomadBSD is the first FreeBSD root on the disk, so the loader is told the partition"
+    assert_equals "rootfs" "$(partition_name 1)" "the UFS image mounts / from /dev/gpt/rootfs"
+    assert_equals "nomadbsd" "$(partition_name 0)"
+    assert_equals "A503" "$(gpt_type_code "${comp_fs[1]}")"
+}
+
+test_freebsd_ufs_slot_alone_needs_no_rootdev() {
+    local freebsd_rootfs_fs
+    freebsd_rootfs_fs=ufs
+    INCLUDE_IMAGES="freebsd" composition_load "gentoo-sway-pine64" "arm64"
+
+    assert_equals "ufs" "${comp_fs[0]}"
+    assert_equals "" "${comp_cmdline[0]}" "the loader's own walk finds the only FreeBSD root"
+}
+
+test_freebsd_zfs_slot_keeps_its_name() {
+    INCLUDE_IMAGES="freebsd" composition_load "gentoo-sway-pine64" "arm64"
+
+    assert_equals "freebsd" "$(partition_name 0)"
+}
+
+test_rootfs_filesystems_are_checked() {
+    assert "rootfs_fs_check"
+    assert "freebsd_rootfs_fs=ufs rootfs_fs_check"
+    assert_fails "freebsd_rootfs_fs=xfs rootfs_fs_check 2>/dev/null" "FreeBSD boots ufs or zfs"
+    assert_fails "linux_rootfs_fs=ext4 rootfs_fs_check 2>/dev/null"
+    assert_fails "linux_rootfs_fs=zfs rootfs_fs_check 2>/dev/null" \
+                 "a ZFS root needs the pool imported, which Linux leaves to an initramfs"
+
+    (linux_rootfs_fs=zfs composition_load "gentoo-sway" "arm64" >/dev/null 2>&1)
+    assert_equals 1 "$?" "create stops before touching a disk"
+}
+
+test_gentoo_root_takes_the_linux_rootfs_filesystem() {
+    local t
+    for t in gentoo-containeros gentoo-sway containeros-virt; do
+        composition_load "${t}" "amd64"
+        local i
+        for i in "${!comp_name[@]}"; do
+            if [ "gentoo" = "${comp_provider[$i]}" ]; then
+                assert_equals "${linux_rootfs_fs}" "${comp_fs[$i]}" "${t}"
+            fi
+        done
+    done
+}
+
+test_freebsd_zfs_falls_back_to_the_unsuffixed_release() {
+    local calls
+    calls="$(mktemp)"
+    CALLS="${calls}"
+    release_image_fetch() { echo "${4}" >>"${CALLS}"; [ "${4##*-}" = latest ] && [[ "${4}" != *-zfs-* ]] && [[ "${4}" != *-ufs-* ]]; }
+
+    (FREEBSD_IMAGE="" freebsd_image_fetch /dl arm64 >/dev/null 2>&1)
+    assert_equals 0 "$?"
+    assert_equals "$(printf '%s\n' "freebsd-${freebsd_image_version}-arm64-zfs-latest" \
+        "freebsd-${freebsd_image_version}-arm64-latest")" "$(cat "${calls}")"
+
+    : >"${calls}"
+    (FREEBSD_IMAGE="" freebsd_rootfs_fs=ufs freebsd_image_fetch /dl arm64 >/dev/null 2>&1)
+    assert_equals 1 "$?" "the unsuffixed image is ZFS, never a stand-in for UFS"
+    assert_equals "freebsd-${freebsd_image_version}-arm64-ufs-latest" "$(cat "${calls}")"
+
+    unset -f release_image_fetch
+    rm -f "${calls}"
+}
+
+test_freebsd_ufs_image_gets_no_zfs_dataset() {
+    local conf
+    conf="$(freebsd_vm_image_config)"
+
+    local fs
+    for fs in ufs zfs; do
+        local d
+        d="$(mktemp -d)"
+        mkdir -p "${d}/etc" "${d}/boot"
+        touch "${d}/METALOG"
+        (
+            pw() { :; }
+            sed() { :; }
+            metalog_add_data() { :; }
+            DESTDIR="${d}" VMFS="${fs}" TARGET=arm64
+            # shellcheck disable=SC1090
+            . "${conf}"
+            vm_extra_pre_umount
+        ) >/dev/null 2>&1
+        assert_equals 0 "$?" "${fs}"
+        if [ zfs = "${fs}" ]; then
+            assert_matches 'containers_dataset_enable="YES"' "$(cat "${d}/etc/rc.conf")"
+            assert "test -f ${d}/usr/local/etc/rc.d/containers_dataset"
+        else
+            assert_fails "grep -q containers_dataset ${d}/etc/rc.conf" "a UFS root has no pool for podman's dataset"
+            assert_fails "test -e ${d}/usr/local/etc/rc.d/containers_dataset"
+            assert_matches 'growfs_enable="YES"' "$(cat "${d}/etc/rc.conf")"
+        fi
+        rm -rf "${d}"
+    done
+    rm -f "${conf}"
+}
+
+u_root_cpio_fixture() {
+    local d
+    d="${1}"
+    mkdir -p "${d}/root/bbin"
+    printf '#!/bin/sh\necho bb\n' >"${d}/root/bbin/bb"
+    chmod 0755 "${d}/root/bbin/bb"
+    ln -s bb "${d}/root/bbin/gosh"
+    ln -s bb "${d}/root/bbin/netcat"
+    (cd "${d}/root" && find . -mindepth 1 | sed 's|^\./||' | cpio -o -H newc --quiet) \
+        >"${d}/dl/initramfs-arm64.cpio"
+}
+
+test_u_root_commands_are_checked_and_bb_is_staged() {
+    command -v cpio >/dev/null || return 0
+    local d
+    d="$(mktemp -d)"
+    mkdir -p "${d}/dl"
+    u_root_cpio_fixture "${d}"
+
+    (u_root_commands="gosh netcat" u_root_stage_bb "${d}/dl" arm64 >/dev/null 2>&1)
+    assert_equals 0 "$?"
+    assert_equals "$(cat "${d}/root/bbin/bb")" "$(cat "${d}/dl/u-root-bb-arm64")"
+    assert "test -x ${d}/dl/u-root-bb-arm64"
+
+    local err
+    err="$( (u_root_commands="gosh vim" u_root_stage_bb "${d}/dl" arm64) 2>&1 >/dev/null)"
+    assert_equals 1 "$?" "a command bb does not carry stops create before the disk is touched"
+    assert_matches "has no vim" "${err}"
+
+    rm -f "${d}/dl/u-root-bb-arm64"
+    (u_root_commands="" u_root_stage_bb "${d}/dl" arm64)
+    assert_fails "test -e ${d}/dl/u-root-bb-arm64" "nothing is staged without U_ROOT_COMMANDS"
+
+    rm -rf "${d}"
+}
+
+test_u_root_commands_link_to_bb_in_local_bin() {
+    local d
+    d="$(mktemp -d)"
+    mkdir -p "${d}/mnt/home/u" "${d}/mnt/etc"
+    printf 'bb\n' >"${d}/bb"
+
+    u_root_commands="gosh netcat bb" install_u_root_commands "${d}/mnt" u "${d}/bb"
+
+    local bin
+    bin="${d}/mnt/home/u/.local/bin"
+    assert "test -x ${bin}/bb"
+    assert_equals "bb" "$(readlink "${bin}/gosh")" "relative, so it resolves inside the image"
+    assert_equals "bb" "$(readlink "${bin}/netcat")"
+    assert "test ! -L ${bin}/bb" "bb itself is the binary, not a link to itself"
+    assert_matches '.local/bin' "$(cat "${d}/mnt/etc/profile.d/local-bin.sh")"
+
+    rm -rf "${d}"
+}
+
+test_u_root_commands_need_staged_bb() {
+    local d
+    d="$(mktemp -d)"
+    mkdir -p "${d}/mnt/home/u"
+
+    (u_root_commands="gosh" install_u_root_commands "${d}/mnt" u "${d}/missing" 2>/dev/null)
+    assert_equals 1 "$?"
+
+    u_root_commands="" install_u_root_commands "${d}/mnt" u "${d}/missing"
+    assert_fails "test -e ${d}/mnt/home/u/.local/bin" "nothing is installed without U_ROOT_COMMANDS"
+
+    rm -rf "${d}"
+}
+
+test_gentoo_k8s_composition_is_headless_like_containeros() {
+    composition_load "gentoo-k8s" "arm64"
+
+    assert_equals "2" "$(comp_count)" "the rootfs and rEFInd"
+    assert_equals "gentoo-k8s" "${comp_name[0]}"
+    assert_equals "Image-virt-arm64" "${comp_kernel[0]}"
+    assert_equals "systemd-networkd-dhcp" "$(net_mode_for_target gokrazy-dhcp gentoo-k8s)" \
+                  "resolved announces the masters, networkd carries the hostname to DHCP"
+}
+
+test_k8s_roles_need_kubeadm_in_the_rootfs() {
+    local d
+    d="$(fake_rootfs_with sway)"
+    write_k8s_roles "${d}"
+    assert_fails "test -e ${d}/etc/systemd/system/role-k8s-master.target"
+    rm -rf "${d}"
+}
+
+test_k8s_roles_hang_their_units_off_the_role_targets() {
+    local d
+    d="$(fake_rootfs_with kubeadm)"
+    write_k8s_roles "${d}"
+
+    local s
+    s="${d}/etc/systemd/system"
+    local role
+    local unit
+    for role in master client; do
+        assert "test -f ${s}/role-k8s-${role}.target"
+        for unit in kubelet.service k8s-prepare.service k8s-endpoint.timer "k8s-${role}.service"; do
+            assert "test -L ${s}/role-k8s-${role}.target.wants/${unit}" "${role}: ${unit}"
+        done
+    done
+    assert "test -L ${s}/role-k8s-master.target.wants/k8s-cilium.service"
+    assert_fails "test -e ${s}/role-k8s-client.target.wants/k8s-cilium.service"
+    assert_fails "test -e ${s}/multi-user.target.wants/kubelet.service" \
+                 "kubelet would restart forever on a node without a role"
+    assert "grep -qx 'ConditionPathExists=!/etc/kubernetes/kubelet.conf' ${s}/k8s-client.service" \
+           "a node joins once"
+    assert "grep -qx 'ExecStartPre=/usr/local/sbin/k8s-endpoint' ${s}/k8s-master.service" \
+           "the endpoint resolves before kubeadm needs it"
+    local f
+    for f in usr/local/sbin/k8s-prepare usr/local/sbin/k8s-endpoint usr/local/sbin/k8s-node \
+        usr/local/sbin/k8s-cilium usr/local/lib/k8s-endpoint/mdns usr/local/lib/k8s-endpoint/dns; do
+        assert "test -x ${d}/${f}" "${f}"
+    done
+    assert_matches "Type=_k8s-api._tcp" "$(cat "${d}/usr/local/sbin/k8s-node")"
+    assert_matches 'ttl: "0s"' "$(cat "${d}/usr/local/sbin/k8s-node")"
+
+    rm -rf "${d}"
+}
+
+k8s_endpoint_env() {
+    local d
+    d="${1}"
+    mkdir -p "${d}/bin"
+    printf 'K8S_ROLE=%s\nK8S_CLUSTER=e2m\nK8S_ENDPOINT=e2m.k8s.internal:6443\nK8S_ENDPOINT_HOST=e2m.k8s.internal\nK8S_ENDPOINT_METHOD=%s\nK8S_BOOTSTRAP=%s\n' \
+        "${2}" "${3}" "${4:-no}" >"${d}/k8s.conf"
+    printf '#!/bin/sh\necho "1.1.1.1 via 10.64.42.1 dev eth0 src 10.64.42.50 uid 0"\n' >"${d}/bin/ip"
+    chmod +x "${d}/bin/ip"
+}
+
+k8s_endpoint_run() {
+    local d
+    d="${1}"
+    PATH="${d}/bin:${PATH}" K8S_CONF="${d}/k8s.conf" K8S_ENDPOINT_LIB="${d}/root/usr/local/lib/k8s-endpoint" \
+        K8S_HOSTS_FILE="${d}/hosts" sh "${d}/root/usr/local/sbin/k8s-endpoint"
+}
+
+k8s_mdns_answers() {
+    printf '#!/bin/sh\ncat <<JSON\n%s\nJSON\n' "${2}" >"${1}/bin/mdns-discover"
+    chmod +x "${1}/bin/mdns-discover"
+}
+
+test_k8s_endpoint_mdns_writes_the_masters_of_its_cluster() {
+    provision_toml_python >/dev/null || return 0
+    local d
+    d="$(mktemp -d)"
+    mkdir -p "${d}/root/usr/bin"
+    touch "${d}/root/usr/bin/kubeadm"
+    chmod +x "${d}/root/usr/bin/kubeadm"
+    write_k8s_roles "${d}/root"
+    k8s_endpoint_env "${d}" client mdns
+    printf '127.0.0.1 localhost\n10.64.42.99 sputnik\n' >"${d}/hosts"
+    k8s_mdns_answers "${d}" '[
+ {"service":"_k8s-api._tcp","address":"10.64.42.12","port":6443,"txtMap":{"cluster":"e2m"}},
+ {"service":"_k8s-api._tcp","address":"fe80::1","port":6443,"txtMap":{"cluster":"e2m"}},
+ {"service":"_k8s-api._tcp","address":"10.64.42.11","port":6443,"txtMap":{"cluster":"e2m"}},
+ {"service":"_k8s-api._tcp","address":"10.64.42.11","port":6443,"txtMap":{"cluster":"e2m"}},
+ {"service":"_k8s-api._tcp","address":"10.64.42.77","port":6443,"txtMap":{"cluster":"lab"}}
+]'
+
+    k8s_endpoint_run "${d}" >/dev/null
+    assert_equals 0 "$?"
+    local want
+    want="$(printf '%s\n' '127.0.0.1 localhost' '10.64.42.99 sputnik' '# k8s-endpoint e2m begin' \
+        '10.64.42.11 e2m.k8s.internal' '10.64.42.12 e2m.k8s.internal' '# k8s-endpoint e2m end')"
+    assert_equals "${want}" "$(cat "${d}/hosts")" "this cluster's masters only, no link-local, no duplicates"
+
+    k8s_endpoint_run "${d}" >/dev/null
+    assert_equals "${want}" "$(cat "${d}/hosts")" "a second run changes nothing"
+
+    k8s_mdns_answers "${d}" '[{"service":"_k8s-api._tcp","address":"10.64.42.13","port":6443,"txtMap":{"cluster":"e2m"}}]'
+    k8s_endpoint_run "${d}" >/dev/null
+    assert_equals "$(printf '%s\n' '127.0.0.1 localhost' '10.64.42.99 sputnik' '# k8s-endpoint e2m begin' \
+        '10.64.42.13 e2m.k8s.internal' '# k8s-endpoint e2m end')" "$(cat "${d}/hosts")" "the block is replaced"
+
+    k8s_mdns_answers "${d}" 'null'
+    k8s_endpoint_run "${d}" 2>/dev/null
+    assert_equals 0 "$?" "a quiet network keeps the last masters"
+    assert_matches "10.64.42.13 e2m.k8s.internal" "$(cat "${d}/hosts")"
+
+    rm -rf "${d}"
+}
+
+test_k8s_endpoint_mdns_without_any_master_fails() {
+    provision_toml_python >/dev/null || return 0
+    local d
+    d="$(mktemp -d)"
+    mkdir -p "${d}/root/usr/bin"
+    touch "${d}/root/usr/bin/kubeadm"
+    chmod +x "${d}/root/usr/bin/kubeadm"
+    write_k8s_roles "${d}/root"
+    k8s_endpoint_env "${d}" client mdns
+    printf '127.0.0.1 localhost\n' >"${d}/hosts"
+    k8s_mdns_answers "${d}" '[]'
+
+    k8s_endpoint_run "${d}" 2>/dev/null
+    assert_equals 1 "$?"
+    assert_equals "127.0.0.1 localhost" "$(cat "${d}/hosts")"
+
+    rm -rf "${d}"
+}
+
+test_k8s_endpoint_a_bootstrap_master_counts_itself_in() {
+    provision_toml_python >/dev/null || return 0
+    local d
+    d="$(mktemp -d)"
+    mkdir -p "${d}/root/usr/bin"
+    touch "${d}/root/usr/bin/kubeadm"
+    chmod +x "${d}/root/usr/bin/kubeadm"
+    write_k8s_roles "${d}/root"
+    printf '127.0.0.1 localhost\n' >"${d}/hosts"
+
+    k8s_endpoint_env "${d}" master mdns yes
+    k8s_mdns_answers "${d}" '[]'
+    k8s_endpoint_run "${d}" >/dev/null
+    assert_equals 0 "$?"
+    assert_matches "10.64.42.50 e2m.k8s.internal" "$(cat "${d}/hosts")" "kubeadm init needs the name before anyone announces it"
+
+    printf '127.0.0.1 localhost\n' >"${d}/hosts"
+    k8s_endpoint_env "${d}" master mdns no
+    k8s_mdns_answers "${d}" '[{"service":"_k8s-api._tcp","address":"10.64.42.11","port":6443,"txtMap":{"cluster":"e2m"}}]'
+    k8s_endpoint_run "${d}" >/dev/null
+    assert_not_matches "10.64.42.50" "$(cat "${d}/hosts")" "a joining master must not point the endpoint at itself"
+
+    rm -rf "${d}"
+}
+
+test_k8s_endpoint_methods_are_scripts() {
+    local d
+    d="$(mktemp -d)"
+    mkdir -p "${d}/root/usr/bin"
+    touch "${d}/root/usr/bin/kubeadm"
+    chmod +x "${d}/root/usr/bin/kubeadm"
+    write_k8s_roles "${d}/root"
+
+    k8s_endpoint_env "${d}" client vip
+    local out
+    out="$(k8s_endpoint_run "${d}" 2>&1)"
+    assert_equals 1 "$?"
+    assert_matches "no method vip" "${out}"
+
+    printf '#!/bin/sh\necho "vip for ${K8S_ENDPOINT_HOST}"\n' >"${d}/root/usr/local/lib/k8s-endpoint/vip"
+    chmod +x "${d}/root/usr/local/lib/k8s-endpoint/vip"
+    assert_equals "vip for e2m.k8s.internal" "$(k8s_endpoint_run "${d}")" "a new method is one more script"
+
+    k8s_endpoint_env "${d}" client dns
+    printf '#!/bin/sh\n[ "${2}" = e2m.k8s.internal ] && echo "10.64.42.11 STREAM e2m.k8s.internal"\n' >"${d}/bin/getent"
+    chmod +x "${d}/bin/getent"
+    k8s_endpoint_run "${d}"
+    assert_equals 0 "$?" "dns: the name resolves"
+    printf '#!/bin/sh\nexit 2\n' >"${d}/bin/getent"
+    assert_fails "k8s_endpoint_run ${d} 2>/dev/null" "dns: it does not"
+
+    rm -rf "${d}"
+}
+
+test_provisioner_comes_from_the_bin_dir() {
+    local d
+    d="$(mktemp -d)"
+    mkdir -p "${d}/bin/linux-arm64" "${d}/root/usr/local/sbin" "${d}/root/etc/systemd/system"
+    printf '#!/bin/sh\necho "provisioner $*"\n' >"${d}/bin/linux-arm64/provisioner"
+    write_provision_fetch "${d}/root" u
+
+    provisioner_bin_dir="${d}/bin"
+    install_provisioner "${d}/root" arm64
+    assert_equals 0 "$?"
+    assert "test -x ${d}/root/usr/local/bin/provisioner"
+    assert "grep -qx 'ExecStart=/usr/local/bin/provisioner fetch %i' ${d}/root/etc/systemd/system/fetch-provision@.service" \
+        "the unit runs provisioner fetch itself"
+    assert_fails "test -e ${d}/root/usr/local/sbin/fetch-provision" "no shell fetch-provision next to it"
+    assert_fails "test -e ${d}/root/usr/local/sbin/provision-discover"
+    assert "test -L ${d}/root/etc/systemd/system/multi-user.target.wants/fetch-provision@u.service"
+
+    assert_fails "(install_provisioner ${d}/root amd64) 2>/dev/null" "no binary for the architecture"
+    provisioner_bin_dir=""
+    provisioner_release_tag=""
+    assert_fails "(install_provisioner ${d}/root arm64) 2>/dev/null" "neither a bin dir nor a release"
+
+    rm -rf "${d}"
+}
+
+test_provisioner_goes_where_the_openwrt_overlay_wants_it() {
+    local d
+    d="$(mktemp -d)"
+    mkdir -p "${d}/bin/linux-mips"
+    printf '#!/bin/sh\necho "provisioner $*"\n' >"${d}/bin/linux-mips/provisioner"
+
+    provisioner_bin_dir="${d}/bin"
+    put_provisioner mips "${d}/files/usr/sbin/provisioner"
+    assert_equals 0 "$?"
+    assert "test -x ${d}/files/usr/sbin/provisioner"
+    assert_fails "test -e ${d}/files/usr/local/bin/provisioner" "no device unit, no /usr/local"
+
+    provisioner_bin_dir=""
+    rm -rf "${d}"
+}
+
+test_openwrt_architectures_map_to_go() {
+    local d
+    d="$(mktemp -d)"
+    printf 'CONFIG_ARCH="mips"\n' >"${d}/config"
+    assert_equals mips "$(openwrt_go_arch "${d}/config")" "ath79, mips_24kc"
+    printf 'CONFIG_ARCH="aarch64"\n' >"${d}/config"
+    assert_equals arm64 "$(openwrt_go_arch "${d}/config")"
+    printf 'CONFIG_ARCH="x86_64"\n' >"${d}/config"
+    assert_equals amd64 "$(openwrt_go_arch "${d}/config")"
+    printf 'CONFIG_ARCH="arm"\n' >"${d}/config"
+    assert_fails "(openwrt_go_arch ${d}/config) 2>/dev/null" "no release for arm"
     rm -rf "${d}"
 }
