@@ -105,15 +105,23 @@ nomadbsd_source_url="https://github.com/NomadBSD/NomadBSD"
 nomadbsd_filesystem="${NOMADBSD_FILESYSTEM:-ufs}"
 nomadbsd_loader_file="nomadbsd-loader.efi"
 
-# FreeBSD slot: the ZFS image bbusse/freebsd-build builds and boot tests for
+# Root filesystem of the Linux slots, xfs or zfs
+linux_rootfs_fs="${LINUX_ROOTFS_FS:-xfs}"
+
+# FreeBSD slot: the image bbusse/freebsd-build builds and boot tests for
 # amd64 and arm64, composed into the disk next to NomadBSD. Optional, it is
-# only added when INCLUDE_IMAGES names it. FREEBSD_REPO_URL selects where the
-# image comes from, FREEBSD_IMAGE overrides the lookup with a local image
+# only added when INCLUDE_IMAGES names it. FREEBSD_ROOTFS_FS picks its UFS or
+# ZFS image, FREEBSD_REPO_URL selects where the image comes from,
+# FREEBSD_IMAGE overrides the lookup with a local image
+freebsd_rootfs_fs="${FREEBSD_ROOTFS_FS:-zfs}"
+# What build freebsd makes, one image per filesystem from a single world
+freebsd_build_fs="${FREEBSD_BUILD_FS:-ufs zfs}"
 freebsd_image_version="${FREEBSD_VERSION:-15.1}"
 freebsd_image_repo_url="${FREEBSD_REPO_URL:-https://github.com/bbusse/freebsd-build/releases/download/latest}"
 freebsd_loader_file="freebsd-loader.efi"
-# The image's zroot pool partition is 2 GiB and is copied in whole, so the
-# slot has to be larger. growfs grows the pool to fill the slot on first boot
+# The image's root partition, UFS or the zroot pool, is 2 GiB and is copied
+# in whole, so the slot has to be larger. growfs grows it to fill the slot
+# on first boot
 freebsd_slot_size="${FREEBSD_SLOT_SIZE:-4096}"
 # The boot environment freebsd-build's image boots, see
 # freebsd_vm_image_config
@@ -162,7 +170,7 @@ net_mode_for_target() {
     build_target="${2}"
 
     case "${build_target}" in
-    gentoo-sway-pine64 | gentoo-sway-rockpro64)
+    gentoo-k8s | gentoo-sway | gentoo-sway-*)
         echo "systemd-networkd-dhcp"
         return
         ;;
@@ -214,10 +222,38 @@ edk2_build="${EDK2_BUILD:-RELEASE}"
 # against, so these are fetched unverified
 u_root_repo_url="https://github.com/bbusse/u-root-build/releases/download/latest"
 u_root_release_url="https://github.com/bbusse/u-root-build/releases/tag/latest"
+# Space separated u-root commands to install for the image user, symlinks
+# in ~/.local/bin to the initramfs's multicall bb
+u_root_commands="${U_ROOT_COMMANDS:-}"
+
+provision_ca_cert="${PROVISION_CA_CERT:-}"
+provision_pinned_pubkey="${PROVISION_PINNED_PUBKEY:-}"
+provision_client_cert="${PROVISION_CLIENT_CERT:-}"
+provision_client_key="${PROVISION_CLIENT_KEY:-}"
+# cfg-provision's checkout, provision-add-trust takes certs/NAME/ from it
+cfg_provision="${CFG_PROVISION:-${SCRIPT_PATH}/../cfg-provision}"
 
 # gokrazy-dhcp
 gokrazy_dhcp_repo_url="https://github.com/bbusse/gokrazy-dhcp"
 gokrazy_dhcp_release_tag="ci_c150ed5_2"
+
+# provisioner: systemd images get it from PROVISIONER_BIN_DIR (linux-<arch>/
+# or flat) or else from the release PROVISIONER_RELEASE_TAG, and
+# fetch-provision@.service runs provisioner fetch. OpenWrt flavours whose
+# overlay runs fetch-profiles get it the same way as /usr/sbin/provisioner
+provisioner_repo_url="https://github.com/bbusse/provisioner"
+provisioner_release_tag="${PROVISIONER_RELEASE_TAG:-ci_46bdd9c_1}"
+provisioner_bin_dir="${PROVISIONER_BIN_DIR:-}"
+
+# mdns-discover
+mdns_discover_repo_url="https://github.com/bbusse/mdns-discover"
+mdns_discover_release_tag="ci_79f912d_8"
+
+# cilium-cli, installs Cilium on a kubeadm cluster's bootstrap master
+cilium_cli_repo_url="https://github.com/cilium/cilium-cli"
+cilium_cli_version="v0.20.1"
+cilium_cli_sha256_amd64="24e817dcfcc8a12e325ce7547617bcbcf171c5b0b335bb24d2bb1207ba047f61"
+cilium_cli_sha256_arm64="d237550b882af6f2e01e8985e1e024d57c0774611c0a527c7a20dcee7dc4fd07"
 
 # OpenWrt
 openwrt_source_url="https://github.com/bbusse/openwrt"
@@ -505,6 +541,13 @@ set_login_shell() {
     fi
     chroot "${mnt_path}" usermod -s "${shell}" "${user}" || true
 
+    local_bin_on_path "${mnt_path}"
+}
+
+local_bin_on_path() {
+    local mnt_path
+    mnt_path="${1}"
+
     mkdir -p "${mnt_path}/etc/profile.d"
     cat <<'EOF' >"${mnt_path}/etc/profile.d/local-bin.sh"
 case ":${PATH}:" in
@@ -605,14 +648,13 @@ enable_sway_session() {
 
     if [ -n "${board}" ]; then
         mkdir -p "${path}"
-        cat <<EOF >"${path}/autovt@tty2.service"
+        cat <<'EOF' >"${path}/autovt@tty2.service"
 [Unit]
-Description=sway on tty2 as ${user}
+Description=sway on tty2
 After=systemd-user-sessions.service
 Conflicts=getty@tty2.service
 
 [Service]
-User=${user}
 PAMName=login
 TTYPath=/dev/tty2
 TTYReset=yes
@@ -622,6 +664,9 @@ ExecStart=/usr/bin/sway
 Restart=on-failure
 RestartSec=2
 EOF
+        mkdir -p "${path}/autovt@tty2.service.d"
+        printf '[Service]\nUser=%s\nEnvironmentFile=-/home/%s/.config/environment.d/50-provision.conf\n' \
+            "${user}" "${user}" >"${path}/autovt@tty2.service.d/user.conf"
         ln -s -f "/usr/lib/systemd/system/graphical.target" \
             "${path}/default.target"
         return 0
@@ -640,6 +685,7 @@ TTYPath=/dev/tty1
 TTYReset=yes
 TTYVHangup=yes
 Environment=XDG_SESSION_TYPE=wayland
+EnvironmentFile=-/home/%i/.config/environment.d/50-provision.conf
 ExecStart=/usr/bin/sway
 Restart=on-failure
 RestartSec=2
@@ -853,6 +899,24 @@ EOF
     fi
 }
 
+write_role_target() {
+    local mnt_path
+    mnt_path="${1}"
+    local role
+    role="${2}"
+    local description
+    description="${3}"
+
+    mkdir -p "${mnt_path}/etc/systemd/system"
+    cat <<EOF >"${mnt_path}/etc/systemd/system/role-${role}.target"
+[Unit]
+Description=Role ${role}: ${description}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
 enable_mpv_tv() {
     local mnt_path
     mnt_path="${1}"
@@ -928,7 +992,8 @@ EOF
 
         local system
         system="${mnt_path}/etc/systemd/system"
-        mkdir -p "${system}/graphical.target.wants"
+        write_role_target "${mnt_path}" tv "mpv TV on tty1"
+        mkdir -p "${system}/role-tv.target.wants"
         cat <<'EOF' >"${system}/tv-tty1@.service"
 [Unit]
 Description=mpv TV on tty1 as %i
@@ -945,22 +1010,25 @@ StandardInput=tty
 StandardOutput=journal
 StandardError=journal
 Environment=URL_TV=https://raw.githubusercontent.com/jnk22/kodinerds-iptv/master/iptv/clean/clean_tv.m3u
+EnvironmentFile=-/home/%i/.config/environment.d/50-provision.conf
 ExecStart=/usr/local/bin/mpv-tv-vt
 Restart=on-failure
 RestartSec=5s
 
 [Install]
-WantedBy=graphical.target
+WantedBy=role-tv.target
 EOF
         ln -s -f /etc/systemd/system/tv-tty1@.service \
-            "${system}/graphical.target.wants/tv-tty1@${user}.service"
+            "${system}/role-tv.target.wants/tv-tty1@${user}.service"
         return 0
     fi
 
+    write_role_target "${mnt_path}" tv "mpv TV inside sway"
     mkdir -p "${mnt_path}/etc/systemd/user/sway-session.target.wants"
     cat <<'EOF' >"${mnt_path}/etc/systemd/user/mpv-tv.service"
 [Unit]
 Description=mpv playing the TV playlist
+ConditionPathExists=/etc/systemd/system/multi-user.target.wants/role-tv.target
 PartOf=graphical-session.target
 After=graphical-session.target pipewire.service
 
@@ -1230,7 +1298,7 @@ Restart=on-failure
 [Install]
 WantedBy=bluetooth.target
 EOF
-        ln -s -f "${system}/bt-agent.service" \
+        ln -s -f "../bt-agent.service" \
             "${system}/bluetooth.target.wants/bt-agent.service"
     fi
 
@@ -1266,7 +1334,7 @@ ExecStart=/usr/local/bin/set-bt-discoverable
 [Install]
 WantedBy=bluetooth.target
 EOF
-    ln -s -f "${system}/set-bt-discoverable.service" \
+    ln -s -f "../set-bt-discoverable.service" \
         "${system}/bluetooth.target.wants/set-bt-discoverable.service"
 }
 
@@ -1289,7 +1357,7 @@ What=/swapfile
 WantedBy=swap.target
 EOF
     mkdir -p "${path}/swap.target.wants"
-    ln -s -f "${path}/swapfile.swap" "${path}/swap.target.wants/swapfile.swap"
+    ln -s -f "../swapfile.swap" "${path}/swap.target.wants/swapfile.swap"
 }
 
 # systemd only, OpenRC and BSD images never come here. A machine-id reading
@@ -1323,7 +1391,7 @@ provision_systemd_firstboot() {
     mkdir -p "${mnt_path}/usr/local/sbin"
     cat <<'EOF' >"${mnt_path}/usr/local/sbin/firstboot-provision"
 #!/bin/sh
-# Runs once from firstboot-provision.service, credentials arrive in
+# Runs once from firstboot-provision@<user>.service, credentials arrive in
 # $CREDENTIALS_DIRECTORY via ImportCredential=firstboot.*
 set -eu
 
@@ -1410,9 +1478,9 @@ fi
 EOF
     chmod 0755 "${mnt_path}/usr/local/sbin/firstboot-provision"
 
-    cat <<EOF >"${path}/firstboot-provision.service"
+    cat <<'EOF' >"${path}/firstboot-provision@.service"
 [Unit]
-Description=First-boot provisioning: grow root, swapfile, local root key
+Description=First-boot provisioning for %i: grow root, swapfile, local root key
 ConditionFirstBoot=yes
 DefaultDependencies=no
 After=systemd-remount-fs.service
@@ -1422,14 +1490,14 @@ Wants=first-boot-complete.target
 [Service]
 Type=oneshot
 ImportCredential=firstboot.*
-ExecStart=/usr/local/sbin/firstboot-provision "${user}"
+ExecStart=/usr/local/sbin/firstboot-provision %i
 
 [Install]
 WantedBy=sysinit.target
 EOF
     mkdir -p "${path}/sysinit.target.wants"
-    ln -s -f "${path}/firstboot-provision.service" \
-        "${path}/sysinit.target.wants/firstboot-provision.service"
+    ln -s -f "../firstboot-provision@.service" \
+        "${path}/sysinit.target.wants/firstboot-provision@${user}.service"
 
     write_swapfile_unit "${mnt_path}"
 }
@@ -1444,87 +1512,541 @@ write_provision_fetch() {
 
     [ -n "${user}" ] || return 0
 
-    cat <<'EOF' >"${mnt_path}/usr/local/sbin/fetch-provision"
-#!/bin/sh
-# Fetch this device's provisioning from the default gateway on first boot: the
-# image user's authorised ssh keys, and a WireGuard config for
-# systemd-networkd if the server has one. Runs after the network is up,
-# reports outcomes to the journal and console, never blocks boot. Exits
-# non-zero (visibly failed unit) only when it could not reach the server
-warn() { echo "provision: $*" >&2; }
-
-user="${1:-}"
-[ -n "${user}" ] && [ -d "/home/${user}" ] || {
-    warn "no image user home, nothing to provision"
-    exit 0
-}
-command -v curl >/dev/null 2>&1 || {
-    warn "curl not installed, cannot provision"
-    exit 1
-}
-gw="$(ip route show default 2>/dev/null | awk '/^default/ {print $3; exit}')"
-[ -n "${gw}" ] || {
-    warn "no default gateway, cannot reach provisioning server"
-    exit 1
-}
-base="http://${gw}/cgi-bin/provision"
-rc=0
-
-tmp="$(mktemp)" || exit 1
-if curl -fsS --max-time 10 -o "${tmp}" "${base}"; then
-    if [ -s "${tmp}" ]; then
-        ssh_dir="/home/${user}/.ssh"
-        ak="${ssh_dir}/authorized_keys"
-        install -d -m 0700 -o "${user}" -g "${user}" "${ssh_dir}"
-        cat "${tmp}" >>"${ak}"
-        sort -u -o "${ak}" "${ak}"
-        chown "${user}:${user}" "${ak}"
-        chmod 0600 "${ak}"
-        echo "provision: installed ssh keys for ${user}"
-    fi
-else
-    warn "could not fetch ssh keys from ${base}"
-    rc=1
-fi
-rm -f "${tmp}"
-
-# WireGuard for systemd-networkd, only if the server has a config for this
-# device. wg0.netdev carries the private key, so it is root:systemd-network 0640
-wg=0
-for f in wg0.netdev wg0.network; do
-    tmp="$(mktemp)" || continue
-    if curl -fsS --max-time 10 -o "${tmp}" "${base}?f=${f}" && [ -s "${tmp}" ]; then
-        install -m 0640 -o root -g systemd-network "${tmp}" "/etc/systemd/network/${f}"
-        wg=1
-    fi
-    rm -f "${tmp}"
-done
-if [ "${wg}" = 1 ]; then
-    networkctl reload 2>/dev/null || systemctl reload systemd-networkd 2>/dev/null || true
-    echo "provision: installed WireGuard config"
-fi
-
-exit "${rc}"
-EOF
-    chmod 0755 "${mnt_path}/usr/local/sbin/fetch-provision"
-
-    cat <<EOF >"${path}/fetch-provision.service"
+    cat <<'EOF' >"${path}/fetch-provision@.service"
 [Unit]
-Description=First-boot fetch of provisioning from the gateway (ssh keys, WireGuard)
+Description=First-boot fetch of provisioning from the provisioning host for %i (user, hostname, ssh keys, WireGuard)
 ConditionFirstBoot=yes
 After=network-online.target
 Wants=network-online.target
+Before=systemd-user-sessions.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/fetch-provision "${user}"
+TimeoutStartSec=120
+ExecStart=/usr/local/bin/provisioner fetch %i
 
 [Install]
 WantedBy=multi-user.target
 EOF
     mkdir -p "${path}/multi-user.target.wants"
-    ln -s -f "${path}/fetch-provision.service" \
-        "${path}/multi-user.target.wants/fetch-provision.service"
+    ln -s -f "../fetch-provision@.service" \
+        "${path}/multi-user.target.wants/fetch-provision@${user}.service"
+
+    cat <<'EOF' >"${mnt_path}/usr/local/sbin/provision-git-clone"
+#!/bin/sh
+# Shallow clones what provisioner fetch queued in /var/lib/provision/git-clone
+# (user, URL, destination, ref per line, tab separated), each as its user.
+# A destination that exists is left alone, what failed stays queued for the
+# next run
+list="${PROVISION_GIT_CLONE_LIST:-/var/lib/provision/git-clone}"
+warn() { echo "provision-git-clone: $*" >&2; }
+
+[ -s "${list}" ] || exit 0
+command -v git >/dev/null 2>&1 || {
+    warn "git not installed, cannot clone"
+    exit 1
+}
+
+left="$(mktemp)" || exit 1
+tab="$(printf '\t')"
+rc=0
+while IFS="${tab}" read -r user url dest ref; do
+    [ -n "${user}" ] && [ -n "${url}" ] && [ -n "${dest}" ] || continue
+    home="$(getent passwd "${user}" | cut -d: -f6)"
+    if [ -z "${home}" ]; then
+        warn "no user ${user}, dropping ${url}"
+        continue
+    fi
+    case "${dest}" in
+    \~/*) dest="${home}/${dest#??}" ;;
+    esac
+    if [ -e "${dest}" ]; then
+        echo "provision-git-clone: ${dest} exists, leaving it"
+        continue
+    fi
+    set -- git clone --quiet --depth 1
+    if [ -n "${ref}" ]; then
+        set -- "$@" --branch "${ref}"
+    fi
+    if runuser -u "${user}" -- mkdir -p "$(dirname "${dest}")" &&
+        runuser -u "${user}" -- "$@" -- "${url}" "${dest}"; then
+        echo "provision-git-clone: cloned ${url} to ${dest}"
+    else
+        warn "could not clone ${url} to ${dest}"
+        printf '%s\t%s\t%s\t%s\n' "${user}" "${url}" "${dest}" "${ref}" >>"${left}"
+        rc=1
+    fi
+done <"${list}"
+
+if [ -s "${left}" ]; then
+    mv -f "${left}" "${list}"
+else
+    rm -f "${left}" "${list}"
+fi
+exit "${rc}"
+EOF
+    chmod 0755 "${mnt_path}/usr/local/sbin/provision-git-clone"
+
+    cat <<'EOF' >"${path}/provision-git-clone.service"
+[Unit]
+Description=Shallow clones queued by first-boot provisioning
+ConditionPathExists=/var/lib/provision/git-clone
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/provision-git-clone
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    ln -s -f "../provision-git-clone.service" \
+        "${path}/multi-user.target.wants/provision-git-clone.service"
+
+    mkdir -p "${mnt_path}/etc/profile.d"
+    cat <<'EOF' >"${mnt_path}/etc/profile.d/provision-env.sh"
+# The variables provisioning set for this user, the same file systemd --user
+# reads, so a login shell sees what sway and user services see
+if [ -n "${HOME:-}" ] && [ -r "${HOME}/.config/environment.d/50-provision.conf" ]; then
+    while IFS= read -r provision_line; do
+        case "${provision_line}" in
+        [A-Za-z_]*=*) export "${provision_line%%=*}=${provision_line#*=}" ;;
+        esac
+    done <"${HOME}/.config/environment.d/50-provision.conf"
+    unset provision_line
+fi
+EOF
+
+    write_role_target "${mnt_path}" wg "WireGuard tunnel wg0"
+    cat <<'EOF' >"${path}/wg-up.service"
+[Unit]
+Description=Bring up WireGuard wg0
+After=systemd-networkd.service
+Requires=systemd-networkd.service
+PartOf=role-wg.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'for i in 1 2 3 4 5 6 7 8 9 10; do /usr/bin/networkctl up wg0 && exit 0; sleep 3; done; exit 1'
+ExecStop=/usr/bin/networkctl down wg0
+
+[Install]
+WantedBy=role-wg.target
+EOF
+    mkdir -p "${path}/role-wg.target.wants"
+    ln -s -f "../wg-up.service" "${path}/role-wg.target.wants/wg-up.service"
+}
+
+# The k8s-master and k8s-client roles, for a rootfs with kubeadm. Provisioning
+# leaves the cluster in /etc/provision/k8s.conf and a master's shared PKI in
+# /etc/provision/k8s-pki. Every node keeps the control-plane endpoint's name
+# resolvable through /usr/local/lib/k8s-endpoint/<method>, then the bootstrap
+# master runs kubeadm init and installs Cilium, other masters join as control
+# plane with the same PKI and clients join with the token, pinning the
+# cluster CA. Masters announce _k8s-api._tcp through systemd-resolved
+write_k8s_roles() {
+    local mnt_path
+    mnt_path="${1}"
+    local path
+    path="${mnt_path}/etc/systemd/system"
+
+    if [ ! -x "${mnt_path}/usr/bin/kubeadm" ]; then
+        debug "write_k8s_roles: no kubeadm in rootfs, skipping"
+        return 0
+    fi
+
+    mkdir -p "${mnt_path}/usr/local/sbin" "${mnt_path}/usr/local/lib/k8s-endpoint" "${path}"
+    write_role_target "${mnt_path}" k8s-master "Kubernetes control plane"
+    write_role_target "${mnt_path}" k8s-client "Kubernetes node"
+
+    cat <<'EOF' >"${mnt_path}/usr/local/sbin/k8s-prepare"
+#!/bin/sh
+# Kernel and containerd settings kubeadm expects
+set -eu
+. /etc/provision/k8s.conf
+
+modprobe overlay
+modprobe br_netfilter
+printf 'overlay\nbr_netfilter\n' >/etc/modules-load.d/k8s.conf
+cat >/etc/sysctl.d/90-k8s.conf <<SYSCTL
+net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
+net.bridge.bridge-nf-call-iptables = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+SYSCTL
+sysctl -q -p /etc/sysctl.d/90-k8s.conf
+
+mkdir -p /etc/containerd
+if [ ! -s /etc/containerd/config.toml ]; then
+    containerd config default >/etc/containerd/config.toml.new
+    mv /etc/containerd/config.toml.new /etc/containerd/config.toml
+fi
+if grep -q 'SystemdCgroup = false' /etc/containerd/config.toml; then
+    sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+    systemctl restart containerd.service
+fi
+systemctl enable --now containerd.service
+EOF
+
+    cat <<'EOF' >"${mnt_path}/usr/local/sbin/k8s-endpoint"
+#!/bin/sh
+# Keeps the control-plane endpoint's name resolvable the way the cluster says,
+# one script per method in /usr/local/lib/k8s-endpoint
+set -eu
+set -a
+. "${K8S_CONF:-/etc/provision/k8s.conf}"
+set +a
+lib="${K8S_ENDPOINT_LIB:-/usr/local/lib/k8s-endpoint}"
+if [ ! -x "${lib}/${K8S_ENDPOINT_METHOD}" ]; then
+    echo "k8s-endpoint: no method ${K8S_ENDPOINT_METHOD} in ${lib}" >&2
+    exit 1
+fi
+exec "${lib}/${K8S_ENDPOINT_METHOD}"
+EOF
+
+    cat <<'EOF' >"${mnt_path}/usr/local/lib/k8s-endpoint/mdns"
+#!/bin/sh
+# The masters of this cluster announce _k8s-api._tcp with TXT cluster=<name>;
+# their addresses become the endpoint's name in a marked block of /etc/hosts.
+# A master counts itself in once its API server runs, or when it is the one
+# to start the cluster. When nobody answers the block stays as it was
+set -eu
+hosts="${K8S_HOSTS_FILE:-/etc/hosts}"
+found="$(MDNS_SERVICE_FILTER=_k8s-api._tcp mdns-discover --output=json \
+    --timeout="${K8S_MDNS_TIMEOUT:-5s}" 2>/dev/null | python3 -c '
+import ipaddress, json, sys
+cluster = sys.argv[1]
+seen = []
+try:
+    entries = json.load(sys.stdin)
+except ValueError:
+    entries = []
+for e in entries if isinstance(entries, list) else []:
+    if not isinstance(e, dict) or e.get("txtMap", {}).get("cluster") != cluster:
+        continue
+    try:
+        a = ipaddress.ip_address(e.get("address", ""))
+    except ValueError:
+        continue
+    if a.is_link_local or a.is_loopback:
+        continue
+    if str(a) not in seen:
+        seen.append(str(a))
+seen.sort(key=lambda a: (ipaddress.ip_address(a).version, ipaddress.ip_address(a)))
+print("\n".join(seen))
+' "${K8S_CLUSTER}")" || found=""
+
+if [ "${K8S_ROLE}" = master ] && { [ "${K8S_BOOTSTRAP}" = yes ] || [ -s /etc/kubernetes/admin.conf ]; }; then
+    own="$(ip -4 route get 192.0.2.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p')"
+    if [ -n "${own}" ] && ! printf '%s\n' "${found}" | grep -qx "${own}"; then
+        found="$(printf '%s\n%s\n' "${own}" "${found}" | sed '/^$/d')"
+    fi
+fi
+
+if [ -z "${found}" ]; then
+    echo "k8s-endpoint: no master of cluster ${K8S_CLUSTER} answered on mDNS" >&2
+    grep -q "^# k8s-endpoint ${K8S_CLUSTER} begin$" "${hosts}" 2>/dev/null
+    exit
+fi
+
+new="$(mktemp)"
+awk -v c="${K8S_CLUSTER}" '
+    $0 == "# k8s-endpoint " c " begin" { skip = 1; next }
+    $0 == "# k8s-endpoint " c " end" { skip = 0; next }
+    !skip { print }' "${hosts}" >"${new}"
+{
+    printf '# k8s-endpoint %s begin\n' "${K8S_CLUSTER}"
+    printf '%s\n' "${found}" | while read -r a; do
+        printf '%s %s\n' "${a}" "${K8S_ENDPOINT_HOST}"
+    done
+    printf '# k8s-endpoint %s end\n' "${K8S_CLUSTER}"
+} >>"${new}"
+if cmp -s "${new}" "${hosts}"; then
+    rm -f "${new}"
+else
+    cat "${new}" >"${hosts}"
+    rm -f "${new}"
+    echo "k8s-endpoint: ${K8S_ENDPOINT_HOST} is $(printf '%s' "${found}" | tr '\n' ' ')"
+fi
+EOF
+
+    cat <<'EOF' >"${mnt_path}/usr/local/lib/k8s-endpoint/dns"
+#!/bin/sh
+# The endpoint's name is kept in DNS, e.g. the router's dnsmasq; only check it
+set -eu
+if ! getent ahosts "${K8S_ENDPOINT_HOST}" >/dev/null; then
+    echo "k8s-endpoint: ${K8S_ENDPOINT_HOST} does not resolve" >&2
+    exit 1
+fi
+EOF
+
+    cat <<'EOF' >"${mnt_path}/usr/local/sbin/k8s-node"
+#!/bin/sh
+# Brings this node into its cluster once: the bootstrap master runs kubeadm
+# init, another master joins as control plane, a client joins as a node. A
+# failed attempt is reset before the next one, and a master's shared PKI is
+# put back from /etc/provision/k8s-pki each time. A master announces its API
+# server over DNS-SD once it runs
+set -eu
+. /etc/provision/k8s.conf
+
+announce() {
+    mkdir -p /etc/systemd/dnssd /etc/systemd/resolved.conf.d /etc/systemd/network/20-dhcp.network.d
+    cat >/etc/systemd/dnssd/k8s-api.dnssd <<DNSSD
+[Service]
+Name=%H
+Type=_k8s-api._tcp
+Port=6443
+TxtText=cluster=${K8S_CLUSTER}
+DNSSD
+    printf '[Resolve]\nMulticastDNS=yes\n' >/etc/systemd/resolved.conf.d/k8s-mdns.conf
+    printf '[Network]\nMulticastDNS=yes\n' >/etc/systemd/network/20-dhcp.network.d/k8s-mdns.conf
+    networkctl reload
+    systemctl restart systemd-resolved.service
+}
+
+if [ -s /etc/kubernetes/kubelet.conf ]; then
+    exit 0
+fi
+if [ -e /var/lib/provision/k8s-attempt ]; then
+    kubeadm reset -f >/dev/null 2>&1 || true
+fi
+mkdir -p /var/lib/provision
+touch /var/lib/provision/k8s-attempt
+
+set -- --ignore-preflight-errors=Swap
+if [ "${K8S_ROLE}" = master ]; then
+    mkdir -p /etc/kubernetes
+    rm -rf /etc/kubernetes/pki
+    cp -a /etc/provision/k8s-pki /etc/kubernetes/pki
+fi
+
+if [ "${K8S_ROLE}" = master ] && [ "${K8S_BOOTSTRAP}" = yes ]; then
+    cat >/etc/kubernetes/kubeadm-init.yaml <<YAML
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: InitConfiguration
+bootstrapTokens:
+  - token: "${K8S_TOKEN}"
+    ttl: "0s"
+    usages: [signing, authentication]
+    groups: [system:bootstrappers:kubeadm:default-node-token]
+nodeRegistration:
+  name: "$(hostname)"
+---
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: ClusterConfiguration
+clusterName: "${K8S_CLUSTER}"
+controlPlaneEndpoint: "${K8S_ENDPOINT}"
+networking:
+  podSubnet: "${K8S_POD_CIDR}"
+  serviceSubnet: "${K8S_SERVICE_CIDR}"
+---
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+cgroupDriver: systemd
+failSwapOn: false
+memorySwap:
+  swapBehavior: NoSwap
+YAML
+    kubeadm init --config /etc/kubernetes/kubeadm-init.yaml "$@"
+    mkdir -p /root/.kube
+    install -m 0600 /etc/kubernetes/admin.conf /root/.kube/config
+    announce
+elif [ "${K8S_ROLE}" = master ]; then
+    kubeadm join "${K8S_ENDPOINT}" --control-plane --token "${K8S_TOKEN}" \
+        --discovery-token-ca-cert-hash "${K8S_CA_CERT_HASH}" "$@"
+    mkdir -p /root/.kube
+    install -m 0600 /etc/kubernetes/admin.conf /root/.kube/config
+    announce
+else
+    kubeadm join "${K8S_ENDPOINT}" --token "${K8S_TOKEN}" \
+        --discovery-token-ca-cert-hash "${K8S_CA_CERT_HASH}" "$@"
+fi
+rm -f /var/lib/provision/k8s-attempt
+echo "k8s-node: $(hostname) is in cluster ${K8S_CLUSTER} as ${K8S_ROLE}"
+EOF
+
+    cat <<'EOF' >"${mnt_path}/usr/local/sbin/k8s-cilium"
+#!/bin/sh
+# Cilium as the cluster's network, installed once from the bootstrap master
+# with the pod CIDR provisioning gave, Cilium's own default would cover 10/8
+set -eu
+. /etc/provision/k8s.conf
+[ "${K8S_ROLE}" = master ] && [ "${K8S_BOOTSTRAP}" = yes ] || exit 0
+export KUBECONFIG=/etc/kubernetes/admin.conf
+if cilium status >/dev/null 2>&1; then
+    exit 0
+fi
+cilium install --set ipam.mode=cluster-pool \
+    --set "ipam.operator.clusterPoolIPv4PodCIDRList={${K8S_POD_CIDR}}"
+cilium status --wait --wait-duration 10m
+EOF
+    chmod 0755 "${mnt_path}/usr/local/sbin/k8s-prepare" "${mnt_path}/usr/local/sbin/k8s-endpoint" \
+        "${mnt_path}/usr/local/sbin/k8s-node" "${mnt_path}/usr/local/sbin/k8s-cilium" \
+        "${mnt_path}/usr/local/lib/k8s-endpoint/mdns" "${mnt_path}/usr/local/lib/k8s-endpoint/dns"
+
+    cat <<'EOF' >"${path}/kubelet.service"
+[Unit]
+Description=kubelet, started and configured by kubeadm
+Wants=network-online.target containerd.service
+After=network-online.target containerd.service
+
+[Service]
+Environment="KUBELET_KUBECONFIG_ARGS=--bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf --kubeconfig=/etc/kubernetes/kubelet.conf"
+Environment="KUBELET_CONFIG_ARGS=--config=/var/lib/kubelet/config.yaml"
+EnvironmentFile=-/var/lib/kubelet/kubeadm-flags.env
+ExecStart=/usr/bin/kubelet $KUBELET_KUBECONFIG_ARGS $KUBELET_CONFIG_ARGS $KUBELET_KUBEADM_ARGS $KUBELET_EXTRA_ARGS
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=role-k8s-master.target role-k8s-client.target
+EOF
+
+    cat <<'EOF' >"${path}/k8s-prepare.service"
+[Unit]
+Description=Kernel, containerd and kubelet settings for Kubernetes
+ConditionPathExists=/etc/provision/k8s.conf
+After=systemd-networkd.service systemd-resolved.service
+PartOf=role-k8s-master.target role-k8s-client.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/k8s-prepare
+
+[Install]
+WantedBy=role-k8s-master.target role-k8s-client.target
+EOF
+
+    cat <<'EOF' >"${path}/k8s-endpoint.service"
+[Unit]
+Description=Resolve the Kubernetes control-plane endpoint
+ConditionPathExists=/etc/provision/k8s.conf
+Wants=network-online.target
+After=network-online.target k8s-prepare.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/k8s-endpoint
+EOF
+
+    cat <<'EOF' >"${path}/k8s-endpoint.timer"
+[Unit]
+Description=Keep the Kubernetes control-plane endpoint resolvable
+PartOf=role-k8s-master.target role-k8s-client.target
+
+[Timer]
+OnActiveSec=0
+OnUnitActiveSec=60s
+
+[Install]
+WantedBy=role-k8s-master.target role-k8s-client.target
+EOF
+
+    local role
+    for role in master client; do
+        cat <<EOF >"${path}/k8s-${role}.service"
+[Unit]
+Description=Bring this node into its Kubernetes cluster as ${role}
+ConditionPathExists=/etc/provision/k8s.conf
+ConditionPathExists=!/etc/kubernetes/kubelet.conf
+Wants=network-online.target containerd.service
+After=network-online.target containerd.service k8s-prepare.service k8s-endpoint.service
+Requires=k8s-prepare.service
+PartOf=role-k8s-${role}.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=/usr/local/sbin/k8s-endpoint
+ExecStart=/usr/local/sbin/k8s-node
+Restart=on-failure
+RestartSec=30
+TimeoutStartSec=15min
+
+[Install]
+WantedBy=role-k8s-${role}.target
+EOF
+    done
+
+    cat <<'EOF' >"${path}/k8s-cilium.service"
+[Unit]
+Description=Install Cilium from the bootstrap master
+ConditionPathExists=/etc/provision/k8s.conf
+After=k8s-master.service
+Requires=k8s-master.service
+PartOf=role-k8s-master.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/k8s-cilium
+Restart=on-failure
+RestartSec=60
+TimeoutStartSec=20min
+
+[Install]
+WantedBy=role-k8s-master.target
+EOF
+
+    local role_unit
+    for role in master client; do
+        mkdir -p "${path}/role-k8s-${role}.target.wants"
+        for role_unit in kubelet.service k8s-prepare.service k8s-endpoint.timer "k8s-${role}.service"; do
+            ln -s -f "../${role_unit}" "${path}/role-k8s-${role}.target.wants/${role_unit}"
+        done
+    done
+    ln -s -f "../k8s-cilium.service" "${path}/role-k8s-master.target.wants/k8s-cilium.service"
+}
+
+install_cilium_cli() {
+    local mnt_path
+    mnt_path="${1}"
+    local target_arch
+    target_arch="${2}"
+
+    if [ ! -x "${mnt_path}/usr/bin/kubeadm" ]; then
+        return 0
+    fi
+
+    local arch
+    local sha256
+    case "${target_arch}" in
+    amd64 | x86_64)
+        arch="amd64"
+        sha256="${cilium_cli_sha256_amd64}"
+        ;;
+    arm64 | aarch64)
+        arch="arm64"
+        sha256="${cilium_cli_sha256_arm64}"
+        ;;
+    *)
+        error "$(printf "install_cilium_cli: no cilium-cli for %s\n" "${target_arch}")"
+        exit 1
+        ;;
+    esac
+
+    local artifact
+    artifact="cilium-linux-${arch}.tar.gz"
+    local build_dir
+    build_dir="$(mktemp -d)"
+    if ! curl -fsSL -o "${build_dir}/${artifact}" \
+        "${cilium_cli_repo_url}/releases/download/${cilium_cli_version}/${artifact}"; then
+        error "$(printf "install_cilium_cli: failed to download %s\n" "${artifact}")"
+        rm -rf "${build_dir}"
+        exit 1
+    fi
+    if [ "$(sha256sum "${build_dir}/${artifact}" | cut -d' ' -f1)" != "${sha256}" ]; then
+        error "$(printf "install_cilium_cli: %s does not match its pinned sha256\n" "${artifact}")"
+        rm -rf "${build_dir}"
+        exit 1
+    fi
+    tar -C "${build_dir}" -xzf "${build_dir}/${artifact}" cilium
+    install -Dm755 "${build_dir}/cilium" "${mnt_path}/usr/local/bin/cilium"
+    rm -rf "${build_dir}"
 }
 
 wifi_enable() {
@@ -1611,7 +2133,7 @@ ExecStart=/usr/local/bin/booted
 WantedBy=getty.target
 EOF
 
-    ln -s -f "${path}/booted.service" "${path}/getty.target.wants/booted.service"
+    ln -s -f "../booted.service" "${path}/getty.target.wants/booted.service"
 }
 
 enable_systemd_resolved() {
@@ -1624,6 +2146,19 @@ enable_systemd_resolved() {
     ln -s -f /usr/lib/systemd/system/systemd-resolved.service \
         "${mnt_path}/etc/systemd/system/multi-user.target.wants/systemd-resolved.service"
     ln -s -f /run/systemd/resolve/stub-resolv.conf "${mnt_path}/etc/resolv.conf"
+}
+
+# network-online.target only waits for networkd's links with
+# wait-online enabled
+enable_systemd_networkd_wait_online() {
+    local mnt_path
+    mnt_path="${1}"
+
+    [ -f "${mnt_path}/usr/lib/systemd/system/systemd-networkd-wait-online.service" ] || return 0
+
+    mkdir -p "${mnt_path}/etc/systemd/system/network-online.target.wants"
+    ln -s -f /usr/lib/systemd/system/systemd-networkd-wait-online.service \
+        "${mnt_path}/etc/systemd/system/network-online.target.wants/systemd-networkd-wait-online.service"
 }
 
 enable_systemd_timesyncd() {
@@ -1669,6 +2204,7 @@ EOF
         mkdir -p "${mnt_path}/etc/systemd/system/multi-user.target.wants"
         ln -s -f "/usr/lib/systemd/system/systemd-networkd.service" \
             "${mnt_path}/etc/systemd/system/multi-user.target.wants/systemd-networkd.service"
+        enable_systemd_networkd_wait_online "${mnt_path}"
         enable_systemd_resolved "${mnt_path}"
         enable_systemd_timesyncd "${mnt_path}"
         ;;
@@ -1690,6 +2226,7 @@ EOF
         mkdir -p "${mnt_path}/etc/systemd/system/multi-user.target.wants"
         ln -s -f "/usr/lib/systemd/system/systemd-networkd.service" \
             "${mnt_path}/etc/systemd/system/multi-user.target.wants/systemd-networkd.service"
+        enable_systemd_networkd_wait_online "${mnt_path}"
         enable_systemd_resolved "${mnt_path}"
         enable_systemd_timesyncd "${mnt_path}"
         ;;
@@ -1728,8 +2265,8 @@ ExecStart=/bin/ip addr add ${net_address} dev ${net_device}
 ExecStart=/bin/ip route add default via ${net_gateway}
 EOF
 
-        ln -s -f "${path}/net-config.service" "${path}/getty.target.wants/net-config.service"
-        ln -s -f "${path}/net-interface.path" "${path}/getty.target.wants/net-config.path"
+        ln -s -f "../net-config.service" "${path}/getty.target.wants/net-config.service"
+        ln -s -f "../net-interface.path" "${path}/getty.target.wants/net-interface.path"
         ;;
     *)
         error "$(printf "write_net_config: unknown net_mode: %s\n" "${net_mode}")"
@@ -1763,6 +2300,77 @@ EOF
     mkdir -p "${path}/multi-user.target.wants"
     ln -s -f "/etc/systemd/system/network-debug.service" \
         "${path}/multi-user.target.wants/network-debug.service"
+}
+
+put_provisioner() {
+    local target_arch
+    target_arch="${1}"
+    local dest
+    dest="${2}"
+
+    local src
+    local build_dir
+    build_dir=""
+    if [ -n "${provisioner_bin_dir}" ]; then
+        for src in "${provisioner_bin_dir}/linux-${target_arch}/provisioner" "${provisioner_bin_dir}/provisioner"; do
+            [ -f "${src}" ] && break
+        done
+        if [ ! -f "${src}" ]; then
+            error "$(printf "put_provisioner: no provisioner for %s in %s\n" "${target_arch}" "${provisioner_bin_dir}")"
+            exit 1
+        fi
+    else
+        if [ -z "${provisioner_release_tag}" ]; then
+            error "$(printf "put_provisioner: set PROVISIONER_BIN_DIR or PROVISIONER_RELEASE_TAG\n")"
+            exit 1
+        fi
+        local artifact
+        artifact="provisioner-linux-${target_arch}-${provisioner_release_tag}.tar.xz"
+        build_dir="$(mktemp -d)"
+        if ! curl -fsSL -o "${build_dir}/${artifact}" \
+            "${provisioner_repo_url}/releases/download/${provisioner_release_tag}/${artifact}"; then
+            error "$(printf "put_provisioner: failed to download %s\n" "${artifact}")"
+            rm -rf "${build_dir}"
+            exit 1
+        fi
+        tar -C "${build_dir}" -xf "${build_dir}/${artifact}" provisioner
+        src="${build_dir}/provisioner"
+    fi
+    mkdir -p "$(dirname "${dest}")"
+    install -m 0755 "${src}" "${dest}"
+    [ -z "${build_dir}" ] || rm -rf "${build_dir}"
+}
+
+install_provisioner() {
+    local mnt_path
+    mnt_path="${1}"
+    local target_arch
+    target_arch="${2}"
+
+    put_provisioner "${target_arch}" "${mnt_path}/usr/local/bin/provisioner"
+}
+
+install_mdns_discover() {
+    local mnt_path
+    mnt_path="${1}"
+    local target_arch
+    target_arch="${2}"
+
+    local artifact
+    artifact="mdns-discover-linux-${target_arch}-${mdns_discover_release_tag}.tar.xz"
+    local build_dir
+    build_dir="$(mktemp -d)"
+
+    if ! curl -fsSL -o "${build_dir}/${artifact}" \
+        "${mdns_discover_repo_url}/releases/download/${mdns_discover_release_tag}/${artifact}"; then
+        error "$(printf "install_mdns_discover: failed to download %s\n" "${artifact}")"
+        rm -rf "${build_dir}"
+        exit 1
+    fi
+
+    tar -C "${build_dir}" -xf "${build_dir}/${artifact}" mdns-discover
+    install -Dm755 "${build_dir}/mdns-discover" "${mnt_path}/usr/local/bin/mdns-discover"
+    rm -rf "${build_dir}"
 }
 
 add_dhcp_client() {
@@ -1810,7 +2418,7 @@ WantedBy=multi-user.target
 EOF
 
     mkdir -p "${path}/multi-user.target.wants"
-    ln -s -f "${path}/net-dhcp.service" "${path}/multi-user.target.wants/net-dhcp.service"
+    ln -s -f "../net-dhcp.service" "${path}/multi-user.target.wants/net-dhcp.service"
 }
 
 # Install a unit that mounts whatever virtio-9p shares the host exported
@@ -1901,7 +2509,7 @@ WantedBy=multi-user.target
 EOF
 
     mkdir -p "${path}/multi-user.target.wants"
-    ln -s -f "${path}/9p-automount.service" \
+    ln -s -f "../9p-automount.service" \
         "${path}/multi-user.target.wants/9p-automount.service"
 }
 
@@ -1989,6 +2597,8 @@ create_boot_entry() {
     cmdline="${7}"
     local dtb
     dtb="${8:-}"
+    local sort_key
+    sort_key="${9:-}"
 
     local entry_dir
     entry_dir="$(dirname -- "${entry_file}")"
@@ -2027,6 +2637,10 @@ create_boot_entry() {
 
         if [ -n "${options}" ]; then
             printf "options       %s\n" "${options}"
+        fi
+
+        if [ -n "${sort_key}" ]; then
+            printf "sort-key      %s\n" "${sort_key}"
         fi
     } >"${entry_file}"
 }
@@ -2243,6 +2857,44 @@ gpt_type_code() {
     esac
 }
 
+# FreeBSD's UFS image mounts its root from /dev/gpt/rootfs, so its slot
+# keeps that GPT name. Every other slot is named after itself
+partition_name() {
+    local i
+    i="${1}"
+
+    if [ "freebsd" = "${comp_provider[$i]}" ] && [ "ufs" = "${comp_fs[$i]}" ]; then
+        echo "rootfs"
+        return 0
+    fi
+    echo "${comp_name[$i]}"
+}
+
+# Root on ZFS needs the pool imported before the root mount. FreeBSD's
+# kernel does that itself, Linux leaves it to an initramfs, which these
+# images do not have
+rootfs_fs_check() {
+    case "${linux_rootfs_fs}" in
+    xfs) ;;
+    zfs)
+        error "$(printf "LINUX_ROOTFS_FS=zfs: Linux can not import a root pool without an initramfs yet\n")"
+        return 1
+        ;;
+    *)
+        error "$(printf "LINUX_ROOTFS_FS must be xfs or zfs, not '%s'\n" "${linux_rootfs_fs}")"
+        return 1
+        ;;
+    esac
+
+    case "${freebsd_rootfs_fs}" in
+    ufs | zfs) ;;
+    *)
+        error "$(printf "FREEBSD_ROOTFS_FS must be ufs or zfs, not '%s'\n" "${freebsd_rootfs_fs}")"
+        return 1
+        ;;
+    esac
+}
+
 esp_partition_name() {
     local i
     for i in "${!comp_provider[@]}"; do
@@ -2291,7 +2943,7 @@ create_disk_parts_gpt() {
         local fs_hint
         fs_hint="$(parted_fs_hint "${comp_fs[$i]}")"
 
-        parted -s "${file_disk}" mkpart "${comp_name[$i]}" \
+        parted -s "${file_disk}" mkpart "$(partition_name "${i}")" \
             ${fs_hint:+"${fs_hint}"} \
             "${start}MiB" "${end}"
         sgdisk -t "${comp_part[$i]}:$(gpt_type_code "${comp_fs[$i]}")" \
@@ -2358,6 +3010,7 @@ composition_reset() {
     comp_disk_size=""
     comp_esp_size=256
     comp_default=""
+    comp_default_saved=""
     esp_installed=""
 }
 
@@ -2393,6 +3046,60 @@ composition_set_dtb() {
     i=$((${#comp_name[@]} - 1))
     comp_dtb_src[i]="${1}"
     comp_dtb[i]="${2}"
+}
+
+# The hardware kernels linux-kernel-build publishes per arch, as
+# "BOARD KERNEL DTB" lines, DTB "-" for none. All of them are built without
+# modules, so any of them can boot the one Gentoo root of that arch
+gentoo_hardware_kernels() {
+    case "${1}" in
+    amd64 | x86_64)
+        printf '%s\n' "x230 bzImage-x230 -" "x201 bzImage-x201 -"
+        ;;
+    arm64 | aarch64)
+        printf '%s\n' "pine64 Image-pine64 dtb-pine64" \
+            "rockpro64 Image-rockpro64 dtb-rockpro64"
+        ;;
+    esac
+}
+
+# One boot entry per hardware kernel, each booting the partition of the
+# slot named ROOT_SLOT rather than one of its own
+composition_add_gentoo_kernels() {
+    local target_arch
+    target_arch="${1}"
+    local root_slot
+    root_slot="${2}"
+
+    local board kernel dtb
+    while read -r board kernel dtb; do
+        composition_add "gentoo-sway-${board}" \
+            "gentoo-kernel" \
+            "${root_slot}" \
+            "none" \
+            "0" \
+            "${kernel}-latest" \
+            "${kernel}" \
+            "" \
+            "" \
+            "$(linux_cmdline_default "${target_arch}" "gentoo-sway-${board}") $(linux_cmdline_firstboot)" \
+            "linux"
+        if [ "-" != "${dtb}" ]; then
+            composition_set_dtb "${dtb}-latest" "${dtb}"
+        fi
+    done < <(gentoo_hardware_kernels "${target_arch}")
+}
+
+# The partition number of the slot called NAME
+composition_part_of() {
+    local i
+    for i in "${!comp_name[@]}"; do
+        if [ "${1}" = "${comp_name[$i]}" ]; then
+            echo "${comp_part[$i]}"
+            return 0
+        fi
+    done
+    return 1
 }
 
 comp_count() {
@@ -2467,6 +3174,14 @@ composition_exclude() {
     local freed
     freed=0
     local i
+    for i in "${!comp_name[@]}"; do
+        if [ "gentoo-kernel" = "${comp_provider[$i]}" ]; then
+            case " ${excluded[*]} " in
+            *" ${comp_provider_arg[$i]} "*) excluded+=("${comp_name[$i]}") ;;
+            esac
+        fi
+    done
+
     for i in "${!comp_name[@]}"; do
         case " ${excluded[*]} " in
         *" ${comp_name[$i]} "*)
@@ -2661,12 +3376,13 @@ composition_load() {
     target_arch="${2}"
 
     composition_reset
+    rootfs_fs_check || exit 1
 
     local kernel_file
     local kernel_src
 
     case "$build_target" in
-    gentoo-containeros | gentoo-sway | gentoo-sway-virt | gentoo-sway-pine64 | gentoo-sway-rockpro64)
+    gentoo-containeros | gentoo-k8s | gentoo-sway | gentoo-sway-virt | gentoo-sway-pine64 | gentoo-sway-rockpro64)
         local target_flavour
         target_flavour=${build_target#*gentoo-}
         target_flavour=${target_flavour%-pine64}
@@ -2720,7 +3436,7 @@ composition_load() {
             composition_add "freebsd" \
                 "freebsd" \
                 "${target_arch}" \
-                "zfs" \
+                "${freebsd_rootfs_fs}" \
                 "${freebsd_slot_size}" \
                 "${freebsd_loader_file}" \
                 "EFI/freebsd/loader.efi" \
@@ -2749,7 +3465,7 @@ composition_load() {
         composition_add "gentoo-${target_flavour}" \
             "gentoo" \
             "${target_flavour}" \
-            "xfs" \
+            "${linux_rootfs_fs}" \
             "rest" \
             "${kernel_file}-latest" \
             "${kernel_file}" \
@@ -2759,6 +3475,13 @@ composition_load() {
             "linux"
         if [ -n "${dtb_file}" ]; then
             composition_set_dtb "${dtb_file}-latest" "${dtb_file}"
+        fi
+        # The sway rootfs carries the graphics stack for every machine of
+        # its arch, so gentoo-sway boots any of them from the same root and
+        # each machine keeps booting the entry it was last started with
+        if [ "gentoo-sway" = "${build_target}" ]; then
+            composition_add_gentoo_kernels "${target_arch}" "gentoo-${target_flavour}"
+            comp_default_saved=1
         fi
         composition_add_refind "${target_arch}"
         ;;
@@ -2777,7 +3500,7 @@ composition_load() {
         composition_add "gentoo-containeros" \
             "gentoo" \
             "containeros" \
-            "xfs" \
+            "${linux_rootfs_fs}" \
             "10240" \
             "${kernel_src}" \
             "${kernel_file}" \
@@ -2874,6 +3597,35 @@ composition_load() {
     composition_pin_bsd_rootdev
 }
 
+composition_fetch_kernel() {
+    local download_path
+    download_path="${1}"
+    local i
+    i="${2}"
+
+    info "Fetching kernel"
+    download_miss "${download_path}" \
+        "${kernel_repo_url}/${comp_kernel_src[$i]}" \
+        "${kernel_repo_url}/${comp_kernel_src[$i]}.sha384" \
+        "${comp_kernel_src[$i]}.sha384"
+    if [ -n "${comp_dtb_src[$i]}" ]; then
+        info "Fetching device tree"
+        # Optional: the kernel release only carries a dtb once
+        # linux-kernel-build emits one. Until then boot on U-Boot's
+        # own device tree. The subshell contains download_miss's exit
+        if ! (
+            download_miss "${download_path}" \
+                "${kernel_repo_url}/${comp_dtb_src[$i]}" \
+                "${kernel_repo_url}/${comp_dtb_src[$i]}.sha384" \
+                "${comp_dtb_src[$i]}.sha384"
+        ); then
+            info "$(printf "Device tree %s not published, booting on U-Boot's own\n" "${comp_dtb_src[$i]}")"
+            comp_dtb_src[i]=""
+            comp_dtb[i]=""
+        fi
+    fi
+}
+
 # Fetch and stage everything the slots need before the disk image is
 # created, so a failed download does not leave a half-built image
 composition_fetch() {
@@ -2885,29 +3637,11 @@ composition_fetch() {
     local i
     for i in "${!comp_name[@]}"; do
         case "${comp_provider[$i]}" in
+        gentoo-kernel)
+            composition_fetch_kernel "${download_path}" "${i}"
+            ;;
         gentoo)
-            info "Fetching kernel"
-            download_miss "${download_path}" \
-                "${kernel_repo_url}/${comp_kernel_src[$i]}" \
-                "${kernel_repo_url}/${comp_kernel_src[$i]}.sha384" \
-                "${comp_kernel_src[$i]}.sha384"
-            if [ -n "${comp_dtb_src[$i]}" ]; then
-                info "Fetching device tree"
-                # Optional: the kernel release only carries a dtb once
-                # linux-kernel-build emits one. Until then boot on U-Boot's
-                # own device tree. The subshell contains download_miss's exit
-                if ! (
-                    download_miss "${download_path}" \
-                        "${kernel_repo_url}/${comp_dtb_src[$i]}" \
-                        "${kernel_repo_url}/${comp_dtb_src[$i]}.sha384" \
-                        "${comp_dtb_src[$i]}.sha384"
-                ); then
-                    info "$(printf "Device tree %s not published, booting on U-Boot's own\n" "${comp_dtb_src[$i]}")"
-                    comp_dtb_src[i]=""
-                    comp_dtb[i]=""
-                fi
-            fi
-
+            composition_fetch_kernel "${download_path}" "${i}"
             gentoo_fetch_stage3 "${target_arch}"
             gentoo_fetch_stage4 "${comp_provider_arg[$i]}" "${target_arch}" "latest"
             ;;
@@ -2946,6 +3680,8 @@ composition_fetch() {
             exit 1
         fi
     done
+
+    u_root_stage_bb "${download_path}" "${target_arch}"
 }
 
 # Create each slot's filesystem. UFS slots are skipped: their
@@ -3018,7 +3754,7 @@ install_rootfs_slots() {
             bsd_install_fs "FreeBSD" \
                 "$(freebsd_image_path "${src_path}" "${comp_provider_arg[$i]}")" \
                 "${dev}" \
-                "zfs"
+                "${comp_fs[$i]}"
             ;;
         9front)
             bsd_install_fs "9front" \
@@ -3428,11 +4164,18 @@ release_image_fetch() {
 }
 
 freebsd_image_file() {
-    printf "freebsd-%s-%s.img" "${freebsd_image_version}" \
-        "$(freebsd_image_arch "${1}")"
+    printf "freebsd-%s-%s-%s.img" "${freebsd_image_version}" \
+        "$(freebsd_image_arch "${1}")" "${freebsd_rootfs_fs}"
 }
 
 freebsd_release_file() {
+    printf "freebsd-%s-%s-%s-latest" "${freebsd_image_version}" \
+        "$(freebsd_image_arch "${1}")" "${freebsd_rootfs_fs}"
+}
+
+# Releases from before the UFS image carry the ZFS one without the
+# filesystem in its name
+freebsd_legacy_release_file() {
     printf "freebsd-%s-%s-latest" "${freebsd_image_version}" \
         "$(freebsd_image_arch "${1}")"
 }
@@ -3466,15 +4209,28 @@ freebsd_image_fetch() {
         return 0
     fi
 
-    if ! release_image_fetch "FreeBSD" "${download_path}" \
+    if release_image_fetch "FreeBSD" "${download_path}" \
         "${freebsd_image_repo_url}" \
         "$(freebsd_release_file "${target_arch}")" \
         "$(freebsd_image_path "${download_path}" "${target_arch}")" \
         "${download_path}/${freebsd_loader_file}"; then
-        error "Set FREEBSD_REPO_URL to a release carrying it, or"
-        error "FREEBSD_IMAGE to an already built image"
-        exit 1
+        return 0
     fi
+
+    if [ "zfs" = "${freebsd_rootfs_fs}" ]; then
+        info "$(printf "FreeBSD: Trying the release's unsuffixed ZFS image\n")"
+        if release_image_fetch "FreeBSD" "${download_path}" \
+            "${freebsd_image_repo_url}" \
+            "$(freebsd_legacy_release_file "${target_arch}")" \
+            "$(freebsd_image_path "${download_path}" "${target_arch}")" \
+            "${download_path}/${freebsd_loader_file}"; then
+            return 0
+        fi
+    fi
+
+    error "Set FREEBSD_REPO_URL to a release carrying it, or"
+    error "FREEBSD_IMAGE to an already built image"
+    exit 1
 }
 
 ninefront_require_arch() {
@@ -3696,8 +4452,12 @@ part_dev() {
     echo "/dev/loop0p${part_no}"
 }
 
+esp_part_no() {
+    echo 2
+}
+
 esp() {
-    part_dev 2
+    part_dev "$(esp_part_no)"
 }
 
 # The first rootfs partition. Compositions with several of them address
@@ -4050,6 +4810,214 @@ esp_install_file() {
     esp_installed="$(printf "%s\n%s" "${esp_installed}" "${dest}")"
 }
 
+provision_pins() {
+    local pins
+    pins="${1}"
+
+    local list
+    IFS=';' read -r -a list <<<"${pins}"
+
+    local out
+    out=""
+    local pin
+    for pin in "${list[@]}"; do
+        pin="$(trim "${pin}")"
+        [ -n "${pin}" ] || continue
+        pin="sha256//${pin#sha256//}"
+        if ! [[ "${pin}" =~ ^sha256//[A-Za-z0-9+/]{43}=$ ]]; then
+            error "$(printf "provision_pins: Not a sha256 public key pin: %s\n" "${pin}")"
+            return 1
+        fi
+        out="${out:+${out};}${pin}"
+    done
+
+    printf "%s" "${out}"
+}
+
+provision_pem_check() {
+    local file
+    file="${1}"
+    local block
+    block="${2}"
+
+    if [ ! -r "${file}" ]; then
+        error "$(printf "provision_pem_check: Can not read %s\n" "${file}")"
+        return 1
+    fi
+    if ! grep -qE -- "-----BEGIN ${block}-----" "${file}"; then
+        error "$(printf "provision_pem_check: No PEM %s in %s\n" "${block}" "${file}")"
+        return 1
+    fi
+}
+
+provision_trust_check() {
+    local ca_cert
+    ca_cert="${1}"
+    local pins
+    pins="${2}"
+    local client_cert
+    client_cert="${3:-}"
+    local client_key
+    client_key="${4:-}"
+
+    if [ -n "${ca_cert}" ]; then
+        provision_pem_check "${ca_cert}" "CERTIFICATE" || return 1
+    fi
+
+    if [ -n "${client_cert}" ] || [ -n "${client_key}" ]; then
+        if [ -z "${client_cert}" ] || [ -z "${client_key}" ]; then
+            error "$(printf "provision_trust_check: A client certificate and its key go together\n")"
+            return 1
+        fi
+        provision_pem_check "${client_cert}" "CERTIFICATE" || return 1
+        provision_pem_check "${client_key}" "([A-Z]+ )?PRIVATE KEY" || return 1
+        if command -v openssl >/dev/null 2>&1 &&
+            [ "$(openssl x509 -noout -pubkey -in "${client_cert}" 2>/dev/null)" != \
+                "$(openssl pkey -pubout -in "${client_key}" 2>/dev/null)" ]; then
+            error "$(printf "provision_trust_check: %s is not the key of %s\n" "${client_key}" "${client_cert}")"
+            return 1
+        fi
+    fi
+
+    provision_pins "${pins}" >/dev/null
+}
+
+esp_install_provision_files() {
+    local mnt_path
+    mnt_path="${1}"
+    local ca_cert
+    ca_cert="${2}"
+    local pins
+    pins="${3}"
+    local client_cert
+    client_cert="${4:-}"
+    local client_key
+    client_key="${5:-}"
+
+    provision_trust_check "${ca_cert}" "${pins}" "${client_cert}" "${client_key}" || return 1
+
+    local pin
+    pin="$(provision_pins "${pins}")" || return 1
+
+    mkdir -p "${mnt_path}/provision" || return 1
+
+    local src
+    local dest
+    for src in "${ca_cert}:ca.pem" "${client_cert}:client.pem" "${client_key}:client.key"; do
+        dest="${src##*:}"
+        src="${src%:*}"
+        [ -n "${src}" ] || continue
+        info "$(printf "Installing %s to ESP as /provision/%s\n" "${src}" "${dest}")"
+        cp "${src}" "${mnt_path}/provision/${dest}" || return 1
+    done
+
+    if [ -n "${pin}" ]; then
+        info "$(printf "Installing %s to ESP as /provision/pinnedpubkey\n" "${pin}")"
+        printf "%s\n" "${pin}" >"${mnt_path}/provision/pinnedpubkey" || return 1
+    fi
+}
+
+install_provision_files() {
+    local esp_dev
+    esp_dev="${1}"
+    local mnt_path
+    mnt_path="${2}"
+
+    if [ -z "${provision_ca_cert}${provision_pinned_pubkey}${provision_client_cert}${provision_client_key}" ]; then
+        return 0
+    fi
+
+    esp_mount "${esp_dev}" "${mnt_path}"
+
+    if ! esp_install_provision_files "${mnt_path}" \
+        "${provision_ca_cert}" \
+        "${provision_pinned_pubkey}" \
+        "${provision_client_cert}" \
+        "${provision_client_key}"; then
+        unmount_recursive "${mnt_path}"
+        exit 1
+    fi
+
+    unmount_recursive "${mnt_path}"
+}
+
+provision_certs() {
+    local disk
+    disk="${1}"
+    local client_cert
+    client_cert="${2}"
+    local client_key
+    client_key="${3}"
+    local ca_cert
+    ca_cert="${4}"
+
+    if [ -z "${disk}" ]; then
+        error "$(printf "provision_certs: Missing disk image or device\n")"
+        return 1
+    fi
+
+    if [ ! -e "${disk}" ]; then
+        error "$(printf "provision_certs: Can not find %s\n" "${disk}")"
+        return 1
+    fi
+
+    if [ -z "${client_cert}${client_key}${ca_cert}${provision_pinned_pubkey}" ]; then
+        error "$(printf "provision_certs: Pass a client certificate and key, or set PROVISION_CLIENT_CERT, PROVISION_CLIENT_KEY, PROVISION_CA_CERT or PROVISION_PINNED_PUBKEY\n")"
+        return 1
+    fi
+
+    provision_trust_check "${ca_cert}" "${provision_pinned_pubkey}" \
+        "${client_cert}" "${client_key}" || return 1
+
+    local mnt_path
+    mnt_path="$(mktemp -d)"
+
+    local attached
+    if ! attached="$(disk_esp_attach "${disk}" "${mnt_path}")"; then
+        rmdir "${mnt_path}"
+        return 1
+    fi
+
+    local ret
+    ret=0
+    esp_install_provision_files "${mnt_path}" "${ca_cert}" "${provision_pinned_pubkey}" \
+        "${client_cert}" "${client_key}" || ret=1
+
+    disk_esp_detach "${mnt_path}" "${attached}"
+    rmdir "${mnt_path}" 2>/dev/null || true
+
+    return "${ret}"
+}
+
+provision_add_trust() {
+    local disk
+    disk="${1}"
+    local name
+    name="${2}"
+
+    if [[ ! "${name}" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]; then
+        error "$(printf "provision_add_trust: Not a device name: %s\n" "${name}")"
+        return 1
+    fi
+
+    local dir
+    dir="${cfg_provision}/certs/${name}"
+    local f
+    for f in "${name}.pem" "${name}.key" ca.pem; do
+        if [ ! -s "${dir}/${f}" ]; then
+            error "$(printf "provision_add_trust: No %s, run provisioner config %s or set CFG_PROVISION\n" "${dir}/${f}" "${name}")"
+            return 1
+        fi
+    done
+
+    if [ "subject=CN=${name}" != "$(openssl x509 -noout -subject -nameopt RFC2253 -in "${dir}/${name}.pem" 2>/dev/null)" ]; then
+        error "$(printf "provision_add_trust: %s is not the certificate of CN=%s\n" "${dir}/${name}.pem" "${name}")"
+        return 1
+    fi
+
+    provision_certs "${disk}" "${dir}/${name}.pem" "${dir}/${name}.key" "${dir}/ca.pem"
+}
+
 # Put every slot's kernel and initrd on the ESP under its own name, so
 # one image can boot several systems
 install_kernels() {
@@ -4120,11 +5088,22 @@ install_boot_entries() {
 
         # A Linux slot needs to be told its root filesystem; an EFI
         # loader finds its own
+        local root_part
+        root_part="${comp_part[$i]}"
+        if [ "gentoo-kernel" = "${comp_provider[$i]}" ]; then
+            if ! root_part="$(composition_part_of "${comp_provider_arg[$i]}")"; then
+                error "$(printf "install_boot_entries: %s boots %s, which is not in this image\n" \
+                    "${entry_id}" "${comp_provider_arg[$i]}")"
+                unmount_recursive "${mnt_path}"
+                exit 1
+            fi
+        fi
+
         local root_spec
         root_spec=""
-        if [ "linux" = "${comp_boot_type[$i]}" ] && [ 0 != "${comp_part[$i]}" ]; then
+        if [ "linux" = "${comp_boot_type[$i]}" ] && [ 0 != "${root_part}" ]; then
             local part
-            part="$(part_dev "${comp_part[$i]}")"
+            part="$(part_dev "${root_part}")"
             local partuuid
             partuuid="$(blkid -o value -s PARTUUID "${part}")"
             if [ -z "${partuuid}" ]; then
@@ -4136,6 +5115,18 @@ install_boot_entries() {
             root_spec="PARTUUID=${partuuid}"
         fi
 
+        # With nothing saved yet, systemd-boot's @saved falls back to the
+        # first entry in sort order, so the default entry sorts first
+        local sort_key
+        sort_key=""
+        if [ -n "${comp_default_saved}" ]; then
+            if [ "${entry_id}" = "${comp_default}" ]; then
+                sort_key="a"
+            else
+                sort_key="$(printf 'b-%02d' "${i}")"
+            fi
+        fi
+
         create_boot_entry "${entry_file}" \
             "${entry_id}" \
             "${comp_boot_type[$i]}" \
@@ -4143,7 +5134,8 @@ install_boot_entries() {
             "${comp_initrd[$i]}" \
             "${root_spec}" \
             "${comp_cmdline[$i]}" \
-            "${comp_dtb[$i]}"
+            "${comp_dtb[$i]}" \
+            "${sort_key}"
 
         if [ -z "${default_entry}" ]; then
             default_entry="${entry_id}"
@@ -4158,20 +5150,266 @@ install_boot_entries() {
         default_entry="${comp_default}"
     fi
 
+    local loader_default
+    loader_default="${default_entry}.conf"
+    if [ -n "${comp_default_saved}" ]; then
+        loader_default="@saved"
+    fi
+
     if [ -z "${default_entry}" ]; then
         info "No bootable slots: not writing loader.conf"
     else
         cat <<EOF >"${mnt_path}/loader/loader.conf"
-default ${default_entry}.conf
+default ${loader_default}
 timeout 5
 console-mode keep
 editor no
 EOF
-        info "$(printf "Default boot entry: %s\n" "${default_entry}")"
+        if [ -n "${comp_default_saved}" ]; then
+            info "$(printf "Default boot entry: the one last booted, %s until then\n" "${default_entry}")"
+        else
+            info "$(printf "Default boot entry: %s\n" "${default_entry}")"
+        fi
     fi
 
     unmount_recursive "${mnt_path}"
     sleep 1
+}
+
+# Mount the ESP of a disk image or device at MNT. Prints what
+# disk_esp_detach needs to undo it
+disk_esp_attach() {
+    local disk
+    disk="${1}"
+    local mnt_path
+    mnt_path="${2}"
+
+    case "$(sys_os)" in
+    macos)
+        local dev
+        local attached
+        attached=""
+        case "${disk}" in
+        /dev/*)
+            dev="${disk}"
+            ;;
+        *)
+            dev="$(hdiutil attach -imagekey diskimage-class=CRawDiskImage \
+                -nomount "${disk}" | awk 'NR == 1 { print $1 }')"
+            if [ -z "${dev}" ]; then
+                error "$(printf "Failed to attach %s\n" "${disk}")"
+                return 1
+            fi
+            attached="${dev}"
+            ;;
+        esac
+
+        if ! diskutil mount -mountPoint "${mnt_path}" "${dev}s$(esp_part_no)" >&2; then
+            error "$(printf "Failed to mount the ESP of %s\n" "${disk}")"
+            if [ -n "${attached}" ]; then
+                hdiutil detach "${attached}" >&2
+            fi
+            return 1
+        fi
+
+        printf "%s" "${attached}"
+        ;;
+    *)
+        loop_mount "${disk}" >&2
+        esp_mount "$(esp)" "${mnt_path}" >&2
+        ;;
+    esac
+}
+
+disk_esp_detach() {
+    local mnt_path
+    mnt_path="${1}"
+    local attached
+    attached="${2}"
+
+    case "$(sys_os)" in
+    macos)
+        diskutil unmount "${mnt_path}" >&2
+        if [ -n "${attached}" ]; then
+            hdiutil detach "${attached}" >&2
+        fi
+        ;;
+    *)
+        unmount_recursive "${mnt_path}" >&2
+        loop_unmount "" >&2
+        ;;
+    esac
+}
+
+# The ESP's boot entries in systemd-boot's menu order: by sort-key,
+# then by name, entries without a sort-key last
+boot_entries() {
+    local mnt_path
+    mnt_path="${1}"
+
+    local f
+    for f in "${mnt_path}"/loader/entries/*.conf; do
+        [ -e "${f}" ] || continue
+        local id
+        id="$(basename "${f}" .conf)"
+        local key
+        key="$(awk '$1 == "sort-key" { print $2; exit }' "${f}")"
+        if [ -n "${key}" ]; then
+            printf '0 %s %s\n' "${key}" "${id}"
+        else
+            printf '1 - %s\n' "${id}"
+        fi
+    done | LC_ALL=C sort -k1,1 -k2,2 -k3,3 | awk '{ print $3 }'
+}
+
+loader_default() {
+    awk '$1 == "default" { print $2; exit }' "${1}/loader/loader.conf" 2>/dev/null
+}
+
+# Replace loader.conf's default, keeping the rest of it
+loader_set_default() {
+    local mnt_path
+    mnt_path="${1}"
+    local value
+    value="${2}"
+
+    local conf
+    conf="${mnt_path}/loader/loader.conf"
+    local rest
+    rest=""
+    if [ -f "${conf}" ]; then
+        rest="$(awk '$1 != "default"' "${conf}")"
+    fi
+
+    {
+        printf 'default %s\n' "${value}"
+        if [ -n "${rest}" ]; then
+            printf '%s\n' "${rest}"
+        fi
+    } >"${conf}"
+}
+
+# The loader.conf default for a choice from set_default_boot's list:
+# its number, an entry's name or @saved, the number after the entries
+boot_entry_choose() {
+    local choice
+    choice="${1}"
+    shift
+    local entries
+    entries=("$@")
+
+    if [[ "${choice}" =~ ^[0-9]+$ ]]; then
+        if [ "${choice}" -ge 1 ] && [ "${choice}" -le "${#entries[@]}" ]; then
+            echo "${entries[$((choice - 1))]}.conf"
+            return 0
+        fi
+        if [ "${choice}" -eq $((${#entries[@]} + 1)) ]; then
+            echo "@saved"
+            return 0
+        fi
+        return 1
+    fi
+
+    if [ "@saved" = "${choice}" ]; then
+        echo "@saved"
+        return 0
+    fi
+
+    local e
+    for e in "${entries[@]}"; do
+        if [ "${e}" = "${choice}" ] || [ "${e}.conf" = "${choice}" ]; then
+            echo "${e}.conf"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# List the boot entries on a disk image or device and make the chosen
+# one systemd-boot's default. CHOICE, a number or name from the list,
+# skips the question
+set_default_boot() {
+    local disk
+    disk="${1}"
+    local choice
+    choice="${2:-}"
+
+    if [ -z "${disk}" ]; then
+        error "$(printf "set_default_boot: Missing disk image or device\n")"
+        return 1
+    fi
+
+    if [ ! -e "${disk}" ]; then
+        error "$(printf "set_default_boot: Can not find %s\n" "${disk}")"
+        return 1
+    fi
+
+    local mnt_path
+    mnt_path="$(mktemp -d)"
+
+    local attached
+    if ! attached="$(disk_esp_attach "${disk}" "${mnt_path}")"; then
+        rmdir "${mnt_path}"
+        return 1
+    fi
+
+    local entries
+    mapfile -t entries < <(boot_entries "${mnt_path}")
+
+    local ret
+    ret=0
+
+    if [ 0 -eq "${#entries[@]}" ]; then
+        error "$(printf "set_default_boot: %s has no boot entries\n" "${disk}")"
+        ret=1
+    else
+        local current
+        current="$(loader_default "${mnt_path}")"
+
+        printf "Boot entries on %s:\n\n" "${disk}"
+        local n
+        n=1
+        local e
+        for e in "${entries[@]}" "@saved"; do
+            local label
+            label="${e}"
+            if [ "@saved" = "${e}" ]; then
+                label="the one last booted (@saved)"
+            else
+                e="${e}.conf"
+            fi
+            local mark
+            mark=""
+            if [ "${e}" = "${current}" ]; then
+                mark="  (default)"
+            fi
+            printf "  %2d) %s%s\n" "${n}" "${label}" "${mark}"
+            n=$((n + 1))
+        done
+        printf "\n"
+
+        if [ -z "${choice}" ]; then
+            printf "New default, Enter keeps %s: " "${current:-none}"
+            read -r choice || true
+        fi
+
+        local value
+        if [ -z "${choice}" ]; then
+            printf "Default boot entry unchanged: %s\n" "${current:-none}"
+        elif value="$(boot_entry_choose "${choice}" "${entries[@]}")"; then
+            loader_set_default "${mnt_path}" "${value}"
+            printf "Default boot entry: %s\n" "${value}"
+        else
+            error "$(printf "set_default_boot: No boot entry %s\n" "${choice}")"
+            ret=1
+        fi
+    fi
+
+    disk_esp_detach "${mnt_path}" "${attached}"
+    rmdir "${mnt_path}" 2>/dev/null || true
+
+    return "${ret}"
 }
 
 sys_os() {
@@ -4613,7 +5851,18 @@ build_freebsd_release() {
     local release_flags
     release_flags=("${mk_flags[@]}" NODISTSETS=yes NOPKGBASE=yes NOPKG=yes NOPORTS=yes NOSRC=yes MK_INCLUDES=no)
 
-    info "$(printf "Building FreeBSD %s ZFS image (%s)\n" "${version}" "${target_arch}")"
+    local fs
+    for fs in ${freebsd_build_fs}; do
+        case "${fs}" in
+        ufs | zfs) ;;
+        *)
+            error "$(printf "FREEBSD_BUILD_FS takes ufs and zfs, not '%s'\n" "${fs}")"
+            exit 1
+            ;;
+        esac
+    done
+
+    info "$(printf "Building FreeBSD %s images (%s): %s\n" "${version}" "${target_arch}" "${freebsd_build_fs}")"
     freebsd_check_system_toolchain "${src_dir}" "${target_arch}"
 
     # Guest disk writes land in a qemu overlay on the CI runner
@@ -4630,8 +5879,11 @@ build_freebsd_release() {
     release_objdir="$(make -C "${src_dir}/release" "${release_flags[@]}" -V .OBJDIR)"
     # vm-image is a stamp target and mk-vmimage.sh refuses nothing on a
     # second run, so clear what an earlier build left behind
-    rm -rf "${release_objdir}/vm-image" "${release_objdir}/vm-image-raw-zfs" \
-        "${release_objdir}/raw.zfs.img" "${release_objdir}/vm.zfs.raw"
+    rm -rf "${release_objdir}/vm-image"
+    for fs in ${freebsd_build_fs}; do
+        rm -rf "${release_objdir}/vm-image-raw-${fs}" \
+            "${release_objdir}/raw.${fs}.img" "${release_objdir}/vm.${fs}.raw"
+    done
 
     local vm_conf
     vm_conf="$(freebsd_vm_image_config)"
@@ -4644,22 +5896,24 @@ build_freebsd_release() {
     # it to fill the disk on first boot
     FREEBSD_VM_ROOT_PASSWORD="${freebsd_ci_root_password}" \
         make -C "${src_dir}/release" "${release_flags[@]}" \
-        WITH_VMIMAGES=yes VMFORMATS=raw VMFSLIST=zfs VMSIZE=2048m \
+        WITH_VMIMAGES=yes VMFORMATS=raw VMFSLIST="${freebsd_build_fs}" VMSIZE=2048m \
         NO_ROOT=yes WITHOUT_QEMU=yes VM_IMAGE_CONFIG="${vm_conf}" \
         vm-image
     rm -f "${vm_conf}"
 
     # Makefile.vm runs mk-vmimage.sh with "|| true", so a failed image
     # build only shows as a missing image
-    local vm_image
-    vm_image="${release_objdir}/vm.zfs.raw"
-    if [ ! -s "${vm_image}" ]; then
-        error "$(printf "build_freebsd_release: %s was not built\n" "${vm_image}")"
-        exit 1
-    fi
+    for fs in ${freebsd_build_fs}; do
+        local vm_image
+        vm_image="${release_objdir}/vm.${fs}.raw"
+        if [ ! -s "${vm_image}" ]; then
+            error "$(printf "build_freebsd_release: %s was not built\n" "${vm_image}")"
+            exit 1
+        fi
 
-    cp "${vm_image}" "${src_dir}/freebsd-${target_arch}.img"
-    info "$(printf "Built %s/freebsd-%s.img\n" "${src_dir}" "${target_arch}")"
+        cp "${vm_image}" "${src_dir}/freebsd-${target_arch}-${fs}.img"
+        info "$(printf "Built %s/freebsd-%s-%s.img\n" "${src_dir}" "${target_arch}" "${fs}")"
+    done
 }
 
 # Write a VM_IMAGE_CONFIG for release/Makefile.vm and print its path.
@@ -4702,7 +5956,6 @@ growfs_enable="YES"
 growfs_swap_size="0"
 pf_enable="YES"
 linux_enable="YES"
-containers_dataset_enable="YES"
 EOF
 
 	# containernetworking-plugins' pf.conf.sample, which only arrives
@@ -4723,7 +5976,12 @@ EOF
 		metalog_add_data ./etc/pf.conf
 
 	# makefs only creates the datasets vmimage.subr's buildfs names, so
-	# podman's dataset is made on first boot instead, next to growfs
+	# podman's dataset is made on first boot instead, next to growfs.
+	# mk-vmimage.sh runs this once per filesystem, a UFS root has no pool
+	if [ "${VMFS}" != zfs ]; then
+		return 0
+	fi
+	echo 'containers_dataset_enable="YES"' >>"${DESTDIR}/etc/rc.conf"
 	mkdir -p "${DESTDIR}/usr/local/etc/rc.d"
 	cat >"${DESTDIR}/usr/local/etc/rc.d/containers_dataset" <<'EOF'
 #!/bin/sh
@@ -5052,7 +6310,26 @@ gentoo_fetch_stage3() {
     local gentoo_stage3_url
     gentoo_stage3_url="${gentoo_stage3_repo_url}/${gentoo_stage3_file}"
 
-    download "${gentoo_stage3_url}" "${path}" "16"
+    # The release's .sha256 is a signed message, the hash sits on the
+    # line naming the file
+    download "${gentoo_stage3_url}.sha256" "${path}" "3"
+    local digest
+    digest="$(mktemp)"
+    grep "[[:space:]]${gentoo_stage3_file}\$" "${path:-.}/${gentoo_stage3_file}.sha256" >"${digest}" || true
+
+    local stage3
+    stage3="${path:-.}/${gentoo_stage3_file}"
+    if [ -f "${stage3}" ] && checksum_verify "${digest}" "${stage3}" sha256; then
+        info "$(printf "Skipping download: %s exists\n" "${gentoo_stage3_file}")"
+    else
+        download "${gentoo_stage3_url}" "${path}" "16"
+        if ! checksum_verify "${digest}" "${stage3}" sha256; then
+            error "$(printf "gentoo_fetch_stage3: %s does not match its sha256\n" "${gentoo_stage3_file}")"
+            rm -f "${digest}"
+            exit 1
+        fi
+    fi
+    rm -f "${digest}"
 }
 
 # We also use this in a github-action
@@ -5130,6 +6407,93 @@ u_root_fetch() {
     fi
 }
 
+u_root_bb_file() {
+    printf "u-root-bb-%s" "${1}"
+}
+
+# Take bb out of the published initramfs for U_ROOT_COMMANDS, after making
+# sure it carries every one of them
+u_root_stage_bb() {
+    local download_path
+    download_path="${1}"
+    local target_arch
+    target_arch="${2}"
+
+    [ -n "${u_root_commands}" ] || return 0
+
+    if ! command -v cpio >/dev/null 2>&1; then
+        error "$(printf "u-root: U_ROOT_COMMANDS needs cpio to unpack the initramfs\n")"
+        exit 1
+    fi
+
+    u_root_fetch "${download_path}" "${target_arch}"
+
+    local initramfs
+    initramfs="${download_path}/initramfs-${target_arch}.cpio"
+
+    local available
+    available="$(cpio -it <"${initramfs}" 2>/dev/null | sed -n 's|^bbin/||p')"
+
+    local missing
+    missing=""
+    local cmd
+    for cmd in ${u_root_commands}; do
+        if ! printf '%s\n' "${available}" | grep -qx -- "${cmd}"; then
+            missing="${missing:+${missing} }${cmd}"
+        fi
+    done
+    if [ -n "${missing}" ]; then
+        error "$(printf "u-root: The initramfs has no %s\n" "${missing}")"
+        error "$(printf "u-root: It carries %s\n" "$(printf '%s' "${available}" | tr '\n' ' ')")"
+        exit 1
+    fi
+
+    local tmp
+    tmp="$(mktemp -d)"
+    (cd "${tmp}" && cpio -id --quiet bbin/bb) <"${initramfs}"
+    if [ ! -s "${tmp}/bbin/bb" ]; then
+        error "$(printf "u-root: No bbin/bb in %s\n" "${initramfs}")"
+        rm -rf "${tmp}"
+        exit 1
+    fi
+    install -m 0755 "${tmp}/bbin/bb" "${download_path}/$(u_root_bb_file "${target_arch}")"
+    rm -rf "${tmp}"
+
+    info "$(printf "u-root: Staged bb for %s\n" "${u_root_commands}")"
+}
+
+# bb runs the command its argv[0] names, so each command is a link to it
+install_u_root_commands() {
+    local mnt_path
+    mnt_path="${1}"
+    local user
+    user="${2}"
+    local bb_src
+    bb_src="${3}"
+
+    [ -n "${u_root_commands}" ] || return 0
+    [ -n "${user}" ] || return 0
+
+    if [ ! -s "${bb_src}" ]; then
+        error "$(printf "u-root: bb was not staged: %s\n" "${bb_src}")"
+        exit 1
+    fi
+
+    local bin
+    bin="${mnt_path}/home/${user}/.local/bin"
+    mkdir -p "${bin}"
+    install -m 0755 "${bb_src}" "${bin}/bb"
+
+    local cmd
+    for cmd in ${u_root_commands}; do
+        if [ "bb" != "${cmd}" ]; then
+            ln -s -f bb "${bin}/${cmd}"
+        fi
+    done
+
+    local_bin_on_path "${mnt_path}"
+}
+
 build_u_root() {
     local target_arch
     target_arch="$1"
@@ -5171,16 +6535,18 @@ openwrt_build() {
     git_fresh_clone openwrt -b "${branch}" "${openwrt_source_url}"
     cd openwrt
     git_fresh_clone openwrt-config "${openwrt_config_url}"
-    mv openwrt-config/openwrt-config-"$flavour" .config
     # Files the image carries on top of its packages, per flavour, e.g.
-    # first boot uci-defaults. The build copies files/ into the rootfs
+    # first boot uci-defaults. The build copies files/ into the rootfs.
+    # Flavours sharing an overlay link files-<flavour> to it, so links
+    # are followed
     if [ -d openwrt-config/files-"$flavour" ]; then
-        cp -R openwrt-config/files-"$flavour" files
+        cp -RL openwrt-config/files-"$flavour" files
     fi
 
     # Package feeds
     ./scripts/feeds update -a
     ./scripts/feeds install -a
+    mv openwrt-config/openwrt-config-"$flavour" .config
 
     # Signing
     if [ -n "${OPENWRT_APK_PRIVATE_KEY:-}" ]; then
@@ -5194,7 +6560,31 @@ openwrt_build() {
     # to list what differs from the defaults.
     make defconfig
 
+    # The provisioning endpoint: routers whose overlay runs
+    # provisioner fetch-profiles need provisioner, which also serves as
+    # provisioner router
+    if [ -f files/etc/init.d/fetch-profiles ]; then
+        local go_arch
+        go_arch="$(openwrt_go_arch .config)" || exit 1
+        put_provisioner "${go_arch}" files/usr/sbin/provisioner
+    fi
+
     make V=s
+}
+
+openwrt_go_arch() {
+    local arch
+    arch="$(sed -n 's/^CONFIG_ARCH="\(.*\)"$/\1/p' "${1}")"
+    case "${arch}" in
+    mips) echo mips ;;
+    mipsel) echo mipsle ;;
+    aarch64) echo arm64 ;;
+    x86_64) echo amd64 ;;
+    *)
+        error "$(printf "openwrt_go_arch: no Go architecture for %s\n" "${arch}")"
+        exit 1
+        ;;
+    esac
 }
 
 install_file() {
@@ -5525,6 +6915,44 @@ EOF
 # filesystem snapshot, so a plain tar overlay would leave the binary
 # packages sitting unmerged - chroot in and emerge --usepkg them,
 # same as emerge.sh did to build them in the first place
+# The Portage snapshot, as YYYYMMDD, the stage4's binpkgs were built
+# against: GENTOO_PORTAGE_SNAPSHOT, else the date gentoo-build records in
+# the stage4. Syncing that same snapshot keeps every binpkg matching its
+# ebuild, a newer tree makes portage drop binpkgs whose USE or deps moved
+gentoo_portage_snapshot() {
+    local mnt_path
+    mnt_path="${1}"
+
+    local snapshot
+    snapshot="${GENTOO_PORTAGE_SNAPSHOT:-}"
+    if [ -z "${snapshot}" ] && [ -r "${mnt_path}/etc/gentoo-build/portage-snapshot" ]; then
+        snapshot="$(tr -d '[:space:]' <"${mnt_path}/etc/gentoo-build/portage-snapshot")"
+    fi
+
+    case "${snapshot}" in
+    "") ;;
+    [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]) printf '%s' "${snapshot}" ;;
+    *)
+        error "$(printf "Gentoo: Portage snapshot is not a YYYYMMDD date: %s\n" "${snapshot}")"
+        exit 1
+        ;;
+    esac
+}
+
+# The overlays to register: GENTOO_OVERLAYS, else the ones gentoo-build
+# records in the stage4. Binpkgs built from an overlay ebuild only match
+# that ebuild, the main tree's version of the package is a different one
+gentoo_stage4_overlays() {
+    local mnt_path
+    mnt_path="${1}"
+
+    if [ -n "${GENTOO_OVERLAYS:-}" ]; then
+        printf '%s' "${GENTOO_OVERLAYS}"
+    elif [ -r "${mnt_path}/etc/gentoo-build/overlays" ]; then
+        tr -s '[:space:]' ' ' <"${mnt_path}/etc/gentoo-build/overlays" | sed 's/^ //; s/ $//'
+    fi
+}
+
 gentoo_install_stage4_binpkgs() {
     local target_flavour
     target_flavour="${1}"
@@ -5564,8 +6992,10 @@ gentoo_install_stage4_binpkgs() {
         ;;
     esac
 
-    if [ -n "${GENTOO_OVERLAYS}" ]; then
-        gentoo_add_overlays "${mnt_path}" "${GENTOO_OVERLAYS}"
+    local overlays
+    overlays="$(gentoo_stage4_overlays "${mnt_path}")"
+    if [ -n "${overlays}" ]; then
+        gentoo_add_overlays "${mnt_path}" "${overlays}"
         verify_stage_fs "${rootfs_dev}" "${mnt_path}" "stage4: overlays"
     fi
 
@@ -5574,8 +7004,16 @@ gentoo_install_stage4_binpkgs() {
 
     chroot_mounts "${mnt_path}"
 
-    info "$(printf "Gentoo: Syncing Portage tree\n")"
-    chroot "${mnt_path}" emerge-webrsync
+    local snapshot
+    snapshot="$(gentoo_portage_snapshot "${mnt_path}")"
+    if [ -n "${snapshot}" ]; then
+        info "$(printf "Gentoo: Syncing Portage tree to the stage4's snapshot %s\n" "${snapshot}")"
+        gentoo_sync_portage_snapshot "${mnt_path}" "${snapshot}"
+    else
+        info "$(printf "Gentoo: The stage4 records no Portage snapshot, syncing the latest\n")"
+        info "$(printf "Gentoo: Packages the tree has moved on from get rebuilt from source\n")"
+        chroot "${mnt_path}" emerge-webrsync
+    fi
     verify_stage_fs "${rootfs_dev}" "${mnt_path}" "stage4: emerge-webrsync" 1
 
     # Mirror gentoo-build/emerge.sh's set list per flavour - keep in
@@ -5584,6 +7022,9 @@ gentoo_install_stage4_binpkgs() {
     case "${target_flavour}" in
     containeros)
         sets="@containers @essentials @net"
+        ;;
+    k8s)
+        sets="@k8s @essentials @net"
         ;;
     sway)
         sets="@dev @dev-lang @sway @essentials @virt @net"
@@ -5624,8 +7065,11 @@ gentoo_install_stage4_binpkgs() {
     # source, while --newuse --update reconciles USE-flag differences
     # against what stage3 already has installed (e.g. iptables)
     # instead of erroring out on the resulting slot conflict
+    # Merging binpkgs mostly waits on syncing after each package and on
+    # one merge at a time; the sync below covers the whole merge instead
     # shellcheck disable=SC2086 # $sets is an intentional word-split set list
-    chroot "${mnt_path}" env -u TARGET emerge --usepkg --newuse --update --getbinpkg=n ${sets}
+    chroot "${mnt_path}" env -u TARGET FEATURES="-merge-sync -merge-wait parallel-install" \
+        emerge --jobs="$(nproc)" --usepkg --newuse --update --getbinpkg=n ${sets}
 
     # Diagnostic: confirm the merge actually landed on this mount before
     # unmounting, so a future "file missing after boot" report can be
@@ -5636,6 +7080,42 @@ gentoo_install_stage4_binpkgs() {
     sync
 
     unmount_recursive "${mnt_path}"
+}
+
+# Sync the Portage tree to a dated snapshot, reusing the tarball an
+# earlier run downloaded: emerge-webrsync --keep looks in DISTDIR first
+gentoo_sync_portage_snapshot() {
+    local mnt_path
+    mnt_path="${1}"
+    local snapshot
+    snapshot="${2}"
+
+    local distdir
+    distdir="${mnt_path}$(chroot "${mnt_path}" portageq distdir)"
+    mkdir -p "${distdir}"
+
+    local files
+    files=("gentoo-${snapshot}.tar.xz" "gentoo-${snapshot}.tar.xz.md5sum" "gentoo-${snapshot}.tar.xz.gpgsig")
+
+    local f
+    for f in "${files[@]}"; do
+        if [ -s "${f}" ]; then
+            cp "${f}" "${distdir}/"
+        fi
+    done
+
+    chroot "${mnt_path}" emerge-webrsync --keep --revert="${snapshot}"
+    local ret
+    ret=$?
+
+    for f in "${files[@]}"; do
+        if [ ! -s "${f}" ] && [ -s "${distdir}/${f}" ]; then
+            cp "${distdir}/${f}" .
+        fi
+        rm -f "${distdir}/${f}"
+    done
+
+    return "${ret}"
 }
 
 set_default_root_pw() {
@@ -5839,6 +7319,12 @@ provision() {
     info "Installing fonts"
     install_fonts "${mnt_path}/home/${user}/.local/share/fonts"
 
+    if [ -n "${u_root_commands}" ]; then
+        info "$(printf "Installing u-root commands: %s\n" "${u_root_commands}")"
+        install_u_root_commands "${mnt_path}" "${user}" \
+            "${path:-.}/$(u_root_bb_file "${target_arch}")"
+    fi
+
     info "Fixing home ownership"
     chown_home "${mnt_path}" "${user}"
 
@@ -5875,6 +7361,10 @@ provision() {
         info "systemd rootfs: installing first-boot provisioning"
         provision_systemd_firstboot "${mnt_path}" "${user}"
         write_provision_fetch "${mnt_path}" "${user}"
+        install_provisioner "${mnt_path}" "${target_arch}"
+        install_mdns_discover "${mnt_path}" "${target_arch}"
+        write_k8s_roles "${mnt_path}"
+        install_cilium_cli "${mnt_path}" "${target_arch}"
     else
         debug "no systemd in rootfs: skipping first-boot provisioning and swapfile"
     fi
@@ -6492,7 +7982,7 @@ ExecReload=/bin/kill -HUP $MAINPID
 KillMode=process
 EOF
 
-    ln -s -f "${path}/${service}.service" "${path}/${target}.target.wants/${service}.service"
+    ln -s -f "../${service}.service" "${path}/${target}.target.wants/${service}.service"
 }
 
 # Create a dedicated bridge network
@@ -6566,7 +8056,7 @@ boot_test_pattern() {
     fi
 
     case "${provider}" in
-    gentoo)
+    gentoo | gentoo-kernel)
         # systemd has started a getty on the serial console
         echo "login:"
         ;;
@@ -6599,6 +8089,20 @@ boot_test_fail_pattern() {
     echo "Kernel panic|not syncing|No bootable option|Boot failed|mountroot: waiting|Fatal error"
 }
 
+# Why boot-test leaves slot I out, empty when it boots it. A hardware
+# kernel is only booted when the slot is asked for by name, qemu stands in
+# for neither the laptops nor the boards
+boot_test_skip_reason() {
+    local i
+    i="${1}"
+    local only_slot
+    only_slot="${2:-}"
+
+    if [ "gentoo-kernel" = "${comp_provider[$i]}" ] && [ -z "${only_slot}" ]; then
+        echo "hardware kernel, boot-test it by name"
+    fi
+}
+
 # Point systemd-boot at one entry, so a slot can be booted without
 # driving the menu. Prints the loader.conf it replaced
 boot_test_select_entry() {
@@ -6609,21 +8113,21 @@ boot_test_select_entry() {
     local entry_id
     entry_id="${3}"
 
-    loop_mount "${disk_file}"
+    loop_mount "${disk_file}" >&2
 
     local esp_dev
     esp_dev="$(esp)"
 
-    esp_mount "${esp_dev}" "${mnt_path}"
+    esp_mount "${esp_dev}" "${mnt_path}" >&2
 
     local entry_file
     entry_file="${mnt_path}/loader/entries/${entry_id}.conf"
 
     if [ ! -f "${entry_file}" ]; then
         error "$(printf "boot-test: The image has no boot entry '%s'\n" "${entry_id}")"
-        ls "${mnt_path}/loader/entries" || true
-        unmount_recursive "${mnt_path}"
-        loop_unmount ""
+        ls "${mnt_path}/loader/entries" >&2 || true
+        unmount_recursive "${mnt_path}" >&2
+        loop_unmount "" >&2
         return 1
     fi
 
@@ -6639,8 +8143,8 @@ console-mode keep
 editor no
 EOF
 
-    unmount_recursive "${mnt_path}"
-    loop_unmount ""
+    unmount_recursive "${mnt_path}" >&2
+    loop_unmount "" >&2
 
     printf "%s" "${previous}"
 }
@@ -6897,13 +8401,16 @@ show_usage() {
     printf "    image-builder install\n"
     printf "    image-builder mount      PARTITION_NUMBER\n"
     printf "    image-builder provision  PARTITION_NUMBER\n"
+    printf "    image-builder provision-add-trust DISK NAME\n"
+    printf "    image-builder provision-certs DISK [CLIENT_CERT CLIENT_KEY [CA_CERT]]\n"
     printf "    image-builder run        TARGET [ARCH]\n"
+    printf "    image-builder set-default-boot DISK [ENTRY]\n"
     printf "    image-builder write      TARGET DEVICE [ARCH]\n"
     printf "\n"
     printf "\n"
     printf "  build TARGET      alpine-containeros[-BOARD] | alpine-sway[-BOARD] |\n"
     printf "                    freebsd |\n"
-    printf "                    gentoo-containeros | gentoo-sway |\n"
+    printf "                    gentoo-containeros | gentoo-k8s | gentoo-sway |\n"
     printf "                    gentoo-sway-pine64 | gentoo-sway-rockpro64 |\n"
     printf "                    gentoo-sway-virt |\n"
     printf "                    gentoo-stage3 | linux-kernel | nanobsd |\n"
@@ -6912,7 +8419,7 @@ show_usage() {
     printf "  create TARGET     9front | alma | alpine-containeros[-BOARD] |\n"
     printf "                    alpine-sway[-BOARD] |\n"
     printf "                    containeros-virt | freebsd |\n"
-    printf "                    gentoo-containeros | gentoo-sway |\n"
+    printf "                    gentoo-containeros | gentoo-k8s | gentoo-sway |\n"
     printf "                    gentoo-sway-pine64 | gentoo-sway-rockpro64 |\n"
     printf "                    gentoo-sway-virt | nomadbsd\n"
     printf "\n"
@@ -6920,7 +8427,14 @@ show_usage() {
     printf "  BOARD             rpi0 | rpi0w | rpi1 | rpi2 | rpi02w | rpi3 |\n"
     printf "                    rpi4 | rpi5 | pine64 | rockpro64 | x230\n"
     printf "                    A board pins the architecture it can run\n"
+    printf "  CA_CERT           A PEM certificate provisioner fetch verifies the\n"
+    printf "                    provisioning host against, defaults to\n"
+    printf "                    PROVISION_CA_CERT\n"
+    printf "  CLIENT_CERT       The device's PEM client certificate and its key,\n"
+    printf "  CLIENT_KEY        default to PROVISION_CLIENT_CERT and _KEY\n"
     printf "  DEVICE            A raw block device e.g. /dev/sdX, /dev/mmcblk0\n"
+    printf "  DISK              A disk image or device, e.g. gentoo-sway-arm64.raw\n"
+    printf "  ENTRY             A boot entry's number or name, or @saved\n"
     printf "  PARTITION_NUMBER  A partition number to work on\n"
     printf "  SLOT              A slot name to boot-test on its own\n"
     printf "\n"
@@ -6938,6 +8452,28 @@ show_usage() {
     printf "  the amd64/arm64 FreeBSD bbusse/freebsd-build publishes, next to\n"
     printf "  NomadBSD. FREEBSD_VERSION, FREEBSD_REPO_URL and FREEBSD_IMAGE\n"
     printf "  choose the image like their NOMADBSD_* counterparts\n"
+    printf "\n"
+    printf "  U_ROOT_COMMANDS, a space separated list such as \"gosh netcat\",\n"
+    printf "  links those commands of the published u-root initramfs's bb into\n"
+    printf "  the image user's ~/.local/bin, which comes first on PATH\n"
+    printf "\n"
+    printf "  FREEBSD_ROOTFS_FS picks the FreeBSD slot's ufs or zfs image, zfs\n"
+    printf "  by default. LINUX_ROOTFS_FS is the Gentoo root's filesystem, xfs;\n"
+    printf "  zfs is refused until Linux can import a root pool without an\n"
+    printf "  initramfs. build freebsd makes an image per FREEBSD_BUILD_FS\n"
+    printf "  filesystem, \"ufs zfs\" by default\n"
+    printf "\n"
+    printf "  Gentoo images fetch a provisioning TOML (user, hostname, ssh keys,\n"
+    printf "  WireGuard) from the provisioning host on first boot, before logins\n"
+    printf "  are allowed: the first _provision._tcp service found over mDNS,\n"
+    printf "  else the default gateway, on port 8443. The device identifies\n"
+    printf "  itself with a client certificate, without one it fetches nothing.\n"
+    printf "  PROVISION_CA_CERT verifies the provisioning host's certificate and\n"
+    printf "  PROVISION_PINNED_PUBKEY, sha256//BASE64 pins separated by ;, its\n"
+    printf "  public key. All of it goes on the ESP under /provision, by create\n"
+    printf "  or later by provision-certs, or by provision-add-trust, which takes\n"
+    printf "  device NAME's from cfg-provision's certs/NAME/ (CFG_PROVISION,\n"
+    printf "  default ../cfg-provision)\n"
     printf "\n"
     printf "  write puts U-Boot on a pine64 card after the image, taken from\n"
     printf "  UBOOT_IMAGE or the FreeBSD, Debian or Fedora U-Boot package\n"
@@ -7088,6 +8624,13 @@ main() {
             build_gentoo_stage4 "$target_flavour" "$target_arch"
             return
             ;;
+        gentoo-k8s)
+            local target_flavour
+            target_flavour="k8s"
+
+            build_gentoo_stage4 "$target_flavour" "$target_arch"
+            return
+            ;;
         gentoo-sway)
             local target_flavour
             target_flavour="sway"
@@ -7187,6 +8730,11 @@ main() {
     # Create disk image
     if [ "create" == "${1}" ]; then
         reexec_privileged "$@"
+
+        if ! provision_trust_check "${provision_ca_cert}" "${provision_pinned_pubkey}" \
+            "${provision_client_cert}" "${provision_client_key}"; then
+            exit 1
+        fi
 
         local build_target
         build_target="${2}"
@@ -7295,7 +8843,7 @@ main() {
             #                "${ansible_roles}"
             exit 0
             ;;
-        gentoo-containeros | gentoo-sway | gentoo-sway-virt | gentoo-sway-pine64 | gentoo-sway-rockpro64 | containeros-virt | nomadbsd | 9front)
+        gentoo-containeros | gentoo-k8s | gentoo-sway | gentoo-sway-virt | gentoo-sway-pine64 | gentoo-sway-rockpro64 | containeros-virt | nomadbsd | 9front)
             # download_miss/gentoo_fetch_stage3 (called below) expect a
             # "path" in scope to fetch into
             local path
@@ -7336,6 +8884,7 @@ main() {
             install_kernels "${esp_dev}" "${mnt_path}" "${path}"
             install_rootfs_slots "${mnt_path}" "${path}"
             install_boot_entries "${esp_dev}" "${mnt_path}"
+            install_provision_files "${esp_dev}" "${mnt_path}"
 
             # Binpkgs and provisioning apply to the Gentoo slots only
             local i
@@ -7393,7 +8942,7 @@ main() {
             printf "You need to specify a valid target system OS\n"
             printf "  One of: 9front, alma, alpine-containeros, alpine-sway,\n"
             printf "          containeros-virt, freebsd, gentoo-containeros,\n"
-            printf "          gentoo-sway, gentoo-sway-pine64,\n"
+            printf "          gentoo-k8s, gentoo-sway, gentoo-sway-pine64,\n"
             printf "          gentoo-sway-rockpro64,\n"
             printf "          gentoo-sway-virt, nomadbsd\n"
             show_usage
@@ -7459,6 +9008,37 @@ main() {
             info "$(printf "%s" "${partitions}")"
             exit 0
         fi
+    fi
+
+    if [ "set-default-boot" == "${1}" ]; then
+        # Linux needs a loop device, macOS attaches images as a user
+        if [ "macos" != "$(sys_os)" ]; then
+            reexec_privileged "$@"
+        fi
+
+        set_default_boot "${2}" "${3}"
+        exit $?
+    fi
+
+    if [ "provision-add-trust" == "${1}" ]; then
+        if [ "macos" != "$(sys_os)" ]; then
+            reexec_privileged "$@"
+        fi
+
+        provision_add_trust "${2:-}" "${3:-}"
+        exit $?
+    fi
+
+    if [ "provision-certs" == "${1}" ]; then
+        if [ "macos" != "$(sys_os)" ]; then
+            reexec_privileged "$@"
+        fi
+
+        provision_certs "${2}" \
+            "${3:-${provision_client_cert}}" \
+            "${4:-${provision_client_key}}" \
+            "${5:-${provision_ca_cert}}"
+        exit $?
     fi
 
     # Unmount
@@ -7649,6 +9229,13 @@ main() {
 
             local entry_id
             entry_id="${comp_name[$i]}"
+
+            local skip
+            skip="$(boot_test_skip_reason "${i}" "${only_slot}")"
+            if [ -n "${skip}" ]; then
+                summary="${summary}\n  SKIP  ${entry_id} (${skip})"
+                continue
+            fi
 
             printf "\n"
             info "$(printf "boot-test: === %s ===\n" "${entry_id}")"
