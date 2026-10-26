@@ -242,7 +242,7 @@ gokrazy_dhcp_release_tag="ci_c150ed5_2"
 # fetch-provision@.service runs provisioner fetch. OpenWrt flavours whose
 # overlay runs fetch-profiles get it the same way as /usr/sbin/provisioner
 provisioner_repo_url="https://github.com/bbusse/provisioner"
-provisioner_release_tag="${PROVISIONER_RELEASE_TAG:-ci_46bdd9c_1}"
+provisioner_release_tag="${PROVISIONER_RELEASE_TAG:-latest}"
 provisioner_bin_dir="${PROVISIONER_BIN_DIR:-}"
 
 # mdns-discover
@@ -1665,6 +1665,7 @@ write_k8s_roles() {
 #!/bin/sh
 # Kernel and containerd settings kubeadm expects
 set -eu
+# shellcheck source=/dev/null
 . /etc/provision/k8s.conf
 
 modprobe overlay
@@ -1683,8 +1684,11 @@ if [ ! -s /etc/containerd/config.toml ]; then
     containerd config default >/etc/containerd/config.toml.new
     mv /etc/containerd/config.toml.new /etc/containerd/config.toml
 fi
-if grep -q 'SystemdCgroup = false' /etc/containerd/config.toml; then
-    sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+awk '{ sub(/SystemdCgroup = false/, "SystemdCgroup = true") } 1' /etc/containerd/config.toml >/etc/containerd/config.toml.new
+if cmp -s /etc/containerd/config.toml.new /etc/containerd/config.toml; then
+    rm -f /etc/containerd/config.toml.new
+else
+    mv /etc/containerd/config.toml.new /etc/containerd/config.toml
     systemctl restart containerd.service
 fi
 systemctl enable --now containerd.service
@@ -1696,6 +1700,7 @@ EOF
 # one script per method in /usr/local/lib/k8s-endpoint
 set -eu
 set -a
+# shellcheck source=/dev/null
 . "${K8S_CONF:-/etc/provision/k8s.conf}"
 set +a
 lib="${K8S_ENDPOINT_LIB:-/usr/local/lib/k8s-endpoint}"
@@ -1739,15 +1744,15 @@ print("\n".join(seen))
 ' "${K8S_CLUSTER}")" || found=""
 
 if [ "${K8S_ROLE}" = master ] && { [ "${K8S_BOOTSTRAP}" = yes ] || [ -s /etc/kubernetes/admin.conf ]; }; then
-    own="$(ip -4 route get 192.0.2.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p')"
-    if [ -n "${own}" ] && ! printf '%s\n' "${found}" | grep -qx "${own}"; then
-        found="$(printf '%s\n%s\n' "${own}" "${found}" | sed '/^$/d')"
+    own="$(ip -4 route get 192.0.2.1 2>/dev/null | awk '{ for (i = 1; i < NF; i++) if ($i == "src") print $(i + 1) }')"
+    if [ -n "${own}" ]; then
+        found="$(printf '%s\n%s\n' "${own}" "${found}" | awk 'NF && !seen[$0]++')"
     fi
 fi
 
 if [ -z "${found}" ]; then
     echo "k8s-endpoint: no master of cluster ${K8S_CLUSTER} answered on mDNS" >&2
-    grep -q "^# k8s-endpoint ${K8S_CLUSTER} begin$" "${hosts}" 2>/dev/null
+    awk -v b="# k8s-endpoint ${K8S_CLUSTER} begin" '$0 == b { found = 1 } END { exit !found }' "${hosts}" 2>/dev/null
     exit
 fi
 
@@ -1768,7 +1773,7 @@ if cmp -s "${new}" "${hosts}"; then
 else
     cat "${new}" >"${hosts}"
     rm -f "${new}"
-    echo "k8s-endpoint: ${K8S_ENDPOINT_HOST} is $(printf '%s' "${found}" | tr '\n' ' ')"
+    echo "k8s-endpoint: ${K8S_ENDPOINT_HOST} is $(printf '%s\n' "${found}" | awk -v ORS=' ' 1)"
 fi
 EOF
 
@@ -1790,6 +1795,7 @@ EOF
 # put back from /etc/provision/k8s-pki each time. A master announces its API
 # server over DNS-SD once it runs
 set -eu
+# shellcheck source=/dev/null
 . /etc/provision/k8s.conf
 
 announce() {
@@ -1873,6 +1879,7 @@ EOF
 # Cilium as the cluster's network, installed once from the bootstrap master
 # with the pod CIDR provisioning gave, Cilium's own default would cover 10/8
 set -eu
+# shellcheck source=/dev/null
 . /etc/provision/k8s.conf
 [ "${K8S_ROLE}" = master ] && [ "${K8S_BOOTSTRAP}" = yes ] || exit 0
 export KUBECONFIG=/etc/kubernetes/admin.conf
@@ -2039,7 +2046,7 @@ install_cilium_cli() {
         rm -rf "${build_dir}"
         exit 1
     fi
-    if [ "$(sha256sum "${build_dir}/${artifact}" | cut -d' ' -f1)" != "${sha256}" ]; then
+    if [ "$(sha256sum "${build_dir}/${artifact}" | awk '{ print $1 }')" != "${sha256}" ]; then
         error "$(printf "install_cilium_cli: %s does not match its pinned sha256\n" "${artifact}")"
         rm -rf "${build_dir}"
         exit 1
@@ -3284,9 +3291,9 @@ composition_finalize() {
     local i
     for i in "${!comp_name[@]}"; do
         if [ "none" = "${comp_fs[$i]}" ]; then
-            comp_part[$i]=0
+            comp_part[i]=0
         else
-            comp_part[$i]="${n}"
+            comp_part[i]="${n}"
             n=$((n + 1))
         fi
     done
@@ -4844,7 +4851,7 @@ provision_pem_check() {
         error "$(printf "provision_pem_check: Can not read %s\n" "${file}")"
         return 1
     fi
-    if ! grep -qE -- "-----BEGIN ${block}-----" "${file}"; then
+    if ! awk -v re="-----BEGIN ${block}-----" '$0 ~ re { found = 1 } END { exit !found }' "${file}"; then
         error "$(printf "provision_pem_check: No PEM %s in %s\n" "${block}" "${file}")"
         return 1
     fi
@@ -5945,6 +5952,8 @@ vm_extra_pre_umount() {
 	fi
 	echo 'autoboot_delay="2"' >>"${DESTDIR}/boot/loader.conf"
 	echo 'pf_load="YES"' >>"${DESTDIR}/boot/loader.conf"
+	grep -q '^\./boot/loader\.conf ' "${DESTDIR}/METALOG" ||
+		metalog_add_data ./boot/loader.conf
 
 	echo 'fdesc /dev/fd fdescfs rw 0 0' >>"${DESTDIR}/etc/fstab"
 	echo 'net.pf.filter_local=1' >>"${DESTDIR}/etc/sysctl.conf"
@@ -6526,8 +6535,7 @@ openwrt_build() {
     local flavour
     flavour="$1"
 
-    # Source branch is per flavour: x86_64 stays on "dev", device ports
-    # (e.g. ap120c) live on their own branch of the fork.
+    # Source branch of the fork, "dev" unless the caller picks another
     local branch
     branch="${OPENWRT_BRANCH:-dev}"
 
@@ -6868,7 +6876,7 @@ install_rootfs() {
     ls "${mnt_path}"
 
     set_default_root_pw "${mnt_path}/etc/shadow"
-    cat ${mnt_path}/etc/shadow
+    cat "${mnt_path}/etc/shadow"
 
     unmount_recursive "${mnt_path}"
 }
@@ -8014,7 +8022,7 @@ podman_init_machine() {
 
     # Ensure the image exists
     if [ ! -f "$image" ]; then
-        printf "Error: raw disk image '$image' not found."
+        printf "Error: raw disk image '%s' not found." "$image"
         return 1
     fi
 
@@ -8489,6 +8497,7 @@ main() {
 
     # Source vars
     if [ -f ENVIRONMENT ]; then
+        # shellcheck source=/dev/null
         source ENVIRONMENT
     fi
 
