@@ -19,6 +19,7 @@
 #  - fdisk      (util-linux)
 #  - losetup    (util-linux)
 #  - mkfs.xfs   (xfsprogs)
+#  - zpool      (zfsutils-linux, LINUX_ROOTFS_FS=zfs only)
 #
 # TODO:
 #   Use a proper language
@@ -107,6 +108,8 @@ nomadbsd_loader_file="nomadbsd-loader.efi"
 
 # Root filesystem of the Linux slots, xfs or zfs
 linux_rootfs_fs="${LINUX_ROOTFS_FS:-xfs}"
+# A ZFS root is this dataset of the pool on the slot's partition
+linux_root_dataset="ROOT/default"
 
 # FreeBSD slot: the image bbusse/freebsd-build builds and boot tests for
 # amd64 and arm64, composed into the disk next to NomadBSD. Optional, it is
@@ -184,8 +187,19 @@ net_mode_for_target() {
 # device runs asynchronously, and without rootwait the mount is attempted
 # immediately and panics with "Cannot open root device ... error -19"
 # (ENODEV)
+#
+# A ZFS root names a dataset rather than a device. The kernel's built-in ZFS
+# imports its pool before the root mount and waits for the pool's devices
+# itself, up to zfs.zfs_boot_import_timeout_ms
 linux_cmdline_default() {
-    printf "rw rootwait init=/lib/systemd/systemd enforcing=1 %s" \
+    local root_opt
+    root_opt="rootwait"
+    if [ "zfs" = "${linux_rootfs_fs}" ]; then
+        root_opt="rootfstype=zfs"
+    fi
+
+    printf "rw %s init=/lib/systemd/systemd enforcing=1 %s" \
+        "${root_opt}" \
         "$(linux_cmdline_console "${1}" "${2:-}")"
 }
 
@@ -353,7 +367,7 @@ mount_disk_image_part_by_no() {
     info "Mounting disk: ${dev} with ${fs_type} at ${mnt_path}"
 
     # Mount
-    if mount -t "${fs_type}" "${dev}" "${mnt_path}"; then
+    if rootfs_mount "${dev}" "${mnt_path}" "${fs_type}"; then
         info "$(printf "Mounted %s at %s\n" "${disk_file}" "${mnt_path}")"
     else
         error "$(printf "Failed to mount %s (%s) at %s \
@@ -1406,6 +1420,12 @@ cred() {
 # Grow root to the end of the disk, only when it is the last partition.
 # sysfs and blkid only, udev has not necessarily settled this early
 root_src="$(findmnt -no SOURCE /)"
+# A ZFS root is a dataset, grow the partition holding its pool
+pool=""
+if [ "$(findmnt -no FSTYPE /)" = "zfs" ]; then
+    pool="${root_src%%/*}"
+    root_src="$(zpool list -HPLv "${pool}" | awk '$1 ~ /^\/dev\// { print $1; exit }')"
+fi
 root_part="${root_src##*/}"
 # Two copies of one image are indistinguishable by PARTUUID, so the kernel
 # may have mounted the copy that was not booted. Growing that one leaves a
@@ -1430,14 +1450,24 @@ elif [ -r "/sys/class/block/${root_part}/partition" ]; then
         # sfdisk moves the backup GPT header to the end of the medium itself
         printf ', +\n' | sfdisk --no-reread --force -N "${partno}" "/dev/${disk_name}" >/dev/null || true
         partx -u "/dev/${disk_name}" || true
-        # Grows xfs, ext4 and btrfs through kernel ioctls, no fs tools needed
-        /usr/lib/systemd/systemd-growfs / || true
+        if [ -n "${pool}" ]; then
+            zpool online -e "${pool}" "${root_src}" || true
+        else
+            # Grows xfs, ext4 and btrfs through kernel ioctls, no fs tools needed
+            /usr/lib/systemd/systemd-growfs / || true
+        fi
     fi
 fi
 
-# 0 disables
+# The pool was created by the build host's ZFS, which may lack features
+# this kernel's has
+if [ -n "${pool}" ]; then
+    zpool upgrade "${pool}" >/dev/null || true
+fi
+
+# 0 disables. ZFS can not swap to a file, a ZFS root gets no swapfile
 size="$(cred firstboot.swapfile-size 4G)"
-if [ "${size}" != "0" ] && [ ! -e /swapfile ]; then
+if [ -z "${pool}" ] && [ "${size}" != "0" ] && [ ! -e /swapfile ]; then
     if fallocate -l "${size}" /swapfile; then
         chmod 0600 /swapfile
         mkswap -q /swapfile
@@ -2852,12 +2882,18 @@ parted_fs_hint() {
     esac
 }
 
-# sgdisk type codes: FreeBSD UFS and ZFS, Microsoft basic data, Linux
-# filesystem
+# sgdisk type codes: FreeBSD UFS and ZFS, Solaris/Linux ZFS, Microsoft
+# basic data, Linux filesystem. PROVIDER tells a FreeBSD pool from a Linux one
 gpt_type_code() {
     case "${1}" in
     ufs) echo "A503" ;;
-    zfs) echo "A504" ;;
+    zfs)
+        if [ "freebsd" = "${2:-}" ]; then
+            echo "A504"
+        else
+            echo "BF01"
+        fi
+        ;;
     plan9) echo "3900" ;;
     vfat) echo "0700" ;;
     *) echo "8300" ;;
@@ -2878,15 +2914,11 @@ partition_name() {
 }
 
 # Root on ZFS needs the pool imported before the root mount. FreeBSD's
-# kernel does that itself, Linux leaves it to an initramfs, which these
-# images do not have
+# kernel does that itself, and so does the ZFS built into the Linux kernels
+# linux-kernel-build publishes, so neither needs an initramfs
 rootfs_fs_check() {
     case "${linux_rootfs_fs}" in
-    xfs) ;;
-    zfs)
-        error "$(printf "LINUX_ROOTFS_FS=zfs: Linux can not import a root pool without an initramfs yet\n")"
-        return 1
-        ;;
+    xfs | zfs) ;;
     *)
         error "$(printf "LINUX_ROOTFS_FS must be xfs or zfs, not '%s'\n" "${linux_rootfs_fs}")"
         return 1
@@ -2953,7 +2985,7 @@ create_disk_parts_gpt() {
         parted -s "${file_disk}" mkpart "$(partition_name "${i}")" \
             ${fs_hint:+"${fs_hint}"} \
             "${start}MiB" "${end}"
-        sgdisk -t "${comp_part[$i]}:$(gpt_type_code "${comp_fs[$i]}")" \
+        sgdisk -t "${comp_part[$i]}:$(gpt_type_code "${comp_fs[$i]}" "${comp_provider[$i]}")" \
             "${file_disk}" >/dev/null
 
         if [ "rest" != "${comp_size[$i]}" ]; then
@@ -3691,8 +3723,8 @@ composition_fetch() {
     u_root_stage_bb "${download_path}" "${target_arch}"
 }
 
-# Create each slot's filesystem. UFS slots are skipped: their
-# filesystem is copied in whole from an upstream image, which would
+# Create each slot's filesystem. UFS and FreeBSD ZFS slots are skipped:
+# their filesystem is copied in whole from an upstream image, which would
 # overwrite anything created here
 composition_mkfs() {
     local i
@@ -3717,7 +3749,14 @@ composition_mkfs() {
                 exit 1
             fi
             ;;
-        ufs | zfs | plan9)
+        zfs)
+            if [ "freebsd" = "${comp_provider[$i]}" ]; then
+                info "$(printf "Skipping mkfs on %s: its ZFS pool is copied in whole\n" "${dev}")"
+            else
+                zfs_root_create "${dev}" "${comp_name[$i]}"
+            fi
+            ;;
+        ufs | plan9)
             info "$(printf "Skipping mkfs on %s: its %s filesystem is copied in whole\n" \
                 "${dev}" "$(echo "${comp_fs[$i]}" | tr '[:lower:]' '[:upper:]')")"
             ;;
@@ -3780,9 +3819,12 @@ install_rootfs_slots() {
             ;;
         esac
 
-        if [ "plan9" != "${comp_fs[$i]}" ]; then
-            verify_filesystem "${dev}" "$(printf "install_rootfs %s" "${comp_name[$i]}")"
+        # The build host's ZFS need not read a FreeBSD pool's features
+        if [ "plan9" = "${comp_fs[$i]}" ] ||
+            { [ "zfs" = "${comp_fs[$i]}" ] && [ "freebsd" = "${comp_provider[$i]}" ]; }; then
+            continue
         fi
+        verify_filesystem "${dev}" "$(printf "install_rootfs %s" "${comp_name[$i]}")"
     done
 }
 
@@ -5106,20 +5148,27 @@ install_boot_entries() {
             fi
         fi
 
+        # A ZFS root is named by its pool and dataset
         local root_spec
         root_spec=""
         if [ "linux" = "${comp_boot_type[$i]}" ] && [ 0 != "${root_part}" ]; then
             local part
             part="$(part_dev "${root_part}")"
-            local partuuid
-            partuuid="$(blkid -o value -s PARTUUID "${part}")"
-            if [ -z "${partuuid}" ]; then
-                error "$(printf "install_boot_entries: Failed to read PARTUUID of %s\n" \
-                    "${part}")"
-                unmount_recursive "${mnt_path}"
-                exit 1
+            local pool
+            pool="$(zfs_pool_of "${part}")"
+            if [ -n "${pool}" ]; then
+                root_spec="${pool}/${linux_root_dataset}"
+            else
+                local partuuid
+                partuuid="$(blkid -o value -s PARTUUID "${part}")"
+                if [ -z "${partuuid}" ]; then
+                    error "$(printf "install_boot_entries: Failed to read PARTUUID of %s\n" \
+                        "${part}")"
+                    unmount_recursive "${mnt_path}"
+                    exit 1
+                fi
+                root_spec="PARTUUID=${partuuid}"
             fi
-            root_spec="PARTUUID=${partuuid}"
         fi
 
         # With nothing saved yet, systemd-boot's @saved falls back to the
@@ -6637,6 +6686,11 @@ unmount_recursive() {
     info "$(printf "unmount_recursive: unmounting %s\n" "${mnt_path}")"
     findmnt -R "${mnt_path}" || true
 
+    # A ZFS root's pool was imported for the mount, export it along with it
+    local pools
+    pools="$(findmnt -R -rno FSTYPE,SOURCE "${mnt_path}" |
+        awk '$1 == "zfs" { sub("/.*", "", $2); print $2 }' | sort -u)"
+
     sync
 
     if ! umount -R "${mnt_path}"; then
@@ -6651,6 +6705,15 @@ unmount_recursive() {
         findmnt -R "${mnt_path}" || true
         exit 1
     fi
+
+    local pool
+    while read -r pool; do
+        [ -n "${pool}" ] || continue
+        if ! zpool export "${pool}"; then
+            error "$(printf "unmount_recursive: Failed to export ZFS pool %s\n" "${pool}")"
+            exit 1
+        fi
+    done <<<"${pools}"
 
     sync
 }
@@ -6674,6 +6737,113 @@ chroot_mounts() {
     mount --make-rslave "${mnt_path}/dev"
 }
 
+# The build host's ZFS creates and imports the Linux root pools. Installed
+# on Ubuntu if missing, as bootctl is
+zfs_require() {
+    if ! command -v zpool >/dev/null 2>&1 && [ "ubuntu" = "$(sys_os)" ]; then
+        info "zpool not found: Installing zfsutils-linux on Ubuntu"
+        sudo apt-get update
+        sudo apt-get install -y zfsutils-linux
+    fi
+
+    if ! command -v zpool >/dev/null 2>&1; then
+        error "A ZFS root needs zpool and zfs on the build host"
+        exit 1
+    fi
+
+    modprobe zfs 2>/dev/null || true
+    if [ ! -e /dev/zfs ]; then
+        error "A ZFS root needs the zfs kernel module on the build host"
+        exit 1
+    fi
+}
+
+# The name of the ZFS pool on DEV, empty when DEV holds none
+zfs_pool_of() {
+    local dev
+    dev="${1}"
+
+    if [ "zfs_member" != "$(blkid -p -o value -s TYPE "${dev}" 2>/dev/null)" ]; then
+        return 0
+    fi
+    blkid -p -o value -s LABEL "${dev}" 2>/dev/null
+}
+
+# A Linux root pool on the slot's partition rather than the whole disk:
+# without udev, zpool create can not wait for a whole disk's partitions.
+# Linux boots the root dataset, see linux_cmdline_default. The kernel refuses
+# to import a root pool whose name another pool on the machine shares, so
+# the name carries a random suffix
+zfs_root_create() {
+    local dev
+    dev="${1}"
+    local name
+    name="${2}"
+
+    zfs_require
+
+    local pool
+    pool="${name}-$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
+
+    info "$(printf "Creating ZFS pool %s on %s\n" "${pool}" "${dev}")"
+    if ! zpool create -o ashift=12 -o autotrim=on -o cachefile=none \
+        -O mountpoint=none -O canmount=off -O compression=lz4 \
+        -O acltype=posixacl -O xattr=sa -O dnodesize=auto -O relatime=on \
+        "${pool}" "${dev}"; then
+        error "$(printf "Error: Failed to create ZFS pool on %s\n" "${dev}")"
+        exit 1
+    fi
+
+    if ! zfs create -o mountpoint=none -o canmount=off "${pool}/${linux_root_dataset%/*}" ||
+        ! zfs create -o mountpoint=legacy "${pool}/${linux_root_dataset}"; then
+        error "$(printf "Error: Failed to create %s/%s\n" "${pool}" "${linux_root_dataset}")"
+        zpool export "${pool}" || true
+        exit 1
+    fi
+
+    zpool export "${pool}"
+}
+
+# Import the pool on DEV for the build, without mounting anything or
+# recording it in the build host's cachefile. unmount_recursive exports it
+zfs_pool_import() {
+    local dev
+    dev="${1}"
+    local pool
+    pool="${2}"
+
+    zfs_require
+
+    if zpool list -H -o name "${pool}" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    if ! zpool import -N -o cachefile=none -d "${dev}" "${pool}"; then
+        error "$(printf "Failed to import ZFS pool %s from %s\n" "${pool}" "${dev}")"
+        return 1
+    fi
+}
+
+# Mount the Linux root on DEV at MNT, a ZFS root by its root dataset
+rootfs_mount() {
+    local dev
+    dev="${1}"
+    local mnt_path
+    mnt_path="${2}"
+    local fs_type
+    fs_type="${3:-xfs}"
+
+    local pool
+    pool="$(zfs_pool_of "${dev}")"
+    if [ -z "${pool}" ]; then
+        mount -t "${fs_type}" "${dev}" "${mnt_path}"
+        return
+    fi
+
+    zfs_pool_import "${dev}" "${pool}" || return 1
+    mount -t zfs "${pool}/${linux_root_dataset}" "${mnt_path}"
+}
+
 verify_stage_fs() {
     local rootfs_dev
     rootfs_dev="${1}"
@@ -6691,7 +6861,7 @@ verify_stage_fs() {
     unmount_recursive "${mnt_path}"
     verify_filesystem "${rootfs_dev}" "${context}"
 
-    if ! mount -t xfs "${rootfs_dev}" "${mnt_path}"; then
+    if ! rootfs_mount "${rootfs_dev}" "${mnt_path}"; then
         error "$(printf "verify_stage_fs: Failed to remount %s at %s\n" "${rootfs_dev}" "${mnt_path}")"
         exit 1
     fi
@@ -6763,6 +6933,11 @@ fs_check_cmd() {
     ufs | ufs2)
         # The BSDs call it fsck_ffs and util-linux ships no fsck.ufs
         fs_check_argv=(fsck_ffs -n "${dev}")
+        ;;
+    zfs_member)
+        # fsck.zfs is a stub too. zdb reads the exported pool without
+        # importing it, verifies every block's checksum and finds leaks
+        fs_check_argv=(zdb -e -p "${dev}" -bcc "$(zfs_pool_of "${dev}")")
         ;;
     *)
         fs_check_argv=("fsck.${fs_type}" -n "${dev}")
@@ -6868,7 +7043,7 @@ install_rootfs() {
     info "Installing sys to root fs"
     info "Mounting: ${rootfs_dev} with ${fs_type} at ${mnt_path}"
 
-    mount -t "${fs_type}" "${rootfs_dev}" "${mnt_path}"
+    rootfs_mount "${rootfs_dev}" "${mnt_path}" "${fs_type}"
 
     printf "Extracting stage3 to root in %s\n" "${mnt_path}"
     tar xpf stage3-*.tar.xz --xattrs-include='*.*' --numeric-owner --directory "${mnt_path}"
@@ -6974,7 +7149,7 @@ gentoo_install_stage4_binpkgs() {
     local stage4_file
     stage4_file="gentoo-stage4-${target_flavour}-${target_arch}.tar.xz"
 
-    mount -t xfs "${rootfs_dev}" "${mnt_path}"
+    rootfs_mount "${rootfs_dev}" "${mnt_path}"
 
     info "$(printf "Gentoo: Extracting stage4 binpkgs\n")"
     tar xpf "${stage4_file}" --xattrs-include='*.*' --numeric-owner --directory "${mnt_path}"
@@ -8466,10 +8641,13 @@ show_usage() {
     printf "  the image user's ~/.local/bin, which comes first on PATH\n"
     printf "\n"
     printf "  FREEBSD_ROOTFS_FS picks the FreeBSD slot's ufs or zfs image, zfs\n"
-    printf "  by default. LINUX_ROOTFS_FS is the Gentoo root's filesystem, xfs;\n"
-    printf "  zfs is refused until Linux can import a root pool without an\n"
-    printf "  initramfs. build freebsd makes an image per FREEBSD_BUILD_FS\n"
-    printf "  filesystem, \"ufs zfs\" by default\n"
+    printf "  by default. LINUX_ROOTFS_FS is the Gentoo root's filesystem, xfs\n"
+    printf "  or zfs, xfs by default. zfs puts a pool named after the slot plus\n"
+    printf "  a random suffix on the slot's partition and boots its ROOT/default\n"
+    printf "  dataset with no initramfs, which needs the ZFS built into the\n"
+    printf "  linux-kernel-build kernels and zpool on the build host. First boot\n"
+    printf "  grows the pool and makes no swapfile. build freebsd makes an image\n"
+    printf "  per FREEBSD_BUILD_FS filesystem, \"ufs zfs\" by default\n"
     printf "\n"
     printf "  Gentoo images fetch a provisioning TOML (user, hostname, ssh keys,\n"
     printf "  WireGuard) from the provisioning host on first boot, before logins\n"
