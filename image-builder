@@ -1698,9 +1698,18 @@ set -eu
 # shellcheck source=/dev/null
 . /etc/provision/k8s.conf
 
-modprobe overlay
-modprobe br_netfilter
-printf 'overlay\nbr_netfilter\n' >/etc/modules-load.d/k8s.conf
+# A kernel without modules has them built in and modprobe fails on it
+load() {
+    if modprobe "${1}" 2>/dev/null; then
+        printf '%s\n' "${1}" >>/etc/modules-load.d/k8s.conf
+    elif [ ! -e "${2}" ]; then
+        modprobe "${1}"
+    fi
+}
+mkdir -p /etc/modules-load.d /etc/sysctl.d
+: >/etc/modules-load.d/k8s.conf
+load overlay /sys/module/overlay
+load br_netfilter /proc/sys/net/bridge
 cat >/etc/sysctl.d/90-k8s.conf <<SYSCTL
 net.ipv4.ip_forward = 1
 net.ipv6.conf.all.forwarding = 1
@@ -1843,7 +1852,7 @@ DNSSD
     systemctl restart systemd-resolved.service
 }
 
-if [ -s /etc/kubernetes/kubelet.conf ]; then
+if [ -s /etc/kubernetes/kubelet.conf ] && [ ! -e /var/lib/provision/k8s-attempt ]; then
     exit 0
 fi
 if [ -e /var/lib/provision/k8s-attempt ]; then
@@ -1908,6 +1917,8 @@ EOF
 #!/bin/sh
 # Cilium as the cluster's network, installed once from the bootstrap master
 # with the pod CIDR provisioning gave, Cilium's own default would cover 10/8
+# Pinned: Kernels from 7.2 reject a probe of Cilium before 1.20.2, and
+# cilium-cli v0.20.1 defaults to 1.20.1
 set -eu
 # shellcheck source=/dev/null
 . /etc/provision/k8s.conf
@@ -1916,7 +1927,7 @@ export KUBECONFIG=/etc/kubernetes/admin.conf
 if cilium status >/dev/null 2>&1; then
     exit 0
 fi
-cilium install --set ipam.mode=cluster-pool \
+cilium install --version 1.20.4 --set ipam.mode=cluster-pool \
     --set "ipam.operator.clusterPoolIPv4PodCIDRList={${K8S_POD_CIDR}}"
 cilium status --wait --wait-duration 10m
 EOF
@@ -1989,7 +2000,8 @@ EOF
 [Unit]
 Description=Bring this node into its Kubernetes cluster as ${role}
 ConditionPathExists=/etc/provision/k8s.conf
-ConditionPathExists=!/etc/kubernetes/kubelet.conf
+ConditionPathExists=|!/etc/kubernetes/kubelet.conf
+ConditionPathExists=|/var/lib/provision/k8s-attempt
 Wants=network-online.target containerd.service
 After=network-online.target containerd.service k8s-prepare.service k8s-endpoint.service
 Requires=k8s-prepare.service
@@ -5891,6 +5903,8 @@ build_freebsd_release() {
     target_arch="${1}"
     local src_dir
     src_dir="$(realpath "${2}")"
+    local user
+    user="${3}"
     local ncpu
     ncpu="$(sysctl -n hw.ncpu)"
     local version
@@ -5951,6 +5965,7 @@ build_freebsd_release() {
     # NO_ROOT in turn needs WITHOUT_QEMU. The pool is 2 GiB, growfs grows
     # it to fill the disk on first boot
     FREEBSD_VM_ROOT_PASSWORD="${freebsd_ci_root_password}" \
+        FREEBSD_VM_USER="${user}" FREEBSD_VM_SSH_PUBKEY="${SSH_PUBKEY}" \
         make -C "${src_dir}/release" "${release_flags[@]}" \
         WITH_VMIMAGES=yes VMFORMATS=raw VMFSLIST="${freebsd_build_fs}" VMSIZE=2048m \
         NO_ROOT=yes WITHOUT_QEMU=yes VM_IMAGE_CONFIG="${vm_conf}" \
@@ -5991,8 +6006,31 @@ freebsd_vm_image_config() {
 NOSWAP=yes
 
 vm_extra_pre_umount() {
+	local home ids entry kind
 	echo "${FREEBSD_VM_ROOT_PASSWORD}" | pw -R "${DESTDIR}" usermod root -h 0
 	sed -i "" -e '/^tty[du]0/s/off/onifconsole/' "${DESTDIR}/etc/ttys"
+
+	# A wheel user with the root password as on the Linux images, sshd
+	# keeps root out. makefs resolves names against the build host, so
+	# the home goes into METALOG by id
+	echo "${FREEBSD_VM_ROOT_PASSWORD}" |
+		pw -R "${DESTDIR}" useradd -n "${FREEBSD_VM_USER}" -G wheel -m -h 0
+	home="./home/${FREEBSD_VM_USER}"
+	if [ -n "${FREEBSD_VM_SSH_PUBKEY}" ]; then
+		mkdir -m 0700 "${DESTDIR}/${home}/.ssh"
+		echo "${FREEBSD_VM_SSH_PUBKEY}" >"${DESTDIR}/${home}/.ssh/authorized_keys"
+		chmod 0600 "${DESTDIR}/${home}/.ssh/authorized_keys"
+	fi
+	ids="$(pw -R "${DESTDIR}" usershow -n "${FREEBSD_VM_USER}" |
+		awk -F: '{print "uid=" $3 " gid=" $4}')"
+	(cd "${DESTDIR}" && find "${home}") | while read -r entry; do
+		kind=file
+		if [ -d "${DESTDIR}/${entry}" ]; then
+			kind=dir
+		fi
+		echo "${entry} type=${kind} ${ids} mode=$(stat -f %Lp "${DESTDIR}/${entry}")" \
+			>>"${DESTDIR}/METALOG"
+	done
 
 	# The arm64 EFI loader has no comconsole, its efi console follows the
 	# firmware ConOut, which is serial under qemu
@@ -6008,8 +6046,11 @@ vm_extra_pre_umount() {
 	echo 'net.pf.filter_local=1' >>"${DESTDIR}/etc/sysctl.conf"
 
 	# growfs would add swap at the end of the disk, in a composed image
-	# a partition nobody asked for, outside any slot
+	# a partition nobody asked for, outside any slot. DHCP is what the
+	# stock image gets, but only without a VM_IMAGE_CONFIG
 	cat >>"${DESTDIR}/etc/rc.conf" <<'EOF'
+ifconfig_DEFAULT="DHCP inet6 accept_rtadv"
+sshd_enable="YES"
 growfs_enable="YES"
 growfs_swap_size="0"
 pf_enable="YES"
@@ -8791,7 +8832,7 @@ main() {
             freebsd_install_build_dependencies
             freebsd_fetch_build_config "${target_arch}"
             freebsd_fetch_src "${freebsd_source_url}" "$(freebsd_release_branch "${release}")"
-            build_freebsd_release "${target_arch}" freebsd-src
+            build_freebsd_release "${target_arch}" freebsd-src "${user}"
             exit 0
             ;;
         nanobsd)
