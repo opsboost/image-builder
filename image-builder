@@ -247,6 +247,12 @@ provision_client_key="${PROVISION_CLIENT_KEY:-}"
 # cfg-provision's checkout, provision-add-trust takes certs/NAME/ from it
 cfg_provision="${CFG_PROVISION:-${SCRIPT_PATH}/../cfg-provision}"
 
+# cfg-services: The units and the scripts they run, at their paths in the
+# rootfs. provision clones CFG_SERVICES_REF of it
+cfg_services_url="${CFG_SERVICES_URL:-https://github.com/bbusse/cfg-services}"
+cfg_services_ref="${CFG_SERVICES_REF:-dev}"
+cfg_services="${PWD}/cfg-services"
+
 # gokrazy-dhcp
 gokrazy_dhcp_repo_url="https://github.com/bbusse/gokrazy-dhcp"
 gokrazy_dhcp_release_tag="ci_c150ed5_2"
@@ -333,6 +339,22 @@ git_fresh_clone() {
 
     rm -rf "${dir}"
     git clone --depth 1 "$@" "${dir}"
+}
+
+# Install files of cfg-services' checkout at the same path in the rootfs
+install_services() {
+    local mnt_path
+    mnt_path="${1}"
+    shift
+
+    local f
+    local mode
+    for f in "$@"; do
+        mode=0644
+        [ -x "${cfg_services}/${f}" ] && mode=0755
+        mkdir -p "$(dirname "${mnt_path}/${f}")"
+        install -m "${mode}" "${cfg_services}/${f}" "${mnt_path}/${f}"
+    done
 }
 
 compare_checksums() {
@@ -661,23 +683,7 @@ enable_sway_session() {
     fi
 
     if [ -n "${board}" ]; then
-        mkdir -p "${path}"
-        cat <<'EOF' >"${path}/autovt@tty2.service"
-[Unit]
-Description=sway on tty2
-After=systemd-user-sessions.service
-Conflicts=getty@tty2.service
-
-[Service]
-PAMName=login
-TTYPath=/dev/tty2
-TTYReset=yes
-TTYVHangup=yes
-Environment=XDG_SESSION_TYPE=wayland
-ExecStart=/usr/bin/sway
-Restart=on-failure
-RestartSec=2
-EOF
+        install_services "${mnt_path}" etc/systemd/system/autovt@tty2.service
         mkdir -p "${path}/autovt@tty2.service.d"
         printf '[Service]\nUser=%s\nEnvironmentFile=-/home/%s/.config/environment.d/50-provision.conf\n' \
             "${user}" "${user}" >"${path}/autovt@tty2.service.d/user.conf"
@@ -686,27 +692,7 @@ EOF
         return 0
     fi
 
-    cat <<'EOF' >"${path}/sway-tty1@.service"
-[Unit]
-Description=sway on tty1 as %i
-After=systemd-user-sessions.service
-Conflicts=getty@tty1.service autovt@tty1.service
-
-[Service]
-User=%i
-PAMName=login
-TTYPath=/dev/tty1
-TTYReset=yes
-TTYVHangup=yes
-Environment=XDG_SESSION_TYPE=wayland
-EnvironmentFile=-/home/%i/.config/environment.d/50-provision.conf
-ExecStart=/usr/bin/sway
-Restart=on-failure
-RestartSec=2
-
-[Install]
-WantedBy=graphical.target
-EOF
+    install_services "${mnt_path}" etc/systemd/system/sway-tty1@.service
 
     mkdir -p "${path}/graphical.target.wants"
     ln -s -f /etc/systemd/system/sway-tty1@.service \
@@ -780,14 +766,7 @@ write_sway_dropins() {
     # sway is up and stop with graphical-session.target when it exits
     printf 'exec systemctl --user import-environment WAYLAND_DISPLAY SWAYSOCK && systemctl --user start sway-session.target\n' \
         >"${mnt_path}/etc/sway/config.d/systemd-session"
-    mkdir -p "${mnt_path}/etc/systemd/user"
-    cat <<'EOF' >"${mnt_path}/etc/systemd/user/sway-session.target"
-[Unit]
-Description=sway session
-BindsTo=graphical-session.target
-Wants=graphical-session-pre.target
-After=graphical-session-pre.target
-EOF
+    install_services "${mnt_path}" etc/systemd/user/sway-session.target
 
     # Login shells outside the compositor, ssh and console, ask the user
     # manager for the same variables, so swaymsg and mpv work from there
@@ -827,40 +806,9 @@ set_default_audio() {
 
     [ -f "${units}/pipewire.socket" ] || return 0
 
-    mkdir -p "${mnt_path}/usr/local/bin"
-    cat <<'EOF' >"${mnt_path}/usr/local/bin/set-default-audio"
-#!/bin/sh
-# Make the DAC POT board the default sink at 50%, retrying until it appears
-want=hdmi
-[ -e /proc/asound/pine64dacpot ] && want=sound-dac
-i=0
-while [ "${i}" -lt 10 ]; do
-    s="$(pactl list short sinks | awk -v w="${want}" 'index($2, w) { print $2; exit }')"
-    if [ -n "${s}" ]; then
-        pactl set-default-sink "${s}"
-        pactl set-sink-volume "${s}" 50%
-        break
-    fi
-    i=$((i + 1))
-    sleep 1
-done
-EOF
-    chmod 0755 "${mnt_path}/usr/local/bin/set-default-audio"
-
+    install_services "${mnt_path}" usr/local/bin/set-default-audio \
+        etc/systemd/user/set-default-audio.service
     mkdir -p "${mnt_path}/etc/systemd/user/default.target.wants"
-    cat <<'EOF' >"${mnt_path}/etc/systemd/user/set-default-audio.service"
-[Unit]
-Description=Default audio to the DAC POT board or HDMI at 50%
-After=pipewire-pulse.service wireplumber.service
-Wants=wireplumber.service
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/set-default-audio
-
-[Install]
-WantedBy=default.target
-EOF
     ln -s -f /etc/systemd/user/set-default-audio.service \
         "${mnt_path}/etc/systemd/user/default.target.wants/set-default-audio.service"
 }
@@ -886,21 +834,8 @@ enable_uxplay() {
 
     [ -x "${mnt_path}/usr/bin/uxplay" ] || return 0
 
+    install_services "${mnt_path}" etc/systemd/user/uxplay.service
     mkdir -p "${mnt_path}/etc/systemd/user/sway-session.target.wants"
-    cat <<'EOF' >"${mnt_path}/etc/systemd/user/uxplay.service"
-[Unit]
-Description=AirPlay screen mirroring receiver
-PartOf=graphical-session.target
-After=graphical-session.target pipewire.service
-
-[Service]
-ExecStart=/usr/bin/uxplay -fs -n %H -nh -vs waylandsink -as "pipewiresink stream-properties=props,node.rate=(string)1/44100,node.latency=(string)4096/44100"
-Restart=on-failure
-RestartSec=5s
-
-[Install]
-WantedBy=sway-session.target
-EOF
     ln -s -f /etc/systemd/user/uxplay.service \
         "${mnt_path}/etc/systemd/user/sway-session.target.wants/uxplay.service"
 
@@ -913,24 +848,6 @@ EOF
     fi
 }
 
-write_role_target() {
-    local mnt_path
-    mnt_path="${1}"
-    local role
-    role="${2}"
-    local description
-    description="${3}"
-
-    mkdir -p "${mnt_path}/etc/systemd/system"
-    cat <<EOF >"${mnt_path}/etc/systemd/system/role-${role}.target"
-[Unit]
-Description=Role ${role}: ${description}
-
-[Install]
-WantedBy=multi-user.target
-EOF
-}
-
 enable_mpv_tv() {
     local mnt_path
     mnt_path="${1}"
@@ -941,121 +858,20 @@ enable_mpv_tv() {
 
     [ -x "${mnt_path}/usr/bin/mpv" ] || return 0
 
-    mkdir -p "${mnt_path}/usr/local/bin"
-    cat <<'EOF' >"${mnt_path}/usr/local/bin/tv-playlist"
-#!/bin/sh
-set -e
-src="$(curl -fsSL "${URL_TV}")"
-printf '%s\n' "${src}" | awk -v list="${TV_WHITELIST}" '
-function key(s) {
-    gsub(/[[:space:]]/, "", s)
-    return tolower(s)
-}
-BEGIN {
-    n = split(list, w, ",")
-    for (i = 1; i <= n; i++)
-        if (!(key(w[i]) in want))
-            want[key(w[i])] = i
-}
-/^#EXTINF/ {
-    info = $0
-    name = $0
-    sub(/.*,/, "", name)
-    next
-}
-/^#/ || !NF {
-    next
-}
-info != "" {
-    k = key(name)
-    if (!n)
-        out[++m] = info "\n" $0
-    else if ((k in want) && !(want[k] in out))
-        out[want[k]] = info "\n" $0
-    info = ""
-}
-END {
-    print "#EXTM3U"
-    for (i = 1; i <= (n ? n : m); i++)
-        if (i in out) {
-            print out[i]
-            found++
-        }
-    exit !found
-}' >"${1}"
-EOF
-    chmod 755 "${mnt_path}/usr/local/bin/tv-playlist"
+    install_services "${mnt_path}" usr/local/bin/tv-playlist etc/systemd/system/role-tv.target
 
     if [ -n "${board}" ] && [ -n "${user}" ]; then
-        cat <<'EOF' >"${mnt_path}/usr/local/bin/mpv-tv-vt"
-#!/bin/sh
-set -e
-run="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
-card=""
-for s in /sys/class/drm/card*-*/status; do
-    if [ -f "${s}" ] && [ "$(cat "${s}")" = connected ]; then
-        card="/dev/dri/$(basename "$(dirname "${s}")" | cut -d- -f1)"
-        break
-    fi
-done
-/usr/local/bin/tv-playlist "${run}/mpv-tv.m3u"
-exec /usr/bin/mpv --profile=vt ${card:+"--drm-device=${card}"} --drm-mode=1920x1080@50 --fs --quiet \
-    --input-ipc-server="${run}/mpv-tv.sock" "${run}/mpv-tv.m3u"
-EOF
-        chmod 755 "${mnt_path}/usr/local/bin/mpv-tv-vt"
-
         local system
         system="${mnt_path}/etc/systemd/system"
-        write_role_target "${mnt_path}" tv "mpv TV on tty1"
+        install_services "${mnt_path}" usr/local/bin/mpv-tv-vt etc/systemd/system/tv-tty1@.service
         mkdir -p "${system}/role-tv.target.wants"
-        cat <<'EOF' >"${system}/tv-tty1@.service"
-[Unit]
-Description=mpv TV on tty1 as %i
-After=systemd-user-sessions.service
-Conflicts=getty@tty1.service autovt@tty1.service
-
-[Service]
-User=%i
-PAMName=login
-TTYPath=/dev/tty1
-TTYReset=yes
-TTYVHangup=yes
-StandardInput=tty
-StandardOutput=journal
-StandardError=journal
-Environment=URL_TV=https://raw.githubusercontent.com/jnk22/kodinerds-iptv/master/iptv/clean/clean_tv.m3u
-EnvironmentFile=-/home/%i/.config/environment.d/50-provision.conf
-ExecStart=/usr/local/bin/mpv-tv-vt
-Restart=on-failure
-RestartSec=5s
-
-[Install]
-WantedBy=role-tv.target
-EOF
         ln -s -f /etc/systemd/system/tv-tty1@.service \
             "${system}/role-tv.target.wants/tv-tty1@${user}.service"
         return 0
     fi
 
-    write_role_target "${mnt_path}" tv "mpv TV inside sway"
+    install_services "${mnt_path}" etc/systemd/user/mpv-tv.service
     mkdir -p "${mnt_path}/etc/systemd/user/sway-session.target.wants"
-    cat <<'EOF' >"${mnt_path}/etc/systemd/user/mpv-tv.service"
-[Unit]
-Description=mpv playing the TV playlist
-ConditionPathExists=/etc/systemd/system/multi-user.target.wants/role-tv.target
-PartOf=graphical-session.target
-After=graphical-session.target pipewire.service
-
-[Service]
-Environment=URL_TV=https://raw.githubusercontent.com/jnk22/kodinerds-iptv/master/iptv/clean/clean_tv.m3u
-ExecStartPre=/usr/local/bin/tv-playlist %t/mpv-tv.m3u
-ExecStart=/usr/bin/mpv --fs --quiet --input-ipc-server=%t/mpv-tv.sock %t/mpv-tv.m3u
-Restart=on-failure
-RestartSec=5s
-
-[Install]
-WantedBy=sway-session.target
-EOF
     ln -s -f /etc/systemd/user/mpv-tv.service \
         "${mnt_path}/etc/systemd/user/sway-session.target.wants/mpv-tv.service"
 }
@@ -1068,45 +884,9 @@ set_raop_volume() {
 
     [ -f "${units}/pipewire.socket" ] || return 0
 
-    mkdir -p "${mnt_path}/usr/local/bin"
-    cat <<'EOF' >"${mnt_path}/usr/local/bin/set-raop-volume"
-#!/bin/sh
-# Cap every raop sink at 40%, lowering only those that come up higher so a
-# quieter manual level still sticks
-max=40
-cap() {
-    pactl list short sinks | awk '/raop/ { print $2 }' | while read -r s; do
-        v="$(pactl get-sink-volume "${s}" 2>/dev/null |
-            awk -F/ 'NR == 1 { gsub(/[ %]/, "", $2); print $2 + 0; exit }')"
-        if [ -n "${v}" ] && [ "${v}" -gt "${max}" ]; then
-            pactl set-sink-volume "${s}" "${max}%"
-        fi
-    done
-}
-cap
-pactl subscribe 2>/dev/null | while read -r ev; do
-    case "${ev}" in
-    *"on sink"*) cap ;;
-    esac
-done
-EOF
-    chmod 0755 "${mnt_path}/usr/local/bin/set-raop-volume"
-
+    install_services "${mnt_path}" usr/local/bin/set-raop-volume \
+        etc/systemd/user/set-raop-volume.service
     mkdir -p "${mnt_path}/etc/systemd/user/default.target.wants"
-    cat <<'EOF' >"${mnt_path}/etc/systemd/user/set-raop-volume.service"
-[Unit]
-Description=Cap AirPlay (raop) sinks at 40%
-After=pipewire-pulse.service wireplumber.service
-Wants=wireplumber.service
-
-[Service]
-ExecStart=/usr/local/bin/set-raop-volume
-Restart=always
-RestartSec=2
-
-[Install]
-WantedBy=default.target
-EOF
     ln -s -f /etc/systemd/user/set-raop-volume.service \
         "${mnt_path}/etc/systemd/user/default.target.wants/set-raop-volume.service"
 }
@@ -1299,55 +1079,13 @@ EOF
         "${system}/dbus-org.bluez.service"
 
     if [ -x "${mnt_path}/usr/bin/bt-agent" ]; then
-        cat <<'EOF' >"${system}/bt-agent.service"
-[Unit]
-Description=Accept Bluetooth pairings without a display
-Requires=bluetooth.service
-After=bluetooth.service
-
-[Service]
-ExecStart=/usr/bin/bt-agent -c NoInputNoOutput
-Restart=on-failure
-
-[Install]
-WantedBy=bluetooth.target
-EOF
+        install_services "${mnt_path}" etc/systemd/system/bt-agent.service
         ln -s -f "../bt-agent.service" \
             "${system}/bluetooth.target.wants/bt-agent.service"
     fi
 
-    mkdir -p "${mnt_path}/usr/local/bin"
-    cat <<'EOF' >"${mnt_path}/usr/local/bin/set-bt-discoverable"
-#!/bin/sh
-# Turn the adapter discoverable and pairable once it is powered, the
-# timeouts in main.conf keep it that way
-i=0
-while [ "${i}" -lt 20 ]; do
-    if bluetoothctl show | awk '/Powered: yes/ { found = 1 } END { exit !found }'; then
-        bluetoothctl discoverable on
-        bluetoothctl pairable on
-        exit 0
-    fi
-    i=$((i + 1))
-    sleep 1
-done
-echo "set-bt-discoverable: no powered adapter" >&2
-exit 1
-EOF
-    chmod 0755 "${mnt_path}/usr/local/bin/set-bt-discoverable"
-    cat <<'EOF' >"${system}/set-bt-discoverable.service"
-[Unit]
-Description=Keep the Bluetooth adapter discoverable and pairable
-Requires=bluetooth.service
-After=bluetooth.service
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/set-bt-discoverable
-
-[Install]
-WantedBy=bluetooth.target
-EOF
+    install_services "${mnt_path}" usr/local/bin/set-bt-discoverable \
+        etc/systemd/system/set-bt-discoverable.service
     ln -s -f "../set-bt-discoverable.service" \
         "${system}/bluetooth.target.wants/set-bt-discoverable.service"
 }
@@ -1359,17 +1097,7 @@ write_swapfile_unit() {
     local path
     path="${mnt_path}/etc/systemd/system"
 
-    cat <<EOF >"${path}/swapfile.swap"
-[Unit]
-Description=Swapfile on the root filesystem
-ConditionPathExists=/swapfile
-
-[Swap]
-What=/swapfile
-
-[Install]
-WantedBy=swap.target
-EOF
+    install_services "${mnt_path}" etc/systemd/system/swapfile.swap
     mkdir -p "${path}/swap.target.wants"
     ln -s -f "../swapfile.swap" "${path}/swap.target.wants/swapfile.swap"
 }
@@ -1402,129 +1130,8 @@ provision_systemd_firstboot() {
     fi
     ln -s -f "../usr/share/zoneinfo/${timezone}" "${mnt_path}/etc/localtime"
 
-    mkdir -p "${mnt_path}/usr/local/sbin"
-    cat <<'EOF' >"${mnt_path}/usr/local/sbin/firstboot-provision"
-#!/bin/sh
-# Runs once from firstboot-provision@<user>.service, credentials arrive in
-# $CREDENTIALS_DIRECTORY via ImportCredential=firstboot.*
-set -eu
-
-cred() {
-    if [ -n "${CREDENTIALS_DIRECTORY:-}" ] && [ -r "${CREDENTIALS_DIRECTORY}/${1}" ]; then
-        cat "${CREDENTIALS_DIRECTORY}/${1}"
-    else
-        printf '%s' "${2}"
-    fi
-}
-
-# Grow root to the end of the disk, only when it is the last partition.
-# sysfs and blkid only, udev has not necessarily settled this early
-root_src="$(findmnt -no SOURCE /)"
-# A ZFS root is a dataset, grow the partition holding its pool
-pool=""
-if [ "$(findmnt -no FSTYPE /)" = "zfs" ]; then
-    pool="${root_src%%/*}"
-    root_src="$(zpool list -HPLv "${pool}" | awk '$1 ~ /^\/dev\// { print $1; exit }')"
-fi
-root_part="${root_src##*/}"
-# Two copies of one image are indistinguishable by PARTUUID, so the kernel
-# may have mounted the copy that was not booted. Growing that one leaves a
-# filesystem larger than its partition on the other medium
-twin=""
-root_uuid="$(blkid -o value -s PARTUUID "${root_src}" || true)"
-for p in /sys/class/block/*/partition; do
-    name="$(basename "$(dirname "${p}")")"
-    [ "${name}" = "${root_part}" ] && continue
-    if [ -n "${root_uuid}" ] && [ "$(blkid -o value -s PARTUUID "/dev/${name}" || true)" = "${root_uuid}" ]; then
-        twin="/dev/${name}"
-        break
-    fi
-done
-if [ -n "${twin}" ]; then
-    echo "firstboot-provision: not growing ${root_src}, ${twin} carries the same PARTUUID" >&2
-elif [ -r "/sys/class/block/${root_part}/partition" ]; then
-    partno="$(cat "/sys/class/block/${root_part}/partition")"
-    disk_name="$(basename "$(readlink -f "/sys/class/block/${root_part}/..")")"
-    last="$(cat /sys/class/block/"${disk_name}"*/partition | sort -n | tail -1)"
-    if [ "${partno}" = "${last}" ]; then
-        # sfdisk moves the backup GPT header to the end of the medium itself
-        printf ', +\n' | sfdisk --no-reread --force -N "${partno}" "/dev/${disk_name}" >/dev/null || true
-        partx -u "/dev/${disk_name}" || true
-        if [ -n "${pool}" ]; then
-            zpool online -e "${pool}" "${root_src}" || true
-        else
-            # Grows xfs, ext4 and btrfs through kernel ioctls, no fs tools needed
-            /usr/lib/systemd/systemd-growfs / || true
-        fi
-    fi
-fi
-
-# The pool was created by the build host's ZFS, which may lack features
-# this kernel's has
-if [ -n "${pool}" ]; then
-    zpool upgrade "${pool}" >/dev/null || true
-fi
-
-# 0 disables. ZFS can not swap to a file, a ZFS root gets no swapfile
-size="$(cred firstboot.swapfile-size 4G)"
-if [ -z "${pool}" ] && [ "${size}" != "0" ] && [ ! -e /swapfile ]; then
-    if fallocate -l "${size}" /swapfile; then
-        chmod 0600 /swapfile
-        mkswap -q /swapfile
-        systemctl start swapfile.swap || true
-    else
-        rm -f /swapfile
-    fi
-fi
-
-# Per-device local root key: the image user gets passwordless ssh to
-# root@localhost. Generated here, not at build, so no key is shared across
-# devices. The authorized_keys entry is pinned to loopback, so even a leaked
-# private key cannot be used to reach root from another host
-user="${1:-}"
-if [ -n "${user}" ] && [ -d "/home/${user}" ]; then
-    key="/home/${user}/.ssh/id_local_root"
-    if [ ! -e "${key}" ]; then
-        install -d -m 0700 -o "${user}" -g "${user}" "/home/${user}/.ssh"
-        ssh-keygen -t ed25519 -N "" -C "local-root@${user}" -f "${key}" >/dev/null
-        chown "${user}:${user}" "${key}" "${key}.pub"
-        chmod 0600 "${key}"
-        install -d -m 0700 /root/.ssh
-        printf 'from="127.0.0.1,::1" %s\n' "$(cat "${key}.pub")" \
-            >>/root/.ssh/authorized_keys
-        chmod 0600 /root/.ssh/authorized_keys
-        cfg="/home/${user}/.ssh/config"
-        if [ ! -e "${cfg}" ]; then
-            cat >"${cfg}" <<'SSHCFG'
-Match host localhost,127.0.0.1,::1 user root
-    IdentityFile ~/.ssh/id_local_root
-    IdentitiesOnly yes
-SSHCFG
-            chown "${user}:${user}" "${cfg}"
-            chmod 0600 "${cfg}"
-        fi
-    fi
-fi
-EOF
-    chmod 0755 "${mnt_path}/usr/local/sbin/firstboot-provision"
-
-    cat <<'EOF' >"${path}/firstboot-provision@.service"
-[Unit]
-Description=First-boot provisioning for %i: grow root, swapfile, local root key
-ConditionFirstBoot=yes
-DefaultDependencies=no
-After=systemd-remount-fs.service
-Before=sysinit.target first-boot-complete.target
-Wants=first-boot-complete.target
-
-[Service]
-Type=oneshot
-ImportCredential=firstboot.*
-ExecStart=/usr/local/sbin/firstboot-provision %i
-
-[Install]
-WantedBy=sysinit.target
-EOF
+    install_services "${mnt_path}" usr/local/sbin/firstboot-provision \
+        etc/systemd/system/firstboot-provision@.service
     mkdir -p "${path}/sysinit.target.wants"
     ln -s -f "../firstboot-provision@.service" \
         "${path}/sysinit.target.wants/firstboot-provision@${user}.service"
@@ -1542,95 +1149,13 @@ write_provision_fetch() {
 
     [ -n "${user}" ] || return 0
 
-    cat <<'EOF' >"${path}/fetch-provision@.service"
-[Unit]
-Description=First-boot fetch of provisioning from the provisioning host for %i (user, hostname, ssh keys, WireGuard)
-ConditionFirstBoot=yes
-After=network-online.target
-Wants=network-online.target
-Before=systemd-user-sessions.service
-
-[Service]
-Type=oneshot
-TimeoutStartSec=120
-ExecStart=/usr/local/bin/provisioner fetch %i
-
-[Install]
-WantedBy=multi-user.target
-EOF
+    install_services "${mnt_path}" etc/systemd/system/fetch-provision@.service
     mkdir -p "${path}/multi-user.target.wants"
     ln -s -f "../fetch-provision@.service" \
         "${path}/multi-user.target.wants/fetch-provision@${user}.service"
 
-    cat <<'EOF' >"${mnt_path}/usr/local/sbin/provision-git-clone"
-#!/bin/sh
-# Shallow clones what provisioner fetch queued in /var/lib/provision/git-clone
-# (user, URL, destination, ref per line, tab separated), each as its user.
-# A destination that exists is left alone, what failed stays queued for the
-# next run
-list="${PROVISION_GIT_CLONE_LIST:-/var/lib/provision/git-clone}"
-warn() { echo "provision-git-clone: $*" >&2; }
-
-[ -s "${list}" ] || exit 0
-command -v git >/dev/null 2>&1 || {
-    warn "git not installed, cannot clone"
-    exit 1
-}
-
-left="$(mktemp)" || exit 1
-tab="$(printf '\t')"
-rc=0
-while IFS="${tab}" read -r user url dest ref; do
-    [ -n "${user}" ] && [ -n "${url}" ] && [ -n "${dest}" ] || continue
-    home="$(getent passwd "${user}" | cut -d: -f6)"
-    if [ -z "${home}" ]; then
-        warn "no user ${user}, dropping ${url}"
-        continue
-    fi
-    case "${dest}" in
-    \~/*) dest="${home}/${dest#??}" ;;
-    esac
-    if [ -e "${dest}" ]; then
-        echo "provision-git-clone: ${dest} exists, leaving it"
-        continue
-    fi
-    set -- git clone --quiet --depth 1
-    if [ -n "${ref}" ]; then
-        set -- "$@" --branch "${ref}"
-    fi
-    if runuser -u "${user}" -- mkdir -p "$(dirname "${dest}")" &&
-        runuser -u "${user}" -- "$@" -- "${url}" "${dest}"; then
-        echo "provision-git-clone: cloned ${url} to ${dest}"
-    else
-        warn "could not clone ${url} to ${dest}"
-        printf '%s\t%s\t%s\t%s\n' "${user}" "${url}" "${dest}" "${ref}" >>"${left}"
-        rc=1
-    fi
-done <"${list}"
-
-if [ -s "${left}" ]; then
-    mv -f "${left}" "${list}"
-else
-    rm -f "${left}" "${list}"
-fi
-exit "${rc}"
-EOF
-    chmod 0755 "${mnt_path}/usr/local/sbin/provision-git-clone"
-
-    cat <<'EOF' >"${path}/provision-git-clone.service"
-[Unit]
-Description=Shallow clones queued by first-boot provisioning
-ConditionPathExists=/var/lib/provision/git-clone
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/provision-git-clone
-
-[Install]
-WantedBy=multi-user.target
-EOF
+    install_services "${mnt_path}" usr/local/sbin/provision-git-clone \
+        etc/systemd/system/provision-git-clone.service
     ln -s -f "../provision-git-clone.service" \
         "${path}/multi-user.target.wants/provision-git-clone.service"
 
@@ -1648,23 +1173,8 @@ if [ -n "${HOME:-}" ] && [ -r "${HOME}/.config/environment.d/50-provision.conf" 
 fi
 EOF
 
-    write_role_target "${mnt_path}" wg "WireGuard tunnel wg0"
-    cat <<'EOF' >"${path}/wg-up.service"
-[Unit]
-Description=Bring up WireGuard wg0
-After=systemd-networkd.service
-Requires=systemd-networkd.service
-PartOf=role-wg.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/bin/sh -c 'for i in 1 2 3 4 5 6 7 8 9 10; do /usr/bin/networkctl up wg0 && exit 0; sleep 3; done; exit 1'
-ExecStop=/usr/bin/networkctl down wg0
-
-[Install]
-WantedBy=role-wg.target
-EOF
+    install_services "${mnt_path}" etc/systemd/system/role-wg.target \
+        etc/systemd/system/wg-up.service
     mkdir -p "${path}/role-wg.target.wants"
     ln -s -f "../wg-up.service" "${path}/role-wg.target.wants/wg-up.service"
 }
@@ -1687,360 +1197,17 @@ write_k8s_roles() {
         return 0
     fi
 
-    mkdir -p "${mnt_path}/usr/local/sbin" "${mnt_path}/usr/local/lib/k8s-endpoint" "${path}"
-    write_role_target "${mnt_path}" k8s-master "Kubernetes control plane"
-    write_role_target "${mnt_path}" k8s-client "Kubernetes node"
-
-    cat <<'EOF' >"${mnt_path}/usr/local/sbin/k8s-prepare"
-#!/bin/sh
-# Kernel and containerd settings kubeadm expects
-set -eu
-# shellcheck source=/dev/null
-. /etc/provision/k8s.conf
-
-# A kernel without modules has them built in and modprobe fails on it
-load() {
-    if modprobe "${1}" 2>/dev/null; then
-        printf '%s\n' "${1}" >>/etc/modules-load.d/k8s.conf
-    elif [ ! -e "${2}" ]; then
-        modprobe "${1}"
-    fi
-}
-mkdir -p /etc/modules-load.d /etc/sysctl.d
-: >/etc/modules-load.d/k8s.conf
-load overlay /sys/module/overlay
-load br_netfilter /proc/sys/net/bridge
-cat >/etc/sysctl.d/90-k8s.conf <<SYSCTL
-net.ipv4.ip_forward = 1
-net.ipv6.conf.all.forwarding = 1
-net.bridge.bridge-nf-call-iptables = 1
-net.bridge.bridge-nf-call-ip6tables = 1
-SYSCTL
-sysctl -q -p /etc/sysctl.d/90-k8s.conf
-
-mkdir -p /etc/containerd
-if [ ! -s /etc/containerd/config.toml ]; then
-    containerd config default >/etc/containerd/config.toml.new
-    mv /etc/containerd/config.toml.new /etc/containerd/config.toml
-fi
-awk '{ sub(/SystemdCgroup = false/, "SystemdCgroup = true") } 1' /etc/containerd/config.toml >/etc/containerd/config.toml.new
-if cmp -s /etc/containerd/config.toml.new /etc/containerd/config.toml; then
-    rm -f /etc/containerd/config.toml.new
-else
-    mv /etc/containerd/config.toml.new /etc/containerd/config.toml
-    systemctl restart containerd.service
-fi
-systemctl enable --now containerd.service
-EOF
-
-    cat <<'EOF' >"${mnt_path}/usr/local/sbin/k8s-endpoint"
-#!/bin/sh
-# Keeps the control-plane endpoint's name resolvable the way the cluster says,
-# one script per method in /usr/local/lib/k8s-endpoint
-set -eu
-set -a
-# shellcheck source=/dev/null
-. "${K8S_CONF:-/etc/provision/k8s.conf}"
-set +a
-lib="${K8S_ENDPOINT_LIB:-/usr/local/lib/k8s-endpoint}"
-if [ ! -x "${lib}/${K8S_ENDPOINT_METHOD}" ]; then
-    echo "k8s-endpoint: no method ${K8S_ENDPOINT_METHOD} in ${lib}" >&2
-    exit 1
-fi
-exec "${lib}/${K8S_ENDPOINT_METHOD}"
-EOF
-
-    cat <<'EOF' >"${mnt_path}/usr/local/lib/k8s-endpoint/mdns"
-#!/bin/sh
-# The masters of this cluster announce _k8s-api._tcp with TXT cluster=<name>;
-# their addresses become the endpoint's name in a marked block of /etc/hosts.
-# A master counts itself in once its API server runs, or when it is the one
-# to start the cluster. When nobody answers the block stays as it was
-set -eu
-hosts="${K8S_HOSTS_FILE:-/etc/hosts}"
-found="$(MDNS_SERVICE_FILTER=_k8s-api._tcp mdns-discover --output=json \
-    --timeout="${K8S_MDNS_TIMEOUT:-5s}" 2>/dev/null | python3 -c '
-import ipaddress, json, sys
-cluster = sys.argv[1]
-seen = []
-try:
-    entries = json.load(sys.stdin)
-except ValueError:
-    entries = []
-for e in entries if isinstance(entries, list) else []:
-    if not isinstance(e, dict) or e.get("txtMap", {}).get("cluster") != cluster:
-        continue
-    try:
-        a = ipaddress.ip_address(e.get("address", ""))
-    except ValueError:
-        continue
-    if a.is_link_local or a.is_loopback:
-        continue
-    if str(a) not in seen:
-        seen.append(str(a))
-seen.sort(key=lambda a: (ipaddress.ip_address(a).version, ipaddress.ip_address(a)))
-print("\n".join(seen))
-' "${K8S_CLUSTER}")" || found=""
-
-if [ "${K8S_ROLE}" = master ] && { [ "${K8S_BOOTSTRAP}" = yes ] || [ -s /etc/kubernetes/admin.conf ]; }; then
-    own="$(ip -4 route get 192.0.2.1 2>/dev/null | awk '{ for (i = 1; i < NF; i++) if ($i == "src") print $(i + 1) }')"
-    if [ -n "${own}" ]; then
-        found="$(printf '%s\n%s\n' "${own}" "${found}" | awk 'NF && !seen[$0]++')"
-    fi
-fi
-
-if [ -z "${found}" ]; then
-    echo "k8s-endpoint: no master of cluster ${K8S_CLUSTER} answered on mDNS" >&2
-    awk -v b="# k8s-endpoint ${K8S_CLUSTER} begin" '$0 == b { found = 1 } END { exit !found }' "${hosts}" 2>/dev/null
-    exit
-fi
-
-new="$(mktemp)"
-awk -v c="${K8S_CLUSTER}" '
-    $0 == "# k8s-endpoint " c " begin" { skip = 1; next }
-    $0 == "# k8s-endpoint " c " end" { skip = 0; next }
-    !skip { print }' "${hosts}" >"${new}"
-{
-    printf '# k8s-endpoint %s begin\n' "${K8S_CLUSTER}"
-    printf '%s\n' "${found}" | while read -r a; do
-        printf '%s %s\n' "${a}" "${K8S_ENDPOINT_HOST}"
-    done
-    printf '# k8s-endpoint %s end\n' "${K8S_CLUSTER}"
-} >>"${new}"
-if cmp -s "${new}" "${hosts}"; then
-    rm -f "${new}"
-else
-    cat "${new}" >"${hosts}"
-    rm -f "${new}"
-    echo "k8s-endpoint: ${K8S_ENDPOINT_HOST} is $(printf '%s\n' "${found}" | awk -v ORS=' ' 1)"
-fi
-EOF
-
-    cat <<'EOF' >"${mnt_path}/usr/local/lib/k8s-endpoint/dns"
-#!/bin/sh
-# The endpoint's name is kept in DNS, e.g. the router's dnsmasq; only check it
-set -eu
-if ! getent ahosts "${K8S_ENDPOINT_HOST}" >/dev/null; then
-    echo "k8s-endpoint: ${K8S_ENDPOINT_HOST} does not resolve" >&2
-    exit 1
-fi
-EOF
-
-    cat <<'EOF' >"${mnt_path}/usr/local/sbin/k8s-node"
-#!/bin/sh
-# Brings this node into its cluster once: the bootstrap master runs kubeadm
-# init, another master joins as control plane, a client joins as a node. A
-# failed attempt is reset before the next one, and a master's shared PKI is
-# put back from /etc/provision/k8s-pki each time. A master announces its API
-# server over DNS-SD once it runs
-set -eu
-# shellcheck source=/dev/null
-. /etc/provision/k8s.conf
-
-announce() {
-    mkdir -p /etc/systemd/dnssd /etc/systemd/resolved.conf.d /etc/systemd/network/20-dhcp.network.d
-    cat >/etc/systemd/dnssd/k8s-api.dnssd <<DNSSD
-[Service]
-Name=%H
-Type=_k8s-api._tcp
-Port=6443
-TxtText=cluster=${K8S_CLUSTER}
-DNSSD
-    printf '[Resolve]\nMulticastDNS=yes\n' >/etc/systemd/resolved.conf.d/k8s-mdns.conf
-    printf '[Network]\nMulticastDNS=yes\n' >/etc/systemd/network/20-dhcp.network.d/k8s-mdns.conf
-    networkctl reload
-    systemctl restart systemd-resolved.service
-}
-
-if [ -s /etc/kubernetes/kubelet.conf ] && [ ! -e /var/lib/provision/k8s-attempt ]; then
-    exit 0
-fi
-if [ -e /var/lib/provision/k8s-attempt ]; then
-    kubeadm reset -f >/dev/null 2>&1 || true
-fi
-mkdir -p /var/lib/provision
-touch /var/lib/provision/k8s-attempt
-
-set -- --ignore-preflight-errors=Swap
-if [ "${K8S_ROLE}" = master ]; then
-    mkdir -p /etc/kubernetes
-    rm -rf /etc/kubernetes/pki
-    cp -a /etc/provision/k8s-pki /etc/kubernetes/pki
-fi
-
-if [ "${K8S_ROLE}" = master ] && [ "${K8S_BOOTSTRAP}" = yes ]; then
-    cat >/etc/kubernetes/kubeadm-init.yaml <<YAML
-apiVersion: kubeadm.k8s.io/v1beta4
-kind: InitConfiguration
-bootstrapTokens:
-  - token: "${K8S_TOKEN}"
-    ttl: "0s"
-    usages: [signing, authentication]
-    groups: [system:bootstrappers:kubeadm:default-node-token]
-nodeRegistration:
-  name: "$(hostname)"
----
-apiVersion: kubeadm.k8s.io/v1beta4
-kind: ClusterConfiguration
-clusterName: "${K8S_CLUSTER}"
-controlPlaneEndpoint: "${K8S_ENDPOINT}"
-networking:
-  podSubnet: "${K8S_POD_CIDR}"
-  serviceSubnet: "${K8S_SERVICE_CIDR}"
----
-apiVersion: kubelet.config.k8s.io/v1beta1
-kind: KubeletConfiguration
-cgroupDriver: systemd
-failSwapOn: false
-memorySwap:
-  swapBehavior: NoSwap
-YAML
-    kubeadm init --config /etc/kubernetes/kubeadm-init.yaml "$@"
-    mkdir -p /root/.kube
-    install -m 0600 /etc/kubernetes/admin.conf /root/.kube/config
-    announce
-elif [ "${K8S_ROLE}" = master ]; then
-    kubeadm join "${K8S_ENDPOINT}" --control-plane --token "${K8S_TOKEN}" \
-        --discovery-token-ca-cert-hash "${K8S_CA_CERT_HASH}" "$@"
-    mkdir -p /root/.kube
-    install -m 0600 /etc/kubernetes/admin.conf /root/.kube/config
-    announce
-else
-    kubeadm join "${K8S_ENDPOINT}" --token "${K8S_TOKEN}" \
-        --discovery-token-ca-cert-hash "${K8S_CA_CERT_HASH}" "$@"
-fi
-rm -f /var/lib/provision/k8s-attempt
-echo "k8s-node: $(hostname) is in cluster ${K8S_CLUSTER} as ${K8S_ROLE}"
-EOF
-
-    cat <<'EOF' >"${mnt_path}/usr/local/sbin/k8s-cilium"
-#!/bin/sh
-# Cilium as the cluster's network, installed once from the bootstrap master
-# with the pod CIDR provisioning gave, Cilium's own default would cover 10/8
-# Pinned: Kernels from 7.2 reject a probe of Cilium before 1.20.2, and
-# cilium-cli v0.20.1 defaults to 1.20.1
-set -eu
-# shellcheck source=/dev/null
-. /etc/provision/k8s.conf
-[ "${K8S_ROLE}" = master ] && [ "${K8S_BOOTSTRAP}" = yes ] || exit 0
-export KUBECONFIG=/etc/kubernetes/admin.conf
-if cilium status >/dev/null 2>&1; then
-    exit 0
-fi
-cilium install --version 1.20.4 --set ipam.mode=cluster-pool \
-    --set "ipam.operator.clusterPoolIPv4PodCIDRList={${K8S_POD_CIDR}}"
-cilium status --wait --wait-duration 10m
-EOF
-    chmod 0755 "${mnt_path}/usr/local/sbin/k8s-prepare" "${mnt_path}/usr/local/sbin/k8s-endpoint" \
-        "${mnt_path}/usr/local/sbin/k8s-node" "${mnt_path}/usr/local/sbin/k8s-cilium" \
-        "${mnt_path}/usr/local/lib/k8s-endpoint/mdns" "${mnt_path}/usr/local/lib/k8s-endpoint/dns"
-
-    cat <<'EOF' >"${path}/kubelet.service"
-[Unit]
-Description=kubelet, started and configured by kubeadm
-Wants=network-online.target containerd.service
-After=network-online.target containerd.service
-
-[Service]
-Environment="KUBELET_KUBECONFIG_ARGS=--bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf --kubeconfig=/etc/kubernetes/kubelet.conf"
-Environment="KUBELET_CONFIG_ARGS=--config=/var/lib/kubelet/config.yaml"
-EnvironmentFile=-/var/lib/kubelet/kubeadm-flags.env
-ExecStart=/usr/bin/kubelet $KUBELET_KUBECONFIG_ARGS $KUBELET_CONFIG_ARGS $KUBELET_KUBEADM_ARGS $KUBELET_EXTRA_ARGS
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=role-k8s-master.target role-k8s-client.target
-EOF
-
-    cat <<'EOF' >"${path}/k8s-prepare.service"
-[Unit]
-Description=Kernel, containerd and kubelet settings for Kubernetes
-ConditionPathExists=/etc/provision/k8s.conf
-After=systemd-networkd.service systemd-resolved.service
-PartOf=role-k8s-master.target role-k8s-client.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/usr/local/sbin/k8s-prepare
-
-[Install]
-WantedBy=role-k8s-master.target role-k8s-client.target
-EOF
-
-    cat <<'EOF' >"${path}/k8s-endpoint.service"
-[Unit]
-Description=Resolve the Kubernetes control-plane endpoint
-ConditionPathExists=/etc/provision/k8s.conf
-Wants=network-online.target
-After=network-online.target k8s-prepare.service
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/k8s-endpoint
-EOF
-
-    cat <<'EOF' >"${path}/k8s-endpoint.timer"
-[Unit]
-Description=Keep the Kubernetes control-plane endpoint resolvable
-PartOf=role-k8s-master.target role-k8s-client.target
-
-[Timer]
-OnActiveSec=0
-OnUnitActiveSec=60s
-
-[Install]
-WantedBy=role-k8s-master.target role-k8s-client.target
-EOF
+    install_services "${mnt_path}" \
+        usr/local/sbin/k8s-prepare usr/local/sbin/k8s-endpoint \
+        usr/local/sbin/k8s-node usr/local/sbin/k8s-cilium \
+        usr/local/lib/k8s-endpoint/mdns usr/local/lib/k8s-endpoint/dns \
+        etc/systemd/system/role-k8s-master.target etc/systemd/system/role-k8s-client.target \
+        etc/systemd/system/kubelet.service etc/systemd/system/k8s-prepare.service \
+        etc/systemd/system/k8s-endpoint.service etc/systemd/system/k8s-endpoint.timer \
+        etc/systemd/system/k8s-master.service etc/systemd/system/k8s-client.service \
+        etc/systemd/system/k8s-cilium.service
 
     local role
-    for role in master client; do
-        cat <<EOF >"${path}/k8s-${role}.service"
-[Unit]
-Description=Bring this node into its Kubernetes cluster as ${role}
-ConditionPathExists=/etc/provision/k8s.conf
-ConditionPathExists=|!/etc/kubernetes/kubelet.conf
-ConditionPathExists=|/var/lib/provision/k8s-attempt
-Wants=network-online.target containerd.service
-After=network-online.target containerd.service k8s-prepare.service k8s-endpoint.service
-Requires=k8s-prepare.service
-PartOf=role-k8s-${role}.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStartPre=/usr/local/sbin/k8s-endpoint
-ExecStart=/usr/local/sbin/k8s-node
-Restart=on-failure
-RestartSec=30
-TimeoutStartSec=15min
-
-[Install]
-WantedBy=role-k8s-${role}.target
-EOF
-    done
-
-    cat <<'EOF' >"${path}/k8s-cilium.service"
-[Unit]
-Description=Install Cilium from the bootstrap master
-ConditionPathExists=/etc/provision/k8s.conf
-After=k8s-master.service
-Requires=k8s-master.service
-PartOf=role-k8s-master.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/usr/local/sbin/k8s-cilium
-Restart=on-failure
-RestartSec=60
-TimeoutStartSec=20min
-
-[Install]
-WantedBy=role-k8s-master.target
-EOF
-
     local role_unit
     for role in master client; do
         mkdir -p "${path}/role-k8s-${role}.target.wants"
@@ -2116,46 +1283,8 @@ wifi_enable() {
 write_booted_script() {
     local mnt_path
     mnt_path="${1}"
-    local path
-    path="${mnt_path}/usr/local/bin"
 
-    cat <<EOF >"${path}/booted"
-#!/usr/bin/env python
-
-import os
-import socket
-import sys
-
-def signal_readiness(ip, port):
-        s = socket.socket()
-
-        try:
-            s.settimeout(3)
-            s.connect((ip,port))
-        except socket.error as msg:
-            s.close()
-            print("Could not open {}:{} {}".format(ip, port, msg))
-            return(1)
-        else:
-            s.close()
-            print("{}:{} is up".format(ip, port))
-            return(0)
-
-host = os.environ.get('SUPERVISE_HOST')
-port = os.environ.get('SUPERVISE_PORT')
-
-if not host:
-    print("You need to provide the address of the supervising host via SUPERVISE_HOST.\nAborting..")
-    sys.exit(1)
-
-if not port:
-    print("You need to provide the port of the supervising host via SUPERVISE_PORT.\nAborting..")
-    sys.exit(1)
-
-signal_readiness(host, int(port))
-EOF
-
-    chmod +x "${path}/booted"
+    install_services "${mnt_path}" usr/local/bin/booted
 }
 
 write_booted_service() {
@@ -2163,24 +1292,15 @@ write_booted_service() {
     mnt_path="${1}"
     local host
     host="${2}"
+    local port
+    port="${3}"
     local path
     path="${mnt_path}/etc/systemd/system"
 
-    cat <<EOF >"${path}/booted.service"
-[Unit]
-Description=Signal readiness to host
-After=net-config.service
-
-[Service]
-Type=oneshot
-Environment=SUPERVISE_HOST=${host}
-Environment=SUPERVISE_PORT=${port}
-ExecStart=sleep 5
-ExecStart=/usr/local/bin/booted
-
-[Install]
-WantedBy=getty.target
-EOF
+    install_services "${mnt_path}" etc/systemd/system/booted.service
+    mkdir -p "${path}/booted.service.d"
+    printf '[Service]\nEnvironment=SUPERVISE_HOST=%s\nEnvironment=SUPERVISE_PORT=%s\n' \
+        "${host}" "${port}" >"${path}/booted.service.d/supervise.conf"
 
     ln -s -f "../booted.service" "${path}/getty.target.wants/booted.service"
 }
@@ -2237,18 +1357,7 @@ write_net_config() {
 
     case "${net_mode}" in
     systemd-networkd-dhcp)
-        local path
-        path="${mnt_path}/etc/systemd/network"
-
-        mkdir -p "${path}"
-
-        cat <<EOF >"${path}/20-dhcp.network"
-[Match]
-Name=en*
-
-[Network]
-DHCP=yes
-EOF
+        install_services "${mnt_path}" etc/systemd/network/20-dhcp.network
 
         mkdir -p "${mnt_path}/etc/systemd/system/multi-user.target.wants"
         ln -s -f "/usr/lib/systemd/system/systemd-networkd.service" \
@@ -2261,16 +1370,10 @@ EOF
         local path
         path="${mnt_path}/etc/systemd/network"
 
-        mkdir -p "${path}"
-
-        cat <<EOF >"${path}/20-static.network"
-[Match]
-Name=en*
-
-[Network]
-Address=${net_address}
-Gateway=${net_gateway}
-EOF
+        install_services "${mnt_path}" etc/systemd/network/20-static.network
+        mkdir -p "${path}/20-static.network.d"
+        printf '[Network]\nAddress=%s\nGateway=%s\n' "${net_address}" "${net_gateway}" \
+            >"${path}/20-static.network.d/address.conf"
 
         mkdir -p "${mnt_path}/etc/systemd/system/multi-user.target.wants"
         ln -s -f "/usr/lib/systemd/system/systemd-networkd.service" \
@@ -2286,33 +1389,13 @@ EOF
         local path
         path="${mnt_path}/etc/systemd/system"
 
-        cat <<EOF >"${path}/net-interface.path"
-[Unit]
-Description=Monitor network interface
-
-[Path]
-PathChanged=/sys/class/net/${net_device}
-Unit=net-config.service
-
-[Install]
-WantedBy=getty.target
-EOF
-
-        cat <<EOF >"${path}/net-config.service"
-[Unit]
-Description=Static Network Configuration
-
-[Install]
-WantedBy=network.target
-
-[Service]
-Type=oneshot
-# Hack: The path condition does not work as intended yet
-ExecStart=/bin/sleep 3
-ExecStart=/bin/ip link set dev ${net_device} up
-ExecStart=/bin/ip addr add ${net_address} dev ${net_device}
-ExecStart=/bin/ip route add default via ${net_gateway}
-EOF
+        install_services "${mnt_path}" etc/systemd/system/net-interface.path \
+            etc/systemd/system/net-config.service
+        mkdir -p "${path}/net-interface.path.d" "${path}/net-config.service.d"
+        printf '[Path]\nPathChanged=/sys/class/net/%s\n' "${net_device}" \
+            >"${path}/net-interface.path.d/device.conf"
+        printf '[Service]\nEnvironment=NET_DEVICE=%s\nEnvironment=NET_ADDRESS=%s\nEnvironment=NET_GATEWAY=%s\n' \
+            "${net_device}" "${net_address}" "${net_gateway}" >"${path}/net-config.service.d/address.conf"
 
         ln -s -f "../net-config.service" "${path}/getty.target.wants/net-config.service"
         ln -s -f "../net-interface.path" "${path}/getty.target.wants/net-interface.path"
@@ -2332,19 +1415,7 @@ add_network_debug_print() {
     local path
     path="${mnt_path}/etc/systemd/system"
 
-    cat <<'EOF' >"${path}/network-debug.service"
-[Unit]
-Description=Print network interface state to the console
-After=network.target
-
-[Service]
-Type=oneshot
-StandardOutput=journal+console
-ExecStart=/bin/sh -c 'echo "=== network-debug: interfaces ==="; ip -br link; echo "=== network-debug: addresses ==="; ip -br addr'
-
-[Install]
-WantedBy=multi-user.target
-EOF
+    install_services "${mnt_path}" etc/systemd/system/network-debug.service
 
     mkdir -p "${path}/multi-user.target.wants"
     ln -s -f "/etc/systemd/system/network-debug.service" \
@@ -2446,26 +1517,7 @@ add_dhcp_client() {
     local path
     path="${mnt_path}/etc/systemd/system"
 
-    cat <<'EOF' >"${mnt_path}/usr/local/sbin/net-dhcp"
-#!/bin/sh
-iface="$(ls /sys/class/net | grep -v '^lo$' | head -1)"
-ip link set dev "${iface}" up
-exec /usr/local/sbin/dhcp -interface="${iface}"
-EOF
-    chmod 755 "${mnt_path}/usr/local/sbin/net-dhcp"
-
-    cat <<EOF >"${path}/net-dhcp.service"
-[Unit]
-Description=gokrazy DHCP client
-
-[Service]
-Type=simple
-ExecStart=/usr/local/sbin/net-dhcp
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
+    install_services "${mnt_path}" usr/local/sbin/net-dhcp etc/systemd/system/net-dhcp.service
     mkdir -p "${path}/multi-user.target.wants"
     ln -s -f "../net-dhcp.service" "${path}/multi-user.target.wants/net-dhcp.service"
 }
@@ -2487,76 +1539,7 @@ virtio_9p_automount() {
     local path
     path="${mnt_path}/etc/systemd/system"
 
-    cat <<'EOF' >"${mnt_path}/usr/local/sbin/9p-automount"
-#!/bin/sh
-#
-# Mount every virtio-9p share the host exported, at the path its mount tag
-# spells out. A tag that does not look like a path is skipped rather than
-# guessed at: 9p tags are free-form and something else may have set one
-
-set -u
-
-status=0
-
-for attr in /sys/bus/virtio/devices/*/mount_tag; do
-    [ -r "${attr}" ] || continue
-
-    # sysfs NUL-terminates the attribute and command substitution drops the
-    # byte with a warning, so strip it here instead
-    tag="$(tr -d '\0' < "${attr}")" || continue
-    [ -n "${tag}" ] || continue
-
-    # ~ crosses the wire literally, because only this side knows whose home
-    # it means, and on these images that is root's
-    case "${tag}" in
-    /*) target="${tag}" ;;
-    "~") target="/root" ;;
-    "~/"*) target="/root/${tag#\~/}" ;;
-    *) continue ;;
-    esac
-
-    if mountpoint -q "${target}" 2>/dev/null; then
-        continue
-    fi
-
-    if ! mkdir -p "${target}"; then
-        printf '9p-automount: cannot create %s\n' "${target}" >&2
-        status=1
-        continue
-    fi
-
-    # No cache= on purpose: the default keeps the guest seeing host edits as
-    # they happen, which is the point of sharing a source tree. It costs mmap
-    # on the share, so binaries cannot be executed from one
-    if ! mount -t 9p -o trans=virtio,version=9p2000.L,msize=262144 \
-        "${tag}" "${target}"; then
-        printf '9p-automount: failed to mount %s at %s\n' "${tag}" "${target}" >&2
-        status=1
-        continue
-    fi
-
-    printf '9p-automount: mounted %s at %s\n' "${tag}" "${target}"
-done
-
-exit "${status}"
-EOF
-    chmod 755 "${mnt_path}/usr/local/sbin/9p-automount"
-
-    cat <<'EOF' >"${path}/9p-automount.service"
-[Unit]
-Description=Mount virtio-9p shares exported by the host
-After=local-fs.target
-Before=getty.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/usr/local/sbin/9p-automount
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
+    install_services "${mnt_path}" usr/local/sbin/9p-automount etc/systemd/system/9p-automount.service
     mkdir -p "${path}/multi-user.target.wants"
     ln -s -f "../9p-automount.service" \
         "${path}/multi-user.target.wants/9p-automount.service"
@@ -7519,14 +6502,17 @@ provision() {
             "${uid}"
     fi
 
+    info "$(printf "Fetching cfg-services %s\n" "${cfg_services_ref}")"
+    git_fresh_clone "${cfg_services}" --branch "${cfg_services_ref}" "${cfg_services_url}"
+
     info "Writing network config"
     write_net_config "${mnt_path}" "${target_arch}" \
         "$(net_mode_for_target "${net_mode}" "${build_target}")" \
         "${net_device}" "${net_address}" "${net_gateway}"
     add_network_debug_print "${mnt_path}"
 
-    write_booted_script "${mnt_path}" "${net_host_readiness_port}"
-    write_booted_service "${mnt_path}" "${net_host_address}"
+    write_booted_script "${mnt_path}"
+    write_booted_service "${mnt_path}" "${net_host_address}" "${net_host_readiness_port}"
 
     info "Writing wpa config"
     write_wpa_supplicant_config "${mnt_path}" \
@@ -8191,20 +7177,7 @@ service_enable() {
     local target
     target="${3}"
 
-    cat <<EOF >"${path}/${service}.service"
-[Unit]
-Description=OpenSSH server daemon
-After=net-config.service
-
-[Service]
-ExecStartPre=mount -o remount,rw /
-ExecStartPre=sleep 2
-ExecStartPre=/usr/bin/ssh-keygen -A
-# Honour sshd_config, which limits root login to loopback (see configure_sshd)
-ExecStart=/usr/sbin/sshd -D -e
-ExecReload=/bin/kill -HUP $MAINPID
-KillMode=process
-EOF
+    install_services "${1}" "etc/systemd/system/${service}.service"
 
     ln -s -f "../${service}.service" "${path}/${target}.target.wants/${service}.service"
 }
