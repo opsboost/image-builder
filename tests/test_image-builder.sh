@@ -23,7 +23,7 @@ test_disk_file_exists() {
 test_disk_partition_count() {
     local n_expected_partitions
     n_expected_partitions=3
-    n="$(fdisk -l "${disk_file}" | grep \.img | grep -v Disk | wc -l)"
+    n="$(fdisk -l "${disk_file}" | awk '/\.img/ && !/Disk/ { n++ } END { print n + 0 }')"
     assert_equals "$n_expected_partitions" "${n}" "Partition count should be 3"
 }
 

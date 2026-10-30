@@ -23,16 +23,26 @@ setup_suite() {
 
     SCRIPT_UNDER_TEST="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/image-builder"
     CFG_PROVISION="${CFG_PROVISION:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/cfg-provision}"
+    CFG_SERVICES="${CFG_SERVICES:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/cfg-services}"
     ROUTER="${CFG_PROVISION}/router"
     local f
     for f in lighttpd openssl curl python3 useradd; do
-        command -v "${f}" >/dev/null 2>&1 || { echo "test_provision_lighttpd: ${f} is missing" >&2; exit 1; }
+        command -v "${f}" >/dev/null 2>&1 || {
+            echo "test_provision_lighttpd: ${f} is missing" >&2
+            exit 1
+        }
     done
     for f in etc/lighttpd/lighttpd.conf www-provision/cgi-bin/provision; do
-        [ -f "${ROUTER}/${f}" ] || { echo "test_provision_lighttpd: no ${f} in ${ROUTER}" >&2; exit 1; }
+        [ -f "${ROUTER}/${f}" ] || {
+            echo "test_provision_lighttpd: no ${f} in ${ROUTER}" >&2
+            exit 1
+        }
     done
     [ -x "${PROVISIONER_BIN:-}/provisioner" ] ||
-        { echo "test_provision_lighttpd: no provisioner in PROVISIONER_BIN" >&2; exit 1; }
+        {
+            echo "test_provision_lighttpd: no provisioner in PROVISIONER_BIN" >&2
+            exit 1
+        }
 
     W="$(mktemp -d)"
     umask 022
@@ -54,6 +64,7 @@ setup_suite() {
     pki_cert "${W}/k8smaster" "${W}/ca" "/CN=k8smaster" clientAuth
     pki_cert "${W}/k8sclient" "${W}/ca" "/CN=k8sclient" clientAuth
     pki_cert "${W}/unitdev" "${W}/ca" "/CN=unitdev" clientAuth
+    pki_cert "${W}/lingerdev" "${W}/ca" "/CN=lingerdev" clientAuth
     pki_cert "${W}/cfg-provision" "${W}/ca" "/CN=cfg-provision" clientAuth
     pki_cert "${W}/rogue-signer" "${W}/other-ca" "/CN=cfg-provision" clientAuth
     pki_cert "${W}/slash" "${W}/ca" "/CN=..\/provision\/testdev" clientAuth
@@ -71,7 +82,7 @@ setup_suite() {
     install -m 0755 "${ROUTER}/www-provision/cgi-bin/provision" /www-provision/cgi-bin/provision
     cat >"${W}/testdev.toml" <<EOF
 [system]
-user = "mue"
+user = "newuser"
 hostname = "testdev"
 roles = ["tv", "wg"]
 
@@ -90,6 +101,7 @@ persistent_keepalive = 25
 EOF
     printf '[ssh]\nauthorized_keys = ["%s"]\n' "${DEVICE_KEY}" >"${W}/timedev.toml"
     printf '[system]\nhostname = "hostdev"\n' >"${W}/hostdev.toml"
+    printf '[system]\nuser = "lingered"\n' >"${W}/lingerdev.toml"
     cat >"${W}/multidev.toml" <<EOF
 [system]
 timezone = "Test/Zone"
@@ -113,7 +125,7 @@ EOF
     openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "${W}/sa.key" 2>/dev/null
     openssl pkey -in "${W}/sa.key" -pubout -out "${W}/sa.pub"
     {
-        printf '[system]\nroles = ["k8s-master"]\n\n[k8s]\ncluster = "e2m"\n'
+        printf '[system]\nroles = ["k8s-master"]\n\n[k8s]\ncluster = "test"\n'
         printf 'token = "abcdef.0123456789abcdef"\nca_cert_hash = "%s"\nbootstrap = true\n\n[k8s.pki]\n' "${K8S_HASH}"
         local k f
         for k in ca_crt:other-ca.pem ca_key:other-ca.key front_proxy_ca_crt:other-ca.pem front_proxy_ca_key:other-ca.key \
@@ -122,7 +134,7 @@ EOF
             printf '%s = """\n%s\n"""\n' "${k%%:*}" "$(cat "${W}/${f}")"
         done
     } >"${W}/k8smaster.toml"
-    printf '[system]\nroles = ["k8s-client"]\n\n[k8s]\ncluster = "e2m"\ntoken = "abcdef.0123456789abcdef"\nca_cert_hash = "%s"\n' \
+    printf '[system]\nroles = ["k8s-client"]\n\n[k8s]\ncluster = "test"\ntoken = "abcdef.0123456789abcdef"\nca_cert_hash = "%s"\n' \
         "${K8S_HASH}" >"${W}/k8sclient.toml"
 
     cat >"${W}/unitdev.toml" <<'EOF'
@@ -171,15 +183,18 @@ EOF
     mkdir -p "${W}/certs/cfg-provision" "${W}/plain"
     cp "${W}/cfg-provision.pem" "${W}/cfg-provision.key" "${W}/certs/cfg-provision/"
     cp "${W}/ca.pem" "${W}/certs/cfg-provision/ca.pem"
-    for name in testdev timedev hostdev multidev bothdev k8smaster k8sclient unitdev; do
+    for name in testdev timedev hostdev multidev bothdev k8smaster k8sclient unitdev lingerdev; do
         mkdir -p "${W}/certs/${name}"
         cp "${W}/${name}.pem" "${W}/${name}.key" "${W}/ca.pem" "${W}/certs/${name}/"
         cp "${W}/${name}.toml" "${W}/plain/${name}.toml" 2>/dev/null ||
             printf '[ssh]\nauthorized_keys = ["%s"]\n' "${DEVICE_KEY}" >"${W}/plain/${name}.toml"
     done
-    PROVISIONER_ENV=/dev/null PROVISIONER_DATA="${W}" "${PROVISIONER_BIN}/provisioner" -local seal >/dev/null ||
-        { echo "test_provision_lighttpd: provisioner seal failed" >&2; exit 1; }
-    for name in testdev timedev hostdev multidev bothdev k8smaster k8sclient unitdev; do
+    PROVISIONER_ENV=/dev/null PROVISIONER_DATA="${W}" "${PROVISIONER_BIN}/provisioner" seal >/dev/null ||
+        {
+            echo "test_provision_lighttpd: provisioner seal failed" >&2
+            exit 1
+        }
+    for name in testdev timedev hostdev multidev bothdev k8smaster k8sclient unitdev lingerdev; do
         install -m 0640 -o root -g www-data "${W}/devices/${name}.cms" "/etc/provision/${name}.cms"
     done
     install -m 0640 -o root -g www-data "${W}/plain/bothdev.toml" /etc/provision/bothdev.toml
@@ -201,7 +216,10 @@ EOF
             -key /etc/lighttpd/server.key -ca /etc/provision/ca.pem -dir /etc/provision 2>"${W}/router.log" &
         echo $! >"${W}/router.pid"
     else
-        lighttpd -f "${W}/lighttpd.conf" || { echo "test_provision_lighttpd: lighttpd did not start" >&2; exit 1; }
+        lighttpd -f "${W}/lighttpd.conf" || {
+            echo "test_provision_lighttpd: lighttpd did not start" >&2
+            exit 1
+        }
     fi
     local i
     for i in 1 2 3 4 5 6 7 8 9 10; do
@@ -295,6 +313,7 @@ install_fetch_provision() {
         # shellcheck disable=SC1090
         source <(sed '/^args=("\$@")$/,$d' "${SCRIPT_UNDER_TEST}")
         log_level=quiet
+        cfg_services="${CFG_SERVICES}"
         write_provision_fetch "${root}" moonshine
     )
     install -m 0755 "${root}/usr/local/sbin/provision-git-clone" /usr/local/sbin/
@@ -332,13 +351,13 @@ test_fetch_provision_finds_the_server_and_applies_the_file() {
 
     assert_equals "_provision._tcp" "$(cat "${W}/mdns")" "the server is looked up over mDNS"
     assert_fails "id moonshine" "the image user is renamed"
-    assert "id mue"
-    assert "test -d /home/mue"
-    assert "grep -qxF '${DEVICE_KEY}' /home/mue/.ssh/authorized_keys"
+    assert "id newuser"
+    assert "test -d /home/newuser"
+    assert "grep -qxF '${DEVICE_KEY}' /home/newuser/.ssh/authorized_keys"
     assert_equals "set-hostname testdev" "$(cat "${W}/hostnamectl")"
     assert "grep -qx 'enable role-tv.target' ${W}/systemctl"
     assert "grep -qx 'enable role-wg.target' ${W}/systemctl"
-    assert "test -L /etc/systemd/system/multi-user.target.wants/fetch-provision@mue.service"
+    assert "test -L /etc/systemd/system/multi-user.target.wants/fetch-provision@newuser.service"
     assert_fails "test -e /etc/systemd/system/multi-user.target.wants/fetch-provision@moonshine.service"
     assert "grep -qx 'PrivateKey=${WG_KEY}' /etc/systemd/network/wg0.netdev"
     assert "grep -qx 'ActivationPolicy=manual' /etc/systemd/network/wg0.network"
@@ -434,6 +453,63 @@ EOF
     stub uname "echo hostdev"
     PATH="${W}/bin:${PATH}" PROVISION_ESP="${W}/host-esp" "${FETCH[@]}" hostuser >/dev/null 2>&1
     assert_fails "test -e ${W}/host-networkctl" "an unchanged hostname leaves the network alone"
+}
+
+test_a_user_in_session_with_a_running_unit_and_linger_is_renamed() {
+    install_fetch_provision
+    id lingerer >/dev/null 2>&1 || useradd -m -U lingerer
+    mkdir -p /var/lib/systemd/linger "${W}/linger-esp/provision" /etc/systemd/system/autovt@tty9.service.d
+    : >/var/lib/systemd/linger/lingerer
+    printf '[Service]\nUser=lingerer\n' >/etc/systemd/system/autovt@tty9.service.d/user.conf
+    cp "${W}/ca.pem" "${W}/linger-esp/provision/ca.pem"
+    cp "${W}/lingerdev.pem" "${W}/linger-esp/provision/client.pem"
+    cp "${W}/lingerdev.key" "${W}/linger-esp/provision/client.key"
+    printf '%s\n' "${PIN}" >"${W}/linger-esp/provision/pinnedpubkey"
+    rm -f "${W}/linger.pid"
+    setsid -f sh -c "echo \$\$ >${W}/linger.pid; exec setpriv --reuid=lingerer --regid=lingerer --clear-groups sleep 600"
+    local i
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        [ -s "${W}/linger.pid" ] && break
+        sleep 0.1
+    done
+    local uid
+    uid="$(id -u lingerer)"
+    stub mdns-discover "echo '[{\"address\":\"127.0.0.1\",\"port\":8443}]'"
+    cat >"${W}/bin/systemctl" <<EOF
+#!/bin/sh
+echo "\$*" >>${W}/linger-systemctl
+[ "\$*" = "show -P ActiveState autovt@tty9.service" ] && echo active
+exit 0
+EOF
+    cat >"${W}/bin/loginctl" <<EOF
+#!/bin/sh
+echo "\$*" >>${W}/linger-loginctl
+if [ "\$*" = "terminate-user lingerer" ]; then
+    kill \$(cat ${W}/linger.pid)
+fi
+EOF
+    cat >"${W}/bin/usermod" <<EOF
+#!/bin/sh
+for user; do :; done
+if [ "\${user}" = lingerer ] && kill -0 \$(cat ${W}/linger.pid) 2>/dev/null; then
+    echo "usermod: user lingerer is currently used by process \$(cat ${W}/linger.pid)" >&2
+    exit 8
+fi
+exec $(command -v usermod) "\$@"
+EOF
+    chmod 0755 "${W}/bin/systemctl" "${W}/bin/loginctl" "${W}/bin/usermod"
+
+    local out
+    out="$(PATH="${W}/bin:${PATH}" PROVISION_ESP="${W}/linger-esp" "${FETCH[@]}" lingerer 2>&1)"
+    assert_equals 0 "$?" "${out}"
+    assert "id lingered"
+    assert_fails "id lingerer"
+    assert_equals "$(printf '%s\n' "terminate-user lingerer" "disable-linger lingerer" "enable-linger lingered")" \
+        "$(cat "${W}/linger-loginctl")" "the sessions end and linger moves to the new name"
+    assert_equals "$(printf '%s\n' "stop autovt@tty9.service" "stop user@${uid}.service" "--no-block start autovt@tty9.service")" \
+        "$(awk '/^stop |start /' "${W}/linger-systemctl")" "the unit and the user manager stop for the rename and the unit starts again"
+    assert "grep -qx 'User=lingered' /etc/systemd/system/autovt@tty9.service.d/user.conf"
+    rm -rf /etc/systemd/system/autovt@tty9.service.d
 }
 
 test_users_shells_environment_and_clones_are_provisioned() {
@@ -597,6 +673,7 @@ install_k8s_roles() {
         # shellcheck disable=SC1090
         source <(sed '/^args=("\$@")$/,$d' "${SCRIPT_UNDER_TEST}")
         log_level=quiet
+        cfg_services="${CFG_SERVICES}"
         write_k8s_roles "${root}"
     )
     cp -a "${root}/etc/systemd/system/." /etc/systemd/system/
@@ -636,7 +713,7 @@ test_a_k8s_client_gets_the_cluster_without_pki() {
     out="$(provision_as k8sclient k8sclientuser)"
     assert_equals 0 "$?" "${out}"
     assert "grep -qx K8S_ROLE=client /etc/provision/k8s.conf"
-    assert "grep -qx K8S_ENDPOINT=e2m.k8s.internal:6443 /etc/provision/k8s.conf"
+    assert "grep -qx K8S_ENDPOINT=test.k8s.internal:6443 /etc/provision/k8s.conf"
     assert_fails "test -e /etc/provision/k8s-pki" "no cluster CA key on a client"
     assert "grep -qx 'enable role-k8s-client.target' ${W}/k8sclient-systemctl"
 }
@@ -650,6 +727,7 @@ test_systemd_units_are_installed_enabled_and_started() {
     chmod 0711 "${W}"
     chmod 0755 "${W}/unitdev-bin"
     chmod 0666 "${W}/unitdev-systemctl"
+    # shellcheck disable=SC2016
     printf '#!/bin/sh\nif [ "$(id -u)" = 0 ]; then echo "root $*"; else echo "$(id -un) HOME=${HOME} $*"; fi >>%s\n' \
         "${W}/unitdev-systemctl" >"${W}/unitdev-bin/systemctl"
     chmod 0755 "${W}/unitdev-bin/systemctl"
