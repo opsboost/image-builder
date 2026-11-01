@@ -2723,21 +2723,46 @@ test_gentoo_k8s_composition_is_headless_like_containeros() {
         "resolved announces the masters, networkd carries the hostname to DHCP"
 }
 
+# Where write_k8s_roles puts the system extension k8s
+K8S_EXT=var/lib/extensions/k8s
+
+# A rootfs write_k8s_roles takes: kubeadm, and systemd-sysext to merge the extension
+k8s_rootfs() {
+    mkdir -p "${1}/usr/bin" "${1}/usr/lib/systemd/system"
+    touch "${1}/usr/bin/kubeadm" "${1}/usr/lib/systemd/system/systemd-sysext.service"
+    chmod +x "${1}/usr/bin/kubeadm"
+}
+
 test_k8s_roles_need_kubeadm_in_the_rootfs() {
     local d
     d="$(fake_rootfs_with sway)"
     write_k8s_roles "${d}"
-    assert_fails "test -e ${d}/etc/systemd/system/role-k8s-master.target"
+    assert_fails "test -e ${d}/${K8S_EXT}"
+    rm -rf "${d}"
+}
+
+test_k8s_roles_need_systemd_sysext() {
+    local d
+    d="$(fake_rootfs_with kubeadm)"
+    assert_fails "(write_k8s_roles ${d}) 2>/dev/null" "nothing would merge the extension"
+    assert_fails "test -e ${d}/${K8S_EXT}"
     rm -rf "${d}"
 }
 
 test_k8s_roles_hang_their_units_off_the_role_targets() {
     local d
-    d="$(fake_rootfs_with kubeadm)"
+    d="$(mktemp -d)"
+    k8s_rootfs "${d}"
     write_k8s_roles "${d}"
 
+    local e
+    e="${d}/${K8S_EXT}"
+    assert "grep -qx EXTENSION_RELOAD_MANAGER=1 ${e}/usr/lib/extension-release.d/extension-release.k8s" \
+        "systemd loads the units once the extension is merged"
+    assert_equals "/usr/lib/systemd/system/systemd-sysext.service" \
+        "$(readlink "${d}/etc/systemd/system/sysinit.target.wants/systemd-sysext.service")" "merged at boot"
     local s
-    s="${d}/etc/systemd/system"
+    s="${e}/usr/lib/systemd/system"
     local role
     local unit
     for role in master client; do
@@ -2759,10 +2784,10 @@ test_k8s_roles_hang_their_units_off_the_role_targets() {
     local f
     for f in usr/local/sbin/k8s-prepare usr/local/sbin/k8s-endpoint usr/local/sbin/k8s-node \
         usr/local/sbin/k8s-cilium usr/local/lib/k8s-endpoint/mdns usr/local/lib/k8s-endpoint/dns; do
-        assert "test -x ${d}/${f}" "${f}"
+        assert "test -x ${e}/${f}" "${f}"
     done
-    assert_matches "Type=_k8s-api._tcp" "$(cat "${d}/usr/local/sbin/k8s-node")"
-    assert_matches 'ttl: "0s"' "$(cat "${d}/usr/local/sbin/k8s-node")"
+    assert_matches "Type=_k8s-api._tcp" "$(cat "${e}/usr/local/sbin/k8s-node")"
+    assert_matches 'ttl: "0s"' "$(cat "${e}/usr/local/sbin/k8s-node")"
 
     rm -rf "${d}"
 }
@@ -2780,8 +2805,8 @@ k8s_endpoint_env() {
 k8s_endpoint_run() {
     local d
     d="${1}"
-    PATH="${d}/bin:${PATH}" K8S_CONF="${d}/k8s.conf" K8S_ENDPOINT_LIB="${d}/root/usr/local/lib/k8s-endpoint" \
-        K8S_HOSTS_FILE="${d}/hosts" sh "${d}/root/usr/local/sbin/k8s-endpoint"
+    PATH="${d}/bin:${PATH}" K8S_CONF="${d}/k8s.conf" K8S_ENDPOINT_LIB="${d}/root/${K8S_EXT}/usr/local/lib/k8s-endpoint" \
+        K8S_HOSTS_FILE="${d}/hosts" sh "${d}/root/${K8S_EXT}/usr/local/sbin/k8s-endpoint"
 }
 
 k8s_mdns_answers() {
@@ -2793,9 +2818,7 @@ test_k8s_endpoint_mdns_writes_the_masters_of_its_cluster() {
     provision_toml_python >/dev/null || return 0
     local d
     d="$(mktemp -d)"
-    mkdir -p "${d}/root/usr/bin"
-    touch "${d}/root/usr/bin/kubeadm"
-    chmod +x "${d}/root/usr/bin/kubeadm"
+    k8s_rootfs "${d}/root"
     write_k8s_roles "${d}/root"
     k8s_endpoint_env "${d}" client mdns
     printf '127.0.0.1 localhost\n192.0.2.99 router\n' >"${d}/hosts"
@@ -2834,9 +2857,7 @@ test_k8s_endpoint_mdns_without_any_master_fails() {
     provision_toml_python >/dev/null || return 0
     local d
     d="$(mktemp -d)"
-    mkdir -p "${d}/root/usr/bin"
-    touch "${d}/root/usr/bin/kubeadm"
-    chmod +x "${d}/root/usr/bin/kubeadm"
+    k8s_rootfs "${d}/root"
     write_k8s_roles "${d}/root"
     k8s_endpoint_env "${d}" client mdns
     printf '127.0.0.1 localhost\n' >"${d}/hosts"
@@ -2853,9 +2874,7 @@ test_k8s_endpoint_a_bootstrap_master_counts_itself_in() {
     provision_toml_python >/dev/null || return 0
     local d
     d="$(mktemp -d)"
-    mkdir -p "${d}/root/usr/bin"
-    touch "${d}/root/usr/bin/kubeadm"
-    chmod +x "${d}/root/usr/bin/kubeadm"
+    k8s_rootfs "${d}/root"
     write_k8s_roles "${d}/root"
     printf '127.0.0.1 localhost\n' >"${d}/hosts"
 
@@ -2877,9 +2896,7 @@ test_k8s_endpoint_a_bootstrap_master_counts_itself_in() {
 test_k8s_endpoint_methods_are_scripts() {
     local d
     d="$(mktemp -d)"
-    mkdir -p "${d}/root/usr/bin"
-    touch "${d}/root/usr/bin/kubeadm"
-    chmod +x "${d}/root/usr/bin/kubeadm"
+    k8s_rootfs "${d}/root"
     write_k8s_roles "${d}/root"
 
     k8s_endpoint_env "${d}" client vip
@@ -2889,8 +2906,8 @@ test_k8s_endpoint_methods_are_scripts() {
     assert_matches "no method vip" "${out}"
 
     # shellcheck disable=SC2016
-    printf '#!/bin/sh\necho "vip for ${K8S_ENDPOINT_HOST}"\n' >"${d}/root/usr/local/lib/k8s-endpoint/vip"
-    chmod +x "${d}/root/usr/local/lib/k8s-endpoint/vip"
+    printf '#!/bin/sh\necho "vip for ${K8S_ENDPOINT_HOST}"\n' >"${d}/root/${K8S_EXT}/usr/local/lib/k8s-endpoint/vip"
+    chmod +x "${d}/root/${K8S_EXT}/usr/local/lib/k8s-endpoint/vip"
     assert_equals "vip for test.k8s.internal" "$(k8s_endpoint_run "${d}")" "a new method is one more script"
 
     k8s_endpoint_env "${d}" client dns

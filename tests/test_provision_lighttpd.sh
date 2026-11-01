@@ -666,8 +666,8 @@ test_a_sealed_file_without_a_ca_on_the_esp_is_opened_with_a_warning() {
 install_k8s_roles() {
     local root
     root="${W}/k8s-root"
-    mkdir -p "${root}/usr/bin"
-    touch "${root}/usr/bin/kubeadm"
+    mkdir -p "${root}/usr/bin" "${root}/usr/lib/systemd/system"
+    touch "${root}/usr/bin/kubeadm" "${root}/usr/lib/systemd/system/systemd-sysext.service"
     chmod 0755 "${root}/usr/bin/kubeadm"
     (
         # shellcheck disable=SC1090
@@ -676,7 +676,9 @@ install_k8s_roles() {
         cfg_services="${CFG_SERVICES}"
         write_k8s_roles "${root}"
     )
-    cp -a "${root}/etc/systemd/system/." /etc/systemd/system/
+    # As systemd-sysext would merge it
+    mkdir -p /usr/lib/systemd/system
+    cp -a "${root}/var/lib/extensions/k8s/usr/lib/systemd/system/." /usr/lib/systemd/system/
 }
 
 test_a_k8s_master_gets_the_cluster_and_its_pki() {
