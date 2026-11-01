@@ -341,7 +341,8 @@ git_fresh_clone() {
     git clone --depth 1 "$@" "${dir}"
 }
 
-# Install files of cfg-services' checkout at the same path in the rootfs
+# Install files or directories of cfg-services' checkout at the same path in
+# the rootfs
 install_services() {
     local mnt_path
     mnt_path="${1}"
@@ -350,6 +351,11 @@ install_services() {
     local f
     local mode
     for f in "$@"; do
+        if [ -d "${cfg_services}/${f}" ]; then
+            mkdir -p "${mnt_path}/${f}"
+            cp -R "${cfg_services}/${f}/." "${mnt_path}/${f}/"
+            continue
+        fi
         mode=0644
         [ -x "${cfg_services}/${f}" ] && mode=0755
         mkdir -p "$(dirname "${mnt_path}/${f}")"
@@ -1185,7 +1191,8 @@ EOF
 # resolvable through /usr/local/lib/k8s-endpoint/<method>, then the bootstrap
 # master runs kubeadm init and installs Cilium, other masters join as control
 # plane with the same PKI and clients join with the token, pinning the
-# cluster CA. Masters announce _k8s-api._tcp through systemd-resolved
+# cluster CA. Masters announce _k8s-api._tcp through systemd-resolved.
+# All of it is the system extension k8s, which systemd-sysext merges into /usr at boot
 write_k8s_roles() {
     local mnt_path
     mnt_path="${1}"
@@ -1196,26 +1203,15 @@ write_k8s_roles() {
         debug "write_k8s_roles: no kubeadm in rootfs, skipping"
         return 0
     fi
+    if [ ! -f "${mnt_path}/usr/lib/systemd/system/systemd-sysext.service" ]; then
+        error "write_k8s_roles: no systemd-sysext in rootfs to merge the k8s extension"
+        exit 1
+    fi
 
-    install_services "${mnt_path}" \
-        usr/local/sbin/k8s-prepare usr/local/sbin/k8s-endpoint \
-        usr/local/sbin/k8s-node usr/local/sbin/k8s-cilium \
-        usr/local/lib/k8s-endpoint/mdns usr/local/lib/k8s-endpoint/dns \
-        etc/systemd/system/role-k8s-master.target etc/systemd/system/role-k8s-client.target \
-        etc/systemd/system/kubelet.service etc/systemd/system/k8s-prepare.service \
-        etc/systemd/system/k8s-endpoint.service etc/systemd/system/k8s-endpoint.timer \
-        etc/systemd/system/k8s-master.service etc/systemd/system/k8s-client.service \
-        etc/systemd/system/k8s-cilium.service
-
-    local role
-    local role_unit
-    for role in master client; do
-        mkdir -p "${path}/role-k8s-${role}.target.wants"
-        for role_unit in kubelet.service k8s-prepare.service k8s-endpoint.timer "k8s-${role}.service"; do
-            ln -s -f "../${role_unit}" "${path}/role-k8s-${role}.target.wants/${role_unit}"
-        done
-    done
-    ln -s -f "../k8s-cilium.service" "${path}/role-k8s-master.target.wants/k8s-cilium.service"
+    install_services "${mnt_path}" var/lib/extensions/k8s
+    mkdir -p "${path}/sysinit.target.wants"
+    ln -s -f /usr/lib/systemd/system/systemd-sysext.service \
+        "${path}/sysinit.target.wants/systemd-sysext.service"
 }
 
 install_cilium_cli() {
